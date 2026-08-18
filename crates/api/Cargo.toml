@@ -1,0 +1,21 @@
+[package]
+name = "aik-api"
+description = "Contracts for the subsystems built on top of the AI kernel: models, tools, memory, agents, permissions, scheduling, platform."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aik-core.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
