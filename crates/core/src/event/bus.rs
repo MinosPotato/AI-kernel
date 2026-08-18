@@ -37,7 +37,10 @@ impl std::fmt::Debug for EventBus {
         f.debug_struct("EventBus")
             .field("capacity", &self.inner.capacity)
             .field("event_types", &channels.len())
-            .field("firehose_subscribers", &self.inner.firehose.receiver_count())
+            .field(
+                "firehose_subscribers",
+                &self.inner.firehose.receiver_count(),
+            )
             .finish()
     }
 }
@@ -161,10 +164,14 @@ impl EventBus {
             return sender.clone();
         }
 
-        let mut channels = self.inner.channels.write().expect("event bus lock poisoned");
-        let entry = channels.entry(key).or_insert_with(|| {
-            Box::new(broadcast::channel::<Envelope<E>>(self.inner.capacity).0)
-        });
+        let mut channels = self
+            .inner
+            .channels
+            .write()
+            .expect("event bus lock poisoned");
+        let entry = channels
+            .entry(key)
+            .or_insert_with(|| Box::new(broadcast::channel::<Envelope<E>>(self.inner.capacity).0));
         entry
             .downcast_ref::<broadcast::Sender<Envelope<E>>>()
             .expect("channel registered under the wrong type")

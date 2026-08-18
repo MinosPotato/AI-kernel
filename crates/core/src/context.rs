@@ -174,7 +174,9 @@ impl ComponentContext {
     /// Returns an empty section if the component is not configured, so a component can
     /// always fall back to its defaults.
     pub fn settings(&self) -> Config {
-        self.kernel.config().section(&format!("components.{}", self.id))
+        self.kernel
+            .config()
+            .section(&format!("components.{}", self.id))
     }
 
     /// The event bus.
@@ -217,7 +219,9 @@ impl ComponentContext {
             .events()
             .metadata_for::<E>()
             .with_source(self.id.clone());
-        self.kernel.events().publish_envelope(Envelope::new(metadata, event))
+        self.kernel
+            .events()
+            .publish_envelope(Envelope::new(metadata, event))
     }
 
     /// Publishes an event attributed to this component and tied to a logical operation.
@@ -228,7 +232,9 @@ impl ComponentContext {
             .metadata_for::<E>()
             .with_source(self.id.clone())
             .with_correlation(correlation);
-        self.kernel.events().publish_envelope(Envelope::new(metadata, event))
+        self.kernel
+            .events()
+            .publish_envelope(Envelope::new(metadata, event))
     }
 
     /// Subscribes to an event type.
@@ -252,7 +258,8 @@ impl ComponentContext {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.registry().register_default::<T>(self.id.clone(), service)
+        self.registry()
+            .register_default::<T>(self.id.clone(), service)
     }
 
     /// Resolves the default service for a capability.

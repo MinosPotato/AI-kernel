@@ -225,9 +225,9 @@ impl Error {
             Self::Config { .. } => ErrorKind::Config,
             Self::NotFound { .. } => ErrorKind::NotFound,
             Self::AlreadyExists { .. } => ErrorKind::Conflict,
-            Self::Ambiguous { .. }
-            | Self::MissingDependency { .. }
-            | Self::DependencyCycle(_) => ErrorKind::Wiring,
+            Self::Ambiguous { .. } | Self::MissingDependency { .. } | Self::DependencyCycle(_) => {
+                ErrorKind::Wiring
+            }
             Self::Lifecycle(_) | Self::Component { .. } => ErrorKind::Lifecycle,
             Self::InvalidArgument(_) => ErrorKind::InvalidArgument,
             Self::Unsupported(_) => ErrorKind::Unsupported,

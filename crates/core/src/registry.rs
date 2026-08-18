@@ -157,9 +157,8 @@ impl Registry {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.try_get::<T>(id).ok_or_else(|| {
-            Error::not_found("service", format!("{}/{id}", type_name::<T>()))
-        })
+        self.try_get::<T>(id)
+            .ok_or_else(|| Error::not_found("service", format!("{}/{id}", type_name::<T>())))
     }
 
     /// Resolves the single service for a capability.
@@ -177,9 +176,9 @@ impl Registry {
         };
 
         let erased = match state.defaults.get(&TypeId::of::<T>()) {
-            Some(default) => slot
-                .get(default)
-                .ok_or_else(|| Error::not_found("service", format!("{}/{default}", type_name::<T>())))?,
+            Some(default) => slot.get(default).ok_or_else(|| {
+                Error::not_found("service", format!("{}/{default}", type_name::<T>()))
+            })?,
             None => match slot.len() {
                 0 => return Err(Error::not_found("service", type_name::<T>())),
                 1 => slot.values().next().expect("length checked"),
@@ -195,10 +194,9 @@ impl Registry {
             },
         };
 
-        erased
-            .downcast_ref::<Arc<T>>()
-            .cloned()
-            .ok_or_else(|| Error::other(format!("service `{}` has the wrong type", type_name::<T>())))
+        erased.downcast_ref::<Arc<T>>().cloned().ok_or_else(|| {
+            Error::other(format!("service `{}` has the wrong type", type_name::<T>()))
+        })
     }
 
     /// Returns every service registered for a capability, sorted by name.
@@ -216,7 +214,9 @@ impl Registry {
         let mut found: Vec<(ComponentId, Arc<T>)> = slot
             .iter()
             .filter_map(|(id, erased)| {
-                erased.downcast_ref::<Arc<T>>().map(|service| (id.clone(), service.clone()))
+                erased
+                    .downcast_ref::<Arc<T>>()
+                    .map(|service| (id.clone(), service.clone()))
             })
             .collect();
         found.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -298,7 +298,9 @@ mod tests {
         let error = registry.resolve::<dyn Greeter>().unwrap_err();
         assert!(matches!(error, Error::Ambiguous { .. }), "{error}");
 
-        registry.set_default::<dyn Greeter>(&ComponentId::new("b")).unwrap();
+        registry
+            .set_default::<dyn Greeter>(&ComponentId::new("b"))
+            .unwrap();
         assert_eq!(registry.resolve::<dyn Greeter>().unwrap().greet(), "b");
     }
 
@@ -316,7 +318,9 @@ mod tests {
     fn duplicate_registration_is_rejected_but_replacement_is_allowed() {
         let registry = Registry::new();
         let id = ComponentId::new("a");
-        registry.register::<dyn Greeter>(id.clone(), Arc::new(Named("first"))).unwrap();
+        registry
+            .register::<dyn Greeter>(id.clone(), Arc::new(Named("first")))
+            .unwrap();
 
         let error = registry
             .register::<dyn Greeter>(id.clone(), Arc::new(Named("second")))
@@ -352,7 +356,9 @@ mod tests {
     #[test]
     fn setting_a_default_for_an_unregistered_name_fails() {
         let registry = Registry::new();
-        let error = registry.set_default::<dyn Greeter>(&ComponentId::new("ghost")).unwrap_err();
+        let error = registry
+            .set_default::<dyn Greeter>(&ComponentId::new("ghost"))
+            .unwrap_err();
         assert!(matches!(error, Error::NotFound { .. }), "{error}");
     }
 }

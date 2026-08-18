@@ -97,10 +97,7 @@ pub struct PluginRegistrar<'a> {
 
 impl<'a> PluginRegistrar<'a> {
     pub(crate) fn new(plugin: PluginId, components: &'a mut Vec<Arc<dyn Component>>) -> Self {
-        Self {
-            plugin,
-            components,
-        }
+        Self { plugin, components }
     }
 
     /// The id of the plugin doing the registering.

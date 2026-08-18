@@ -124,9 +124,5 @@ pub trait Agent: Send + Sync + 'static {
     ) -> Result<BoxStream<'static, Result<AgentUpdate>>>;
 
     /// Runs the agent and waits for the final response.
-    async fn run(
-        &self,
-        request: AgentRequest,
-        cx: &ExecutionContext,
-    ) -> Result<AgentResponse>;
+    async fn run(&self, request: AgentRequest, cx: &ExecutionContext) -> Result<AgentResponse>;
 }

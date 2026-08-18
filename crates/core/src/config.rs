@@ -213,8 +213,8 @@ impl ConfigBuilder {
                 .collect::<Vec<_>>()
                 .join(".");
             let raw = value.as_ref();
-            let parsed =
-                serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+            let parsed = serde_json::from_str::<Value>(raw)
+                .unwrap_or_else(|_| Value::String(raw.to_owned()));
             set_path(&mut self.root, &path, parsed);
         }
         self
@@ -314,7 +314,9 @@ mod tests {
 
         let config = Config::empty();
         assert_eq!(
-            config.get_or_default::<Settings>("components.demo").unwrap(),
+            config
+                .get_or_default::<Settings>("components.demo")
+                .unwrap(),
             Settings { retries: 0 }
         );
     }
@@ -347,7 +349,10 @@ mod tests {
             .build();
 
         assert_eq!(config.get::<usize>("kernel.event_capacity").unwrap(), 512);
-        assert_eq!(config.get::<u64>("kernel.shutdown_timeout_ms").unwrap(), 1000);
+        assert_eq!(
+            config.get::<u64>("kernel.shutdown_timeout_ms").unwrap(),
+            1000
+        );
     }
 
     #[test]

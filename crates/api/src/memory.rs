@@ -56,7 +56,11 @@ pub struct MemoryRecord {
 
 impl MemoryRecord {
     /// Creates a record with a fresh id and no metadata.
-    pub fn new(kind: impl Into<MemoryKind>, content: impl Into<Value>, created_at: Timestamp) -> Self {
+    pub fn new(
+        kind: impl Into<MemoryKind>,
+        content: impl Into<Value>,
+        created_at: Timestamp,
+    ) -> Self {
         Self {
             id: MemoryId::new(),
             kind: kind.into(),
