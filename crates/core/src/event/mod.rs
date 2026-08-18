@@ -60,7 +60,9 @@ use crate::id::{ComponentId, CorrelationId, EventId, EventName};
 ///
 /// The `Serialize`/`DeserializeOwned` bounds are what make cross-process delivery possible
 /// later without revisiting every event type.
-pub trait Event: Clone + Send + Sync + std::fmt::Debug + Serialize + DeserializeOwned + 'static {
+pub trait Event:
+    Clone + Send + Sync + std::fmt::Debug + Serialize + DeserializeOwned + 'static
+{
     /// The stable wire name of this event type.
     const NAME: &'static str;
 

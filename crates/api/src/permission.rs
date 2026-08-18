@@ -145,8 +145,11 @@ impl Decision {
 #[async_trait]
 pub trait PolicyEngine: Send + Sync + 'static {
     /// Answers a permission question.
-    async fn evaluate(&self, request: &PermissionRequest, cx: &ExecutionContext)
-    -> Result<Decision>;
+    async fn evaluate(
+        &self,
+        request: &PermissionRequest,
+        cx: &ExecutionContext,
+    ) -> Result<Decision>;
 }
 
 /// Asks a human for approval. Implemented by frontends.

@@ -94,7 +94,9 @@ impl ExecutionContext {
     /// Returns true if the operation has been cancelled or its deadline has passed.
     pub fn is_expired(&self, clock: &dyn Clock) -> bool {
         self.cancellation.is_cancelled()
-            || self.deadline.is_some_and(|deadline| clock.now() >= deadline)
+            || self
+                .deadline
+                .is_some_and(|deadline| clock.now() >= deadline)
     }
 
     /// Waits until the operation is cancelled.

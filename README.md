@@ -17,9 +17,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-core`](crates/core) | The kernel: lifecycle, events, registry, tasks, config, plugins |
 | [`aik-api`](crates/api) | Contracts for future subsystems. Traits and types only, no implementations |
 | [`aik`](crates/aik) | Facade re-exporting both |
+| [`aik-ollama`](crates/ollama) | A `ModelProvider` backed by a local or remote Ollama server |
 
-`aik-core` does not depend on `aik-api`. A kernel can be built and run with none of the
-subsystem contracts present.
+`aik-core` does not depend on `aik-api`, and neither depends on `aik-ollama`. A kernel can
+be built and run with none of the subsystem contracts present, and with no model provider
+registered at all.
 
 ## The mechanisms
 
@@ -92,6 +94,24 @@ let notifier = ctx.service::<dyn Notifier>()?;
 That indirection is the point: replacing a desktop backend, a model provider or a memory
 store is a change to which component is registered, never a change to the kernel.
 
+## Talking to a real model
+
+[`aik-ollama`](crates/ollama) is the first real `ModelProvider`: a kernel component that
+talks to [Ollama](https://ollama.com) over HTTP, with streaming, cancellation and timeouts.
+Nothing about HTTP or Ollama's wire format leaves that crate — consumers depend on
+`dyn ModelProvider`, resolved through the registry, exactly like the `Notifier` example
+above.
+
+```bash
+cargo run -p aik-ollama --example chat
+cargo run -p aik-ollama --example chat -- mistral "what is a kernel?"
+```
+
+Requires a running `ollama serve` with a model pulled; if it is not reachable, the example
+prints a clear explanation and exits cleanly instead of failing loudly. The crate's own test
+suite (`cargo test -p aik-ollama`) needs no such server — it runs against a mocked HTTP
+server, deterministically.
+
 ## Configuration
 
 The kernel reads no files. It accepts JSON layers, deep-merged in order, so the host
@@ -133,5 +153,8 @@ compiles anywhere Tokio does, even though the target system is Arch Linux with H
 
 ## Status
 
-The kernel is complete and tested. What comes next builds *on* it rather than *into* it:
-implementations of the `aik-api` contracts, each as a component in its own crate.
+The kernel is complete and tested. The `ModelProvider` contract has one real implementation
+(`aik-ollama`), proving the registry/component architecture hosts a real, cancellable,
+streaming integration cleanly. What comes next builds *on* the kernel rather than *into*
+it: further `aik-api` contracts (tools, memory, agents), each as a component in its own
+crate, following the same pattern.

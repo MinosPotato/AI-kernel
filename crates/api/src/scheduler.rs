@@ -148,7 +148,10 @@ mod tests {
             interval: Duration::from_secs(30),
         };
         let json = serde_json::to_value(&trigger).unwrap();
-        assert_eq!(json, serde_json::json!({ "type": "every", "interval": 30_000 }));
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "every", "interval": 30_000 })
+        );
         assert_eq!(serde_json::from_value::<Trigger>(json).unwrap(), trigger);
     }
 }

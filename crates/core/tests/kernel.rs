@@ -412,7 +412,10 @@ fn unsound_wiring_is_rejected_at_build_time() {
         .component(Recorder::new("app", &["ghost"], &journal))
         .build()
         .unwrap_err();
-    assert!(matches!(missing, Error::MissingDependency { .. }), "{missing}");
+    assert!(
+        matches!(missing, Error::MissingDependency { .. }),
+        "{missing}"
+    );
 
     let cycle = Kernel::builder()
         .component(Recorder::new("a", &["b"], &journal))
@@ -426,7 +429,10 @@ fn unsound_wiring_is_rejected_at_build_time() {
         .component(Recorder::new("a", &[], &journal))
         .build()
         .unwrap_err();
-    assert!(matches!(duplicate, Error::AlreadyExists { .. }), "{duplicate}");
+    assert!(
+        matches!(duplicate, Error::AlreadyExists { .. }),
+        "{duplicate}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -482,13 +488,21 @@ async fn unconfigured_components_fall_back_to_their_defaults() {
 #[test]
 fn kernel_settings_come_from_configuration() {
     let kernel = Kernel::builder()
-        .config(Config::builder().layer(json!({ "kernel": { "event_capacity": 4 } })).build())
+        .config(
+            Config::builder()
+                .layer(json!({ "kernel": { "event_capacity": 4 } }))
+                .build(),
+        )
         .build()
         .unwrap();
     assert_eq!(kernel.context().events().capacity(), 4);
 
     let error = Kernel::builder()
-        .config(Config::builder().layer(json!({ "kernel": { "event_capacity": 0 } })).build())
+        .config(
+            Config::builder()
+                .layer(json!({ "kernel": { "event_capacity": 0 } }))
+                .build(),
+        )
         .build()
         .unwrap_err();
     assert!(matches!(error, Error::Config { .. }), "{error}");

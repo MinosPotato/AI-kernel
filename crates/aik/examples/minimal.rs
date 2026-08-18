@@ -71,9 +71,8 @@ impl Component for SensorComponent {
 
     async fn start(&self, ctx: &ComponentContext) -> Result<()> {
         // Interval comes from `components.demo.sensor.interval_ms`, with a default.
-        let interval = Duration::from_millis(
-            ctx.settings().get_optional("interval_ms")?.unwrap_or(100),
-        );
+        let interval =
+            Duration::from_millis(ctx.settings().get_optional("interval_ms")?.unwrap_or(100));
         let sensor = self.sensor.clone();
         let ctx = ctx.clone();
 
@@ -157,14 +156,12 @@ impl Component for Bridge {
 
         // A subscription never ends on its own, so this task must be cancellable —
         // otherwise shutdown would wait for it until the timeout expires.
-        ctx.tasks().spawn_until_cancelled("bridge-loop", async move {
-            while let Ok(envelope) = everything.recv().await {
-                println!(
-                    "[bridge]   {} {}",
-                    envelope.metadata.name, envelope.payload
-                );
-            }
-        });
+        ctx.tasks()
+            .spawn_until_cancelled("bridge-loop", async move {
+                while let Ok(envelope) = everything.recv().await {
+                    println!("[bridge]   {} {}", envelope.metadata.name, envelope.payload);
+                }
+            });
 
         Ok(())
     }
@@ -201,7 +198,10 @@ async fn main() -> Result<()> {
         .env("AIK_")
         .build();
 
-    let kernel = Kernel::builder().config(config).plugin(DemoPlugin).build()?;
+    let kernel = Kernel::builder()
+        .config(config)
+        .plugin(DemoPlugin)
+        .build()?;
 
     println!("start order: {:?}", kernel.component_ids());
 
