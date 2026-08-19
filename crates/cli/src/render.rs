@@ -20,6 +20,7 @@ use aik_api::audit::{AuthorizationDecided, ToolInvoked};
 use aik_api::context::ContextAssembled;
 use aik_api::measurement::RequestMeasured;
 use aik_api::model::{ContentPart, Usage};
+use aik_api::permission::{PrincipalId, PrincipalKind};
 use serde_json::Value;
 
 /// How much of a tool's output or arguments is shown before it is cut short.
@@ -217,6 +218,22 @@ pub fn summary(usage: &Usage, stats: &TurnStats) -> String {
     )
 }
 
+/// Renders "who was asking" for `--verbose`, including delegated authority when present.
+///
+/// This is the attribution the underlying audit events ([`AuthorizationDecided`],
+/// [`ToolInvoked`]) already carry — see `docs/CLI.md`'s verbose-mode section — rendered so a
+/// human reading the terminal can see it too, not just a JSONL consumer.
+fn principal(id: &PrincipalId, kind: PrincipalKind, on_behalf_of: &Option<PrincipalId>) -> String {
+    match on_behalf_of {
+        Some(delegator) => format!(
+            "{} ({kind:?}, on behalf of {})",
+            safe(id.as_str()),
+            safe(delegator.as_str())
+        ),
+        None => format!("{} ({kind:?})", safe(id.as_str())),
+    }
+}
+
 /// Prints one authorization decision, for `--verbose`.
 ///
 /// Every field here is produced by the kernel or by a policy author, never by a model, so
@@ -236,7 +253,8 @@ pub fn authorization(event: &AuthorizationDecided) {
         None => format!(" ({}ms)", event.duration_ms),
     };
     println!(
-        "  [auth] {:?} {}{} → {:?}{wait}",
+        "  [auth] {} {:?} {}{} → {:?}{wait}",
+        principal(&event.principal, event.principal_kind, &event.on_behalf_of),
         event.phase,
         safe(event.action.as_str()),
         resource,
@@ -252,7 +270,8 @@ pub fn invocation(event: &ToolInvoked) {
         _ => String::new(),
     };
     println!(
-        "  [tool] {} → {:?}{timing}",
+        "  [tool] {} {} → {:?}{timing}",
+        principal(&event.principal, event.principal_kind, &event.on_behalf_of),
         safe(event.tool.as_str()),
         event.outcome,
     );
@@ -353,6 +372,22 @@ mod tests {
             approval_wait_ms,
             outcome,
         }
+    }
+
+    #[test]
+    fn principal_attribution_names_the_actor_and_its_kind() {
+        let rendered = principal(&PrincipalId::new("agent-1"), PrincipalKind::Agent, &None);
+        assert_eq!(rendered, "agent-1 (Agent)");
+    }
+
+    #[test]
+    fn principal_attribution_names_delegated_authority_when_present() {
+        let rendered = principal(
+            &PrincipalId::new("agent-1"),
+            PrincipalKind::Agent,
+            &Some(PrincipalId::new("user-1")),
+        );
+        assert_eq!(rendered, "agent-1 (Agent, on behalf of user-1)");
     }
 
     #[test]

@@ -103,8 +103,8 @@ Per turn:
   [req]  turn 2 — system 0, tools 301 (2 offered), conversation 247, total 548 (estimated)
   [req]  provider usage: 133 in / 114 out (exact, as reported)
   [req]  model latency: 1593ms
-  [auth] Resource filesystem.write on ... → ApprovalGranted (118ms)
-  [tool] filesystem.write → Succeeded (4ms exec, 118ms auth)
+  [auth] agent-1 (Agent) Resource filesystem.write on ... → ApprovalGranted (118ms)
+  [tool] agent-1 (Agent) filesystem.write → Succeeded (4ms exec, 118ms auth)
 ```
 
 End of turn / end of session:

@@ -319,9 +319,9 @@ conversation output:
   [req]  turn 2 — system 0, tools 301 (2 offered), conversation 244, total 545 (estimated)
   [req]  provider usage: 337 in / 20 out (exact, as reported)
   [req]  model latency: 401ms
-  [auth] Tool filesystem.write → Allowed (0ms)
-  [auth] Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted (118ms, 115ms of it waiting on approval)
-  [tool] filesystem.write → Succeeded (4ms exec, 118ms auth)
+  [auth] agent-1 (Agent) Tool filesystem.write → Allowed (0ms)
+  [auth] agent-1 (Agent) Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted (118ms, 115ms of it waiting on approval)
+  [tool] agent-1 (Agent) filesystem.write → Succeeded (4ms exec, 118ms auth)
 ```
 
 - `[ctx]` — one per model turn, from the context store's `ContextAssembled` event: how many
@@ -336,15 +336,18 @@ conversation output:
   definitions are attached to the request by the agent loop, not read from the context store, so
   their cost is invisible to `ContextAssembled` — see
   [`docs/MEASUREMENTS.md`](MEASUREMENTS.md) for why.
-- `[auth]` — one per authorization question (`Tool`, `Resource`, or `DiscoveredResource` phase —
-  see [Filesystem confinement](#filesystem-confinement) for what the third phase is), with the
-  outcome (`Allowed`, `Denied`, `ApprovalGranted`, `ApprovalRefused`, `ApprovalUnavailable`,
-  `PolicyUnavailable`) and how long the decision took, in parentheses. For an approval-related
-  outcome, the parenthetical breaks out how much of that time was specifically spent waiting for
-  a human to answer — see `AuthorizationDecided.approval_wait_ms`, which is `None` (and so
-  omitted here) whenever no approval sink was ever asked.
-- `[tool]` — one per completed (or refused, or not-found) invocation, with execution and
-  authorization time in parentheses where they apply.
+- `[auth]` — one per authorization question, prefixed with who was asking (the principal id and
+  kind, plus `on behalf of <id>` when the principal is acting under delegated authority — see
+  `AuthorizationDecided.on_behalf_of`), then the phase (`Tool`, `Resource`, or
+  `DiscoveredResource` — see [Filesystem confinement](#filesystem-confinement) for what the
+  third phase is), the outcome (`Allowed`, `Denied`, `ApprovalGranted`, `ApprovalRefused`,
+  `ApprovalUnavailable`, `PolicyUnavailable`) and how long the decision took, in parentheses.
+  For an approval-related outcome, the parenthetical breaks out how much of that time was
+  specifically spent waiting for a human to answer — see
+  `AuthorizationDecided.approval_wait_ms`, which is `None` (and so omitted here) whenever no
+  approval sink was ever asked.
+- `[tool]` — one per completed (or refused, or not-found) invocation, prefixed the same way with
+  who was asking, with execution and authorization time in parentheses where they apply.
 
 At the end of each turn, and again at the end of the whole session, a cumulative line is
 printed:
@@ -579,8 +582,6 @@ These are documented, deliberate properties of the current implementation, not d
   reported `prompt_eval_count` and the CLI's own `window tokens` figure routinely differ by an
   order of magnitude once tool schemas are counted (see
   [Token and context cost](#token-and-context-cost-a-baseline)).
-- **Verbose mode does not display principal/delegation attribution**, even though the
-  underlying audit events carry it correctly (see [Verbose mode](#verbose-mode)).
 - **The TOCTOU window between resolving a path and acting on it is not fully closed** — a
   documented property of the POSIX filesystem API, mitigated but not eliminated by the write
   tool's handle-pinning; see [Filesystem confinement](#filesystem-confinement).
