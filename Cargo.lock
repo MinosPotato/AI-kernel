@@ -23,6 +23,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-agent"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-approval",
+ "aik-context",
+ "aik-core",
+ "aik-policy",
+ "aik-tools",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "futures-core",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "aik-api"
 version = "0.1.0"
 dependencies = [

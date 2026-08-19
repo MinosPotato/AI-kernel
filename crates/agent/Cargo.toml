@@ -1,0 +1,30 @@
+[package]
+name = "aik-agent"
+description = "A minimal agent loop for the AI kernel: model turns, bounded context, and authorization-gated tool calls."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aik-core.workspace = true
+aik-api.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+aik-approval.workspace = true
+aik-policy.workspace = true
+aik-tools.workspace = true
+aik-context.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio-util.workspace = true
