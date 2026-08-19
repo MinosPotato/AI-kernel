@@ -16,8 +16,9 @@
 use std::fmt::Write as _;
 
 use aik_api::agent::AgentUpdate;
-use aik_api::audit::{AuthorizationDecided, ToolInvoked};
+use aik_api::audit::{AuthorizationDecided, AuthorizationOutcome, ToolInvoked};
 use aik_api::context::ContextAssembled;
+use aik_api::measurement::RequestMeasured;
 use aik_api::model::{ContentPart, Usage};
 use serde_json::Value;
 
@@ -84,10 +85,88 @@ impl TurnStats {
     ///
     /// One window is assembled per model turn, so counting them counts turns without the
     /// frontend having to track the loop's own progress.
+    ///
+    /// Note this can double-count turns against [`RequestMeasured`]: both are published
+    /// once per model turn, from different subsystems, and a caller that folds in both
+    /// should only take `turns` from one of them. [`Session`](crate::session::Session)
+    /// takes it from here, since [`ContextAssembled`] existed first and callers may already
+    /// depend on this count.
     pub fn record(&mut self, event: &ContextAssembled) {
         self.turns += 1;
         self.window_tokens = event.usage.included_tokens;
         self.dropped_records = event.usage.dropped_records;
+    }
+}
+
+/// What a whole session has cost so far, accumulated across every turn of every prompt
+/// answered in it.
+///
+/// Distinct from [`TurnStats`], which is reset at the start of every prompt: this is the
+/// "cumulative run cost" a long interactive session needs to see, and it is intentionally
+/// simple to fold into — one method per event type this frontend already subscribes to, so
+/// accumulating it costs nothing beyond what verbose rendering was already doing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionStats {
+    /// Model turns taken across every prompt so far.
+    pub turns: usize,
+    /// Tool calls made across every prompt so far.
+    pub tool_calls: usize,
+    /// Provider-reported input tokens, summed across every turn that reported them.
+    ///
+    /// `None` until the first turn that reports usage at all — see
+    /// [`RequestMeasured::provider_usage`](aik_api::measurement::RequestMeasured::provider_usage)
+    /// for why a provider can simply not report this.
+    pub provider_input_tokens: Option<u64>,
+    /// Provider-reported output tokens, summed the same way.
+    pub provider_output_tokens: Option<u64>,
+    /// Locally estimated total request size, summed across every turn. Always available,
+    /// since it needs no provider cooperation — see [`aik_api::measurement`] for what
+    /// "estimated" means here.
+    pub estimated_total_tokens: u64,
+    /// Time spent waiting on the model, summed across every turn.
+    pub model_latency_ms: u64,
+    /// Time spent on tool execution proper (excluding authorization), summed across every
+    /// completed invocation that reported it.
+    pub tool_execution_latency_ms: u64,
+    /// Time spent on authorization decisions, summed across every one made. Includes any
+    /// approval wait — see [`AuthorizationDecided::duration_ms`].
+    pub authorization_latency_ms: u64,
+    /// Time spent specifically waiting for a human to answer a `require_approval`
+    /// decision, summed across every such decision. A subset of
+    /// [`SessionStats::authorization_latency_ms`], broken out because it is usually the
+    /// dominant cost of the decisions it applies to.
+    pub approval_latency_ms: u64,
+}
+
+impl SessionStats {
+    /// Folds in one measured model turn.
+    pub fn record_measurement(&mut self, event: &RequestMeasured) {
+        self.turns += 1;
+        self.estimated_total_tokens += event.estimate.total_tokens;
+        self.model_latency_ms += event.model_latency_ms;
+        if let Some(usage) = event.provider_usage {
+            *self.provider_input_tokens.get_or_insert(0) += usage.input_tokens;
+            *self.provider_output_tokens.get_or_insert(0) += usage.output_tokens;
+        }
+    }
+
+    /// Folds in one completed tool invocation.
+    pub fn record_invocation(&mut self, event: &ToolInvoked) {
+        self.tool_calls += 1;
+        self.tool_execution_latency_ms += event.execution_duration_ms.unwrap_or(0);
+    }
+
+    /// Folds in one authorization decision.
+    pub fn record_authorization(&mut self, event: &AuthorizationDecided) {
+        self.authorization_latency_ms += event.duration_ms;
+        if matches!(
+            event.outcome,
+            AuthorizationOutcome::ApprovalGranted
+                | AuthorizationOutcome::ApprovalRefused
+                | AuthorizationOutcome::ApprovalUnavailable
+        ) {
+            self.approval_latency_ms += event.duration_ms;
+        }
     }
 }
 
@@ -157,31 +236,92 @@ pub fn authorization(event: &AuthorizationDecided) {
         .map(|resource| format!(" on {}", safe(resource.as_str())))
         .unwrap_or_default();
     println!(
-        "  [auth] {:?} {}{} → {:?}",
+        "  [auth] {:?} {}{} → {:?} ({}ms)",
         event.phase,
         safe(event.action.as_str()),
         resource,
         event.outcome,
+        event.duration_ms,
     );
 }
 
 /// Prints one completed invocation, for `--verbose`.
 pub fn invocation(event: &ToolInvoked) {
+    let timing = match (event.authorization_duration_ms, event.execution_duration_ms) {
+        (Some(auth), Some(exec)) => format!(" ({exec}ms exec, {auth}ms auth)"),
+        (Some(auth), None) => format!(" ({auth}ms auth)"),
+        _ => String::new(),
+    };
     println!(
-        "  [tool] {} → {:?}",
+        "  [tool] {} → {:?}{timing}",
         safe(event.tool.as_str()),
         event.outcome,
     );
 }
 
+/// Prints what one model turn's request was estimated to cost, for `--verbose`.
+///
+/// This is the measurement breakdown the [README](../README.md) and
+/// `docs/MEASUREMENTS.md` describe: what the context store's own accounting cannot see
+/// (tool-definition cost) alongside what it can, plus provider-reported usage and model
+/// latency, all for the exact request this one turn sent.
+pub fn measurement(event: &RequestMeasured) {
+    let estimate = &event.estimate;
+    println!(
+        "  [req]  turn {} — system {}, tools {} ({} offered), conversation {}, total {} (estimated)",
+        event.turn,
+        estimate.system_tokens,
+        estimate.tool_definition_tokens,
+        estimate.tools_offered,
+        estimate.conversation_tokens,
+        estimate.total_tokens,
+    );
+    match event.provider_usage {
+        Some(usage) => println!(
+            "  [req]  provider usage: {} in / {} out (exact, as reported)",
+            usage.input_tokens, usage.output_tokens,
+        ),
+        None => println!("  [req]  provider usage: not reported by this provider"),
+    }
+    println!("  [req]  model latency: {}ms", event.model_latency_ms);
+}
+
+/// Prints a session's cumulative cost so far, for `--verbose`.
+pub fn session_totals(stats: &SessionStats) {
+    let provider = match (stats.provider_input_tokens, stats.provider_output_tokens) {
+        (Some(input), Some(output)) => format!("{input} in / {output} out (exact)"),
+        _ => "not reported".to_owned(),
+    };
+    println!(
+        "  [session] {} turns, {} tool calls, {} estimated tokens total, provider {provider}",
+        stats.turns, stats.tool_calls, stats.estimated_total_tokens,
+    );
+    println!(
+        "  [session] latency — model {}ms, tools {}ms, authorization {}ms (approval {}ms)",
+        stats.model_latency_ms,
+        stats.tool_execution_latency_ms,
+        stats.authorization_latency_ms,
+        stats.approval_latency_ms,
+    );
+}
+
 /// Prints what a window cost, for `--verbose`.
 pub fn assembled(event: &ContextAssembled) {
+    let usage = &event.usage;
     println!(
-        "  [ctx]  {} records, {} tokens, {} elided, {} dropped",
-        event.usage.included_records,
-        event.usage.included_tokens,
-        event.usage.elided_parts,
-        event.usage.dropped_records,
+        "  [ctx]  stored {} — included {} ({} records), elided {} ({} parts), evicted {} ({} records){over_budget}",
+        usage.total_tokens(),
+        usage.included_tokens,
+        usage.included_records,
+        usage.elided_tokens,
+        usage.elided_parts,
+        usage.dropped_tokens,
+        usage.dropped_records,
+        over_budget = if usage.over_budget {
+            " [over budget: pinned records alone exceed it]"
+        } else {
+            ""
+        },
     );
 }
 

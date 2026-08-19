@@ -295,7 +295,13 @@ model output to it that does not go through trusted code deciding to record some
 conversation with the agent, prints what it does, and answers approval prompts. See
 [`docs/CLI.md`](docs/CLI.md) for the full manual — every option explained with examples, how to
 write a policy without hitting its sharpest edge, verbose-mode output explained event by event,
-a token/context cost baseline, and a troubleshooting table. This section is the short version.
+and a troubleshooting table. This section is the short version.
+
+For what a run actually costs — exact provider-reported tokens versus locally estimated
+ones, tool-schema overhead, context accounting, latency, a `--record`ed JSONL format for
+machine-readable analysis, and reproducible benchmark commands — see
+[`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md), which supersedes the baseline
+`docs/CLI.md` previously carried inline.
 
 ### Prerequisites
 
@@ -340,6 +346,7 @@ cargo run -p aik-cli -- -c crates/cli/aik.example.json "what is in src?"
 | `--write` | also register the write tool |
 | `--no-tools` | register none |
 | `-v, --verbose` | print authorization and context events as they happen |
+| `-R, --record <FILE>` | append a JSONL measurement record of the run (counts and timings only) |
 
 In a session, `/new` starts a fresh conversation, `/session` says who is acting,
 `/tools` lists what the agent has, `/quit` leaves. Ctrl-C cancels the turn in progress.

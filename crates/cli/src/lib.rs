@@ -51,6 +51,7 @@
 pub mod approval;
 pub mod args;
 pub mod console;
+pub mod recorder;
 pub mod render;
 pub mod session;
 pub mod settings;
@@ -137,11 +138,29 @@ async fn converse(assembled: &wiring::Assembled, settings: &Settings) -> Result<
     let kernel = assembled.kernel.context();
     banner(settings);
 
+    // Opened before either session variant, and its failure reported the same way any
+    // other startup problem is: named, before a single turn runs, rather than discovered
+    // partway through a conversation when the first write silently had nowhere to go.
+    let recorder = match &settings.record {
+        Some(path) => {
+            let recorder = recorder::Recorder::create(path)?;
+            println!(
+                "  record: appending measurement events to {}",
+                path.display()
+            );
+            Some(recorder)
+        }
+        None => None,
+    };
+
     match &settings.prompt {
         // One shot: no gate is attached, so the broker has nobody to ask and refuses
         // immediately rather than parking the question in front of an empty terminal.
         Some(prompt) => {
             let mut session = session::stdio(&kernel, settings, None)?;
+            if let Some(recorder) = recorder {
+                session = session.with_recorder(recorder);
+            }
             session.one_shot(prompt.clone()).await
         }
         // Interactive: subscribing holds a gate for as long as the session lasts, which is
@@ -149,6 +168,9 @@ async fn converse(assembled: &wiring::Assembled, settings: &Settings) -> Result<
         None => {
             let approvals = assembled.broker.gate().subscribe();
             let mut session = session::stdio(&kernel, settings, Some(approvals))?;
+            if let Some(recorder) = recorder {
+                session = session.with_recorder(recorder);
+            }
             session.interactive().await.map(|_| ())
         }
     }

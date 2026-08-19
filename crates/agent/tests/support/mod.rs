@@ -594,7 +594,9 @@ impl HarnessBuilder {
             store.clone(),
             self.settings,
         )
-        .with_clock(self.clock.clone());
+        .with_clock(self.clock.clone())
+        .with_token_counter(Arc::new(aik_context::HeuristicTokenCounter::new()))
+        .with_events(events.clone(), ComponentId::new("agent.loop"));
         if let Some(allowed) = self.allowed {
             agent = agent.with_tools(allowed);
         }

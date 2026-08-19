@@ -13,6 +13,7 @@
 //! | [`permission`] | Principals, policy, human approval and resource authorization |
 //! | [`audit`] | Structured authorization and invocation events |
 //! | [`context`] | An agent's transcript, and the bounded view of it a model is sent |
+//! | [`measurement`] | What one request to a model provider cost, estimated and reported |
 //! | [`memory`] | Persistent records and retrieval |
 //! | [`scheduler`] | Time- and event-triggered jobs |
 //! | [`agent`] | Long-running work with streamed progress |
@@ -74,6 +75,7 @@ pub mod agent;
 pub mod audit;
 pub mod context;
 pub mod execution;
+pub mod measurement;
 pub mod memory;
 pub mod model;
 pub mod permission;

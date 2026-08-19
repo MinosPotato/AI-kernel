@@ -20,6 +20,7 @@ use aik_api::agent::{Agent, AgentRequest, AgentUpdate, SessionId};
 use aik_api::audit::{AuthorizationDecided, ToolInvoked};
 use aik_api::context::ContextAssembled;
 use aik_api::execution::ExecutionContext;
+use aik_api::measurement::RequestMeasured;
 use aik_api::model::ContentPart;
 use aik_api::permission::Principal;
 use aik_approval::{ApprovalStream, PendingApproval};
@@ -31,7 +32,8 @@ use tokio::io::AsyncBufRead;
 
 use crate::approval;
 use crate::console::Console;
-use crate::render::{self, TurnStats};
+use crate::recorder::Recorder;
+use crate::render::{self, SessionStats, TurnStats};
 use crate::settings::Settings;
 
 /// The prompt shown before each line of input.
@@ -69,6 +71,13 @@ pub struct Session<R> {
     windows: EventStream<ContextAssembled>,
     decisions: EventStream<AuthorizationDecided>,
     invocations: EventStream<ToolInvoked>,
+    measurements: EventStream<RequestMeasured>,
+    /// What every prompt answered in this session has cost so far. See
+    /// [`SessionStats`].
+    session_stats: SessionStats,
+    /// Where a JSONL measurement record is appended, if [`Session::with_recorder`] was
+    /// called. `None` records nothing and changes nothing else about the session.
+    recorder: Option<Recorder>,
 }
 
 impl<R> std::fmt::Debug for Session<R> {
@@ -103,7 +112,26 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
             windows: kernel.subscribe::<ContextAssembled>(),
             decisions: kernel.subscribe::<AuthorizationDecided>(),
             invocations: kernel.subscribe::<ToolInvoked>(),
+            measurements: kernel.subscribe::<RequestMeasured>(),
+            session_stats: SessionStats::default(),
+            recorder: None,
         })
+    }
+
+    /// Records every measurement event this session observes to a JSONL file.
+    ///
+    /// Purely observational, like the events themselves: it changes what is written to
+    /// disk, never what the session does. See [`crate::recorder`] for the format and for
+    /// exactly what is and is not persisted.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Recorder) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// What this session has cost so far, across every prompt answered in it.
+    pub fn session_stats(&self) -> SessionStats {
+        self.session_stats
     }
 
     /// The conversation this session is appending to.
@@ -245,28 +273,54 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
         }
 
         self.drain(&mut stats);
+        if self.verbose {
+            render::session_totals(&self.session_stats);
+        }
         Ok(())
     }
 
     /// Consumes whatever the kernel published since the last check.
     ///
     /// Polled rather than selected on: these are diagnostics, and a missed one must never
-    /// be able to stall the conversation. Lag is ignored for the same reason.
+    /// be able to stall the conversation. Lag is ignored for the same reason — a recording
+    /// or a verbose line skipped because a channel overflowed is a smaller problem than the
+    /// conversation stalling to avoid it, and is exactly the trade-off
+    /// [`EventBus`](aik_core::event::EventBus) itself documents.
     fn drain(&mut self, stats: &mut TurnStats) {
         while let Some(Ok(envelope)) = self.windows.try_recv() {
             stats.record(&envelope.payload);
             if self.verbose {
                 render::assembled(&envelope.payload);
             }
+            if let Some(recorder) = &mut self.recorder {
+                recorder.record_context(&envelope.payload);
+            }
         }
         while let Some(Ok(envelope)) = self.decisions.try_recv() {
+            self.session_stats.record_authorization(&envelope.payload);
             if self.verbose {
                 render::authorization(&envelope.payload);
             }
+            if let Some(recorder) = &mut self.recorder {
+                recorder.record_authorization(&envelope.payload);
+            }
         }
         while let Some(Ok(envelope)) = self.invocations.try_recv() {
+            self.session_stats.record_invocation(&envelope.payload);
             if self.verbose {
                 render::invocation(&envelope.payload);
+            }
+            if let Some(recorder) = &mut self.recorder {
+                recorder.record_invocation(&envelope.payload);
+            }
+        }
+        while let Some(Ok(envelope)) = self.measurements.try_recv() {
+            self.session_stats.record_measurement(&envelope.payload);
+            if self.verbose {
+                render::measurement(&envelope.payload);
+            }
+            if let Some(recorder) = &mut self.recorder {
+                recorder.record_measurement(&envelope.payload);
             }
         }
     }

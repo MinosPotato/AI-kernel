@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aik_api::audit::{
     AuthorizationDecided, AuthorizationOutcome, AuthorizationPhase, InvocationOutcome, ToolInvoked,
@@ -180,7 +181,12 @@ impl InProcessToolRegistry {
         bus.publish_envelope(Envelope::new(metadata, event));
     }
 
-    fn record_decision(&self, question: &Question<'_>, outcome: AuthorizationOutcome) {
+    fn record_decision(
+        &self,
+        question: &Question<'_>,
+        outcome: AuthorizationOutcome,
+        duration: Duration,
+    ) {
         self.audit(
             question.cx,
             AuthorizationDecided {
@@ -193,17 +199,22 @@ impl InProcessToolRegistry {
                 action: question.action.clone(),
                 resource: question.resource.cloned(),
                 phase: question.phase,
+                duration_ms: millis(duration),
                 outcome,
             },
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_invocation(
         &self,
         cx: &ExecutionContext,
         tool: &ToolName,
         principal: &Principal,
         outcome: InvocationOutcome,
+        duration: Duration,
+        authorization_duration: Option<Duration>,
+        execution_duration: Option<Duration>,
     ) {
         self.audit(
             cx,
@@ -214,6 +225,9 @@ impl InProcessToolRegistry {
                 principal: principal.id.clone(),
                 principal_kind: principal.kind,
                 on_behalf_of: principal.on_behalf_of.clone(),
+                duration_ms: millis(duration),
+                authorization_duration_ms: authorization_duration.map(millis),
+                execution_duration_ms: execution_duration.map(millis),
                 outcome,
             },
         );
@@ -225,11 +239,16 @@ impl InProcessToolRegistry {
     /// planned-resource checks and resources discovered at runtime all land here, so all
     /// three are enforced identically and audited identically.
     async fn decide(&self, question: &Question<'_>) -> Result<()> {
+        let started = Instant::now();
         let subject = question.describe();
         let tool = question.tool;
 
         let Some(policy) = &self.policy else {
-            self.record_decision(question, AuthorizationOutcome::PolicyUnavailable);
+            self.record_decision(
+                question,
+                AuthorizationOutcome::PolicyUnavailable,
+                started.elapsed(),
+            );
             return Err(Error::PermissionDenied(format!(
                 "tool `{tool}`: {subject} is required, but no policy engine is configured"
             )));
@@ -249,7 +268,11 @@ impl InProcessToolRegistry {
         let decision = match policy.evaluate(&request, question.cx).await {
             Ok(decision) => decision,
             Err(error) => {
-                self.record_decision(question, AuthorizationOutcome::PolicyUnavailable);
+                self.record_decision(
+                    question,
+                    AuthorizationOutcome::PolicyUnavailable,
+                    started.elapsed(),
+                );
                 return Err(error);
             }
         };
@@ -284,6 +307,7 @@ impl InProcessToolRegistry {
                             self.record_decision(
                                 question,
                                 AuthorizationOutcome::ApprovalUnavailable,
+                                started.elapsed(),
                             );
                             return Err(error);
                         }
@@ -292,7 +316,7 @@ impl InProcessToolRegistry {
             },
         };
 
-        self.record_decision(question, outcome);
+        self.record_decision(question, outcome, started.elapsed());
 
         match error {
             Some(message) => Err(Error::PermissionDenied(format!("tool `{tool}`: {message}"))),
@@ -411,21 +435,40 @@ impl ToolRegistry for InProcessToolRegistry {
         arguments: serde_json::Value,
         cx: &ExecutionContext,
     ) -> Result<ToolOutcome> {
+        let started = Instant::now();
         let principal = Self::principal_of(cx);
 
         let Some(tool) = self.tools.get(name).cloned() else {
-            self.record_invocation(cx, name, &principal, InvocationOutcome::NotFound);
+            self.record_invocation(
+                cx,
+                name,
+                &principal,
+                InvocationOutcome::NotFound,
+                started.elapsed(),
+                None,
+                None,
+            );
             return Err(Error::not_found("tool", name));
         };
 
         let spec = tool.spec();
+        let authorization_started = Instant::now();
         if let Err(error) = self
             .authorize(cx, &spec, tool.as_ref(), &principal, &arguments)
             .await
         {
-            self.record_invocation(cx, name, &principal, InvocationOutcome::Denied);
+            self.record_invocation(
+                cx,
+                name,
+                &principal,
+                InvocationOutcome::Denied,
+                started.elapsed(),
+                Some(authorization_started.elapsed()),
+                None,
+            );
             return Err(error);
         }
+        let authorization_duration = authorization_started.elapsed();
 
         let authorizer = ScopedAuthorizer {
             registry: self,
@@ -434,7 +477,9 @@ impl ToolRegistry for InProcessToolRegistry {
             cx,
         };
 
+        let execution_started = Instant::now();
         let result = tool.invoke(arguments, &authorizer, cx).await;
+        let execution_duration = execution_started.elapsed();
 
         let outcome = match &result {
             Ok(outcome) if outcome.is_error => InvocationOutcome::ReportedError,
@@ -448,10 +493,24 @@ impl ToolRegistry for InProcessToolRegistry {
                 kind: format!("{:?}", error.kind()).to_lowercase(),
             },
         };
-        self.record_invocation(cx, name, &principal, outcome);
+        self.record_invocation(
+            cx,
+            name,
+            &principal,
+            outcome,
+            started.elapsed(),
+            Some(authorization_duration),
+            Some(execution_duration),
+        );
 
         result
     }
+}
+
+/// Converts a duration to milliseconds, saturating rather than panicking on an
+/// implausibly long one.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// A [`PrincipalId`] for the implicit system principal, for policy engines that want to

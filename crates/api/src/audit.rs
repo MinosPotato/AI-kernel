@@ -129,6 +129,18 @@ pub struct AuthorizationDecided {
     pub resource: Option<ResourceId>,
     /// Which stage asked.
     pub phase: AuthorizationPhase,
+    /// How long this one decision took to reach, in milliseconds.
+    ///
+    /// Measured from the moment the question was formed to the moment
+    /// [`AuthorizationOutcome`] was decided — policy evaluation for
+    /// [`AuthorizationOutcome::Allowed`]/[`AuthorizationOutcome::Denied`], and *including
+    /// the human's response time* for [`AuthorizationOutcome::ApprovalGranted`]/
+    /// [`AuthorizationOutcome::ApprovalRefused`]/[`AuthorizationOutcome::ApprovalUnavailable`]
+    /// — since asking a human is the dominant cost of that phase and there is no coarser
+    /// event this crate publishes to separate the two. A locally measured wall-clock
+    /// duration (`std::time::Instant`), not a provider- or policy-engine-reported figure.
+    #[serde(default)]
+    pub duration_ms: u64,
     /// The answer.
     #[serde(flatten)]
     pub outcome: AuthorizationOutcome,
@@ -193,6 +205,36 @@ pub struct ToolInvoked {
     /// Who they were acting for, if anyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<PrincipalId>,
+    /// How long the whole call took, in milliseconds: authorization plus execution.
+    ///
+    /// Present even for [`InvocationOutcome::NotFound`] and
+    /// [`InvocationOutcome::Denied`], where it measures whatever work happened before the
+    /// call was refused. A locally measured wall-clock duration, not a provider figure.
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// How long authorization (every [`AuthorizationPhase::Tool`] and
+    /// [`AuthorizationPhase::Resource`] question this call required) took, in milliseconds.
+    ///
+    /// `None` for [`InvocationOutcome::NotFound`], where no authorization question was ever
+    /// asked. Includes any approval wait, for the same reason
+    /// [`AuthorizationDecided::duration_ms`] does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_duration_ms: Option<u64>,
+    /// How long the tool itself ran, in milliseconds, excluding authorization.
+    ///
+    /// `None` when the tool never ran at all — [`InvocationOutcome::NotFound`] or
+    /// [`InvocationOutcome::Denied`]. This is the figure to read as "tool latency" in the
+    /// narrow sense; [`ToolInvoked::duration_ms`] is the end-to-end figure most callers
+    /// actually experience.
+    ///
+    /// Note this can still include authorization time: a tool such as
+    /// `filesystem.list` asks [`AuthorizationPhase::DiscoveredResource`] questions *while
+    /// it runs*, one per entry, which are structurally part of its execution rather than
+    /// of the up-front [`ToolInvoked::authorization_duration_ms`] phase. Summing every
+    /// [`AuthorizationDecided::duration_ms`] for the same correlation gives the true total
+    /// authorization time when that distinction matters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_duration_ms: Option<u64>,
     /// How it ended.
     #[serde(flatten)]
     pub outcome: InvocationOutcome,
@@ -218,6 +260,7 @@ mod tests {
             action: ActionId::new("demo.act"),
             resource: Some(ResourceId::new("/tmp/x")),
             phase: AuthorizationPhase::Resource,
+            duration_ms: 5,
             outcome: AuthorizationOutcome::Allowed,
         }
     }
@@ -267,6 +310,9 @@ mod tests {
             principal: PrincipalId::new("agent-1"),
             principal_kind: PrincipalKind::Agent,
             on_behalf_of: Some(PrincipalId::new("user-1")),
+            duration_ms: 12,
+            authorization_duration_ms: Some(3),
+            execution_duration_ms: Some(9),
             outcome: InvocationOutcome::Failed {
                 kind: "timeout".into(),
             },
@@ -275,9 +321,31 @@ mod tests {
         assert_eq!(json["result"], json!("failed"));
         assert_eq!(json["kind"], json!("timeout"));
         assert_eq!(json["on_behalf_of"], json!("user-1"));
+        assert_eq!(json["duration_ms"], json!(12));
+        assert_eq!(json["authorization_duration_ms"], json!(3));
+        assert_eq!(json["execution_duration_ms"], json!(9));
 
         let parsed: ToolInvoked = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn a_tool_invocation_that_never_ran_omits_its_execution_duration() {
+        let event = ToolInvoked {
+            correlation: CorrelationId::new(),
+            timestamp: Timestamp::from_millis(2_000),
+            tool: ToolName::new("ghost"),
+            principal: PrincipalId::new("agent-1"),
+            principal_kind: PrincipalKind::Agent,
+            on_behalf_of: None,
+            duration_ms: 1,
+            authorization_duration_ms: None,
+            execution_duration_ms: None,
+            outcome: InvocationOutcome::NotFound,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("authorization_duration_ms").is_none());
+        assert!(json.get("execution_duration_ms").is_none());
     }
 
     #[test]
