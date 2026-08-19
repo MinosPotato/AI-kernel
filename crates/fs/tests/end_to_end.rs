@@ -538,6 +538,60 @@ async fn the_write_tools_confinement_holds_even_when_policy_allows_everything() 
     kernel.shutdown().await.unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_parent_escape_is_audited_as_failed_not_denied_even_with_a_permissive_policy() {
+    // Combines two independent guarantees this crate and `aik-tools` each make: the write
+    // tool refuses to resolve a claim through a symlinked parent that escapes its root,
+    // regardless of policy (this test's `*`/`*` rules would authorize anything a resource
+    // claim named), and `InProcessToolRegistry` records that refusal as
+    // `Failed { kind: "confinement" }` rather than `Denied`, because `planned_resources`
+    // fails before any policy question is asked about it — see
+    // `InProcessToolRegistry::invoke` in `crates/tools/src/registry.rs`.
+    let outer = tempfile::tempdir().unwrap();
+    let root_dir = outer.path().join("root");
+    let elsewhere = outer.path().join("elsewhere");
+    std::fs::create_dir(&root_dir).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root_dir.join("escape")).unwrap();
+
+    let kernel = stack(
+        &root_dir,
+        engine(json!({ "rules": [
+            { "action": "*", "resource": "*", "effect": { "decision": "allow" } },
+            { "action": "*", "effect": { "decision": "allow" } }
+        ]})),
+    );
+    kernel.start().await.unwrap();
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let (name, arguments) = write_call("escape/planted.txt", "PLANTED");
+    let error = tools
+        .invoke(&name, arguments, &agent("a1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
+    assert!(!elsewhere.join("planted.txt").exists());
+
+    // No policy question was ever asked — the tool never produced a resource claim to ask
+    // about, so there is nothing for a permissive policy to have authorized in the first
+    // place.
+    assert!(drain(&mut decisions).is_empty());
+
+    let invoked = drain(&mut invocations);
+    assert_eq!(invoked.len(), 1);
+    assert_eq!(
+        invoked[0].outcome,
+        InvocationOutcome::Failed {
+            kind: "confinement".into()
+        }
+    );
+
+    kernel.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Listing: the first tool that authorizes resources it only discovers by running
 // ---------------------------------------------------------------------------

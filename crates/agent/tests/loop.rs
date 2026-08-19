@@ -810,6 +810,59 @@ async fn cancelling_during_a_tool_call_stops_the_run() {
 }
 
 #[tokio::test]
+async fn a_tool_failure_that_coincides_with_cancellation_still_records_its_real_outcome() {
+    // The tool call itself completes with a real, specific outcome (a failure with its own
+    // reason) at the same moment something else independently cancels the run. The run must
+    // still end as cancelled -- no further turn is safe -- but the transcript must show what
+    // actually happened to the call, not a fabricated "the run stopped before this call was
+    // made", since the call was in fact made and did get an answer.
+    let token = CancellationToken::new();
+    let harness = Harness::builder(ScriptedModel::new([
+        Reply::calls([call("c1", "probe", json!({}))]),
+        Reply::answer("never reached"),
+    ]))
+    .tool(ProbeTool::new(
+        "probe",
+        Behaviour::FailAndCancel("the probe found something wrong".into(), token.clone()),
+    ))
+    .build();
+
+    let cx = ExecutionContext {
+        cancellation: token,
+        ..user("alice")
+    };
+
+    let error = harness
+        .agent
+        .run(request("go", harness.session), &cx)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(
+        harness.model.call_count(),
+        1,
+        "no further turn once the run is cancelled",
+    );
+
+    let transcript = harness.transcript(&cx).await;
+    let ContentPart::ToolResult {
+        call_id,
+        content,
+        is_error,
+    } = &transcript[2].message.content[0]
+    else {
+        panic!("expected the tool call to be answered");
+    };
+    assert_eq!(call_id, "c1");
+    assert!(is_error);
+    // The call's own outcome, not the run's: `Error::other` classifies as "other", never
+    // "cancelled", and the message is the tool's real reason, not a generic run-stopped one.
+    assert_eq!(content["kind"], json!("other"));
+    assert_eq!(content["message"], json!("the probe found something wrong"));
+}
+
+#[tokio::test]
 async fn a_run_cancelled_during_a_turn_never_starts_the_tool_it_asked_for() {
     let token = CancellationToken::new();
     let cancelling = token.clone();

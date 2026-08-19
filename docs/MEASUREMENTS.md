@@ -103,8 +103,8 @@ Per turn:
   [req]  turn 2 — system 0, tools 301 (2 offered), conversation 247, total 548 (estimated)
   [req]  provider usage: 133 in / 114 out (exact, as reported)
   [req]  model latency: 1593ms
-  [auth] Resource filesystem.write on ... → ApprovalGranted (118ms)
-  [tool] filesystem.write → Succeeded (4ms exec, 118ms auth)
+  [auth] agent-1 (Agent) Resource filesystem.write on ... → ApprovalGranted (118ms)
+  [tool] agent-1 (Agent) filesystem.write → Succeeded (4ms exec, 118ms auth)
 ```
 
 End of turn / end of session:
@@ -215,6 +215,69 @@ separated by workload shape:
 | Authorization latency | 0ms observed for the in-memory `RuleBasedPolicyEngine` | Locally exact (wall-clock) |
 | Approval latency | ~0ms observed *in this scripted pass* because the answer was piped instantly | Locally exact, but not representative of a human's real response time — see [Limitations](#limitations) |
 
+## Turn-over-turn provider usage: evidence of server-side reuse
+
+Not part of the original pass — found while investigating the [tool-definition-resend
+recommendation](#recommended-next-step) below, and important enough to correct it.
+
+**Observation.** Within one multi-turn conversation, the *second* turn's provider-reported
+input tokens are consistently far lower than the first's, even though the second turn's
+actual request is strictly larger (the first turn's messages and tool definitions, byte-for-
+byte, plus the assistant's tool call and the tool's result appended after them). Reproduced
+three times, against a real local Ollama server (`0.32.9`, the same version and model —
+`llama3.1:8b` — as the rest of this document), with three different files and prompts:
+
+| Conversation | Turn 1 provider input | Turn 2 provider input | Turn 2's actual request vs. turn 1's |
+|---|---|---|---|
+| "what is in notes.txt?" | 391 | 109 | superset: same messages + tool call + tool result |
+| "read secret.txt" | 388 | 105 | superset: same messages + tool call + tool result |
+| (continuing that conversation) "what did it say" | 505 | 222 | superset: same messages + tool call + tool result |
+| (continuing again) "say it once more" | 575 | 292 | superset: same messages + tool call + tool result |
+
+Every one of these turn pairs sends the *identical* tool definitions (the tool set is fixed
+once per run — see `Run::prepare` in `crates/agent/src/run.rs` — never rebuilt per turn) and
+a message list where turn 2's is turn 1's plus two appended messages. If Ollama reported the
+true total size of the prompt it evaluated, turn 2's number could not be smaller than turn
+1's. It is, by roughly the same ~270–290-token margin each time — suspiciously close to the
+combined size of the two appended messages, not to the size of what was dropped.
+
+**What this does and does not show.** `aik_ollama::protocol::ChatRequest` (see
+`crates/ollama/src/protocol.rs`) carries no session, context or cache-key field of any
+kind — verified by reading the struct, not inferred — so this is not something `aik-ollama`
+or the kernel's `ModelProvider` contract does. The client sends the full prompt, tool
+definitions included, on every single call; nothing about *what is transmitted* changes.
+What the evidence points to is the **server** — most plausibly Ollama/llama.cpp's own
+prompt-prefix (KV-cache) reuse across closely-spaced requests to the same loaded model —
+evaluating only the newly-appended suffix of a repeated prefix, and reporting
+`prompt_eval_count` as that smaller, "newly evaluated" figure rather than the true prompt
+length. This pass did not locate and verify an authoritative definition of
+`prompt_eval_count` in Ollama's own documentation, so — per this project's own rule against
+asserting undocumented API behaviour — the mechanism above is stated as an inference from
+reproducible measurements, not as a confirmed fact.
+
+A control makes clear this is tied to prefix continuation, not just "the second identical
+call is always cheaper": four **independent** `aik` invocations (fresh process, fresh
+session, `--no-tools`, no shared conversation) of the exact same one-line prompt
+("Say PONG and nothing else.") back to back all reported the identical `17 in` — no
+reduction at all, run to run. A different prompt run in between also reported its own full
+count (`18 in`), not a partial one. So the reduction above is specific to a request whose
+prefix was *just* evaluated by the same model, within the same running conversation — not a
+general "repeated prompts get cheaper" effect.
+
+**Why this matters for the recommendation below.** It does not mean the client should stop
+caring — the client still transmits the full tool-definition payload on every turn
+regardless (bandwidth and, for a provider that bills by tokens *sent* rather than tokens the
+server chooses to newly evaluate, cost, are both unaffected by this). But it does mean the
+premise "no caching or deduplication of any kind" was too strong, and that any future
+work in this area needs to separately account for provider-reported *newly-evaluated*
+tokens (what was measured throughout this document as "provider usage") against the *true*
+prompt size for that turn — a distinction [What is measured](#what-is-measured) at the top
+of this document does not yet draw, and `RequestEstimate`'s local heuristic does not draw
+either. Building a client-side cache against a server that may already be doing this work
+risks solving a smaller problem than the numbers first suggested, or double-discounting the
+same savings — exactly the kind of evidence a caching change would need to gather first,
+now gathered.
+
 ## Reproducing these measurements
 
 ```bash
@@ -281,28 +344,57 @@ Inspect `*.jsonl` for the structured form of everything `-v` printed.
 * **The heuristic token counter is not a real tokenizer**, by design (see
   `crates/context/src/tokens.rs`) — every number in this document labelled "estimated"
   should be read as a consistent, monotonic, but not billing-accurate figure.
-* **An observation, not a bug found by this pass:** `ToolInvoked.outcome` is
-  `InvocationOutcome::Denied` for *any* error `InProcessToolRegistry::authorize` returns —
-  including a `Tool::planned_resources` failure that has nothing to do with a policy
-  decision, such as reading a file that does not exist (`resolve_within` cannot canonicalise
-  a path that is not there, so the read tool's own resource-claim construction fails before
-  any policy question is even asked). This was true before this pass — the `if let
-  Err(error) = self.authorize(...)` branch that produces it predates this work — and
-  `duration_ms`/`authorization_duration_ms` are correctly populated for it regardless of
-  what the outcome label means; it is noted here because it was visible in scenario H's
-  audit trail and is worth knowing when reading `ToolInvoked` events, not because it affects
-  anything this pass implemented.
+* **Fixed since this pass:** `ToolInvoked.outcome` used to be `InvocationOutcome::Denied` for
+  *any* error `InProcessToolRegistry::authorize` returned, including a
+  `Tool::planned_resources` failure that has nothing to do with a policy decision, such as
+  reading a file that does not exist (`resolve_within` cannot canonicalise a path that is not
+  there, so the read tool's own resource-claim construction fails before any policy question
+  is even asked). It was visible in scenario H's audit trail as a `NotFound` read recorded
+  identically to an actual policy refusal. `InProcessToolRegistry::invoke` now calls
+  `Tool::planned_resources` before entering the authorization phase, so a claim that fails to
+  build is recorded as `InvocationOutcome::Failed { kind: "notfound" }` and a claim that is
+  actually refused (including by a broken policy engine or approval sink, which fails closed)
+  is recorded as `InvocationOutcome::Denied` — see
+  `classify_authorization_error`/`InProcessToolRegistry::authorize` in
+  `crates/tools/src/registry.rs`, and
+  `a_resource_claim_that_cannot_be_built_is_audited_as_failed_not_denied` in
+  `crates/tools/tests/authorization.rs`.
+* **Follow-up fix, same theme:** the `Failed { kind }` this produces was itself too coarse for
+  one specific case. `crates/fs`'s confinement checks (a symlink escaping a tool's root, a
+  final-component symlink the write tool refuses to follow, a hard-linked write target) used
+  to return `Error::InvalidArgument` — the same variant as a missing field or a NUL byte in a
+  path — so `InvocationOutcome::Failed { kind: "invalidargument" }` could not distinguish an
+  actual boundary-escape attempt from a malformed request. `aik_core::Error` now has a
+  dedicated `Confinement` variant (`ErrorKind::Confinement`) for exactly this, so the same
+  scenario now audits as `Failed { kind: "confinement" }`. See
+  `crates/core/src/error.rs`, `crates/fs/src/{common,write}.rs`, and
+  `a_symlinked_parent_escape_is_audited_as_failed_not_denied_even_with_a_permissive_policy` in
+  `crates/fs/tests/end_to_end.rs`.
 
 ## Recommended next step
 
-Based only on the measurements collected in this pass: **tool-definition resend is the
-single highest-value target.** It is fixed cost — 122–469 estimated tokens (211–537 tokens
-by the provider's own count) — added to *every single turn* of *every conversation*,
-whether or not the model ever calls a tool, and it currently has no caching or
-deduplication of any kind (`ModelProvider::complete` takes a fresh `CompletionRequest`
-every call, and Ollama's `/api/chat` is stateless). By contrast, tool-*result* growth
-(scenario D/F) is already bounded by the existing elision/eviction mechanism, and the
-fixed 0-tool conversation overhead (17 tokens) is negligible next to either. No optimisation
-for this was implemented as part of this pass, per its explicit scope — this is a
-measurement-driven recommendation for what to investigate next, not an instruction to
-implement it here.
+Based on the measurements collected in this pass, tool-definition resend remains the
+largest *client-controlled* fixed cost: 122–469 estimated tokens (211–537 tokens by the
+provider's own count), sent on *every single turn* of *every conversation* whether or not
+the model calls a tool, with no client-side caching or deduplication of any kind — the
+client (`aik-ollama`) sends the full tool-definition payload every call, unconditionally,
+and nothing in `aik_api::model::ModelProvider` or `aik_ollama::protocol::ChatRequest`
+carries a session or cache key that could avoid that. That much is unchanged and still
+true.
+
+What changed since the first version of this recommendation is the
+[turn-over-turn evidence above](#turn-over-turn-provider-usage-evidence-of-server-side-reuse):
+the *provider-reported* cost of a turn that repeats a just-sent prefix — which includes the
+tool definitions — is already far lower than the full prompt size, most plausibly because
+the server is not re-evaluating a prefix it just evaluated. That does not make client-side
+caching pointless (bytes still cross the wire every turn regardless, and a token-billed
+non-local provider would not necessarily pass along the same discount), but it means the
+size of the win this recommendation originally claimed — full provider-reported
+tool-definition cost, saved every turn — is not established, since some of it may already
+be absorbed server-side under exactly the repeated-conversation workload this
+recommendation is about. **Before implementing anything here, the next pass should
+establish, for whichever provider(s) are actually in scope, whether "provider-reported
+input tokens" already reflects server-side reuse (as this pass found evidence of for
+Ollama) and whether that reuse is documented/guaranteed behaviour or an implementation
+detail not to be relied on** — not implemented as part of this pass, since it is measurement
+work, not the optimisation itself.

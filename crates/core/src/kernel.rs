@@ -352,6 +352,15 @@ impl Kernel {
     }
 
     /// Unwinds a failed startup. Errors are logged; the original failure is what matters.
+    ///
+    /// Mirrors [`Kernel::shutdown`]'s own last step: [`Tasks::cancel`] (which `stop_range`
+    /// already calls per component) only *signals* cancellation, it does not wait, so
+    /// without this a component whose `start` spawned a background task would have that
+    /// task merely told to stop rather than actually waited on before `start` returns —
+    /// the caller would treat the kernel as fully torn down while cleanup work might still
+    /// be mid-flight. `Tasks::shutdown` is safe to call again if the caller goes on to call
+    /// [`Kernel::shutdown`] explicitly afterwards; both cancelling an already-cancelled
+    /// token and closing an already-closed tracker are no-ops.
     async fn rollback(&self, count: usize) {
         if count == 0 {
             return;
@@ -359,6 +368,9 @@ impl Kernel {
         tracing::warn!(components = count, "rolling back a failed startup");
         if let Some(error) = self.stop_range(count).await {
             tracing::error!(%error, "a component also failed while rolling back");
+        }
+        if let Err(error) = self.ctx.tasks().shutdown(self.shutdown_timeout).await {
+            tracing::warn!(%error, "background tasks did not finish rolling back in time");
         }
     }
 

@@ -118,7 +118,7 @@ fn confine(canonical: PathBuf, root: &Path) -> Result<PathBuf> {
     if canonical.starts_with(root) {
         Ok(canonical)
     } else {
-        Err(Error::InvalidArgument(
+        Err(Error::Confinement(
             "path resolves outside the tool's allowed root".into(),
         ))
     }
@@ -156,7 +156,7 @@ pub(crate) fn verify_handle_within(file: &File, root: &Path) -> Result<()> {
     if real.starts_with(root) {
         Ok(())
     } else {
-        Err(Error::InvalidArgument(
+        Err(Error::Confinement(
             "the opened file resolves outside the tool's allowed root".into(),
         ))
     }
@@ -223,7 +223,7 @@ pub(crate) fn create_within(
     if descriptor < 0 {
         let error = std::io::Error::last_os_error();
         return Err(match error.raw_os_error() {
-            Some(libc::ELOOP) => Error::InvalidArgument(
+            Some(libc::ELOOP) => Error::Confinement(
                 "the path's final component is a symlink; this tool never writes through one"
                     .into(),
             ),

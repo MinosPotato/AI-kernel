@@ -261,8 +261,11 @@ An allow rule for `/etc/*` does not make `filesystem.read` able to read `/etc/pa
 tool confined to `/home/user/project` — the tool never produces `/etc/passwd` as a resource to
 ask about; the call is refused as `path resolves outside the tool's allowed root` before
 authorization runs at all. Confirmed directly: `--policy` set to allow everything (`"*"`) still
-refuses an absolute path, a `../` traversal, and a symlink whose target resolves outside the
-root, all with `Error::InvalidArgument`, never reaching a permission decision.
+refuses an absolute path or a `../` traversal (`Error::InvalidArgument` — malformed input,
+rejected on syntax alone) and a symlink whose target resolves outside the root
+(`Error::Confinement` — the tool's own boundary, kept distinct from a malformed request so an
+audit consumer can tell a genuine escape attempt from a typo; see
+[Filesystem confinement](#filesystem-confinement)), never reaching a permission decision.
 
 ## Approvals and the one-shot security posture
 
@@ -319,9 +322,9 @@ conversation output:
   [req]  turn 2 — system 0, tools 301 (2 offered), conversation 244, total 545 (estimated)
   [req]  provider usage: 337 in / 20 out (exact, as reported)
   [req]  model latency: 401ms
-  [auth] Tool filesystem.write → Allowed (0ms)
-  [auth] Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted (118ms, 115ms of it waiting on approval)
-  [tool] filesystem.write → Succeeded (4ms exec, 118ms auth)
+  [auth] agent-1 (Agent) Tool filesystem.write → Allowed (0ms)
+  [auth] agent-1 (Agent) Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted (118ms, 115ms of it waiting on approval)
+  [tool] agent-1 (Agent) filesystem.write → Succeeded (4ms exec, 118ms auth)
 ```
 
 - `[ctx]` — one per model turn, from the context store's `ContextAssembled` event: how many
@@ -336,15 +339,18 @@ conversation output:
   definitions are attached to the request by the agent loop, not read from the context store, so
   their cost is invisible to `ContextAssembled` — see
   [`docs/MEASUREMENTS.md`](MEASUREMENTS.md) for why.
-- `[auth]` — one per authorization question (`Tool`, `Resource`, or `DiscoveredResource` phase —
-  see [Filesystem confinement](#filesystem-confinement) for what the third phase is), with the
-  outcome (`Allowed`, `Denied`, `ApprovalGranted`, `ApprovalRefused`, `ApprovalUnavailable`,
-  `PolicyUnavailable`) and how long the decision took, in parentheses. For an approval-related
-  outcome, the parenthetical breaks out how much of that time was specifically spent waiting for
-  a human to answer — see `AuthorizationDecided.approval_wait_ms`, which is `None` (and so
-  omitted here) whenever no approval sink was ever asked.
-- `[tool]` — one per completed (or refused, or not-found) invocation, with execution and
-  authorization time in parentheses where they apply.
+- `[auth]` — one per authorization question, prefixed with who was asking (the principal id and
+  kind, plus `on behalf of <id>` when the principal is acting under delegated authority — see
+  `AuthorizationDecided.on_behalf_of`), then the phase (`Tool`, `Resource`, or
+  `DiscoveredResource` — see [Filesystem confinement](#filesystem-confinement) for what the
+  third phase is), the outcome (`Allowed`, `Denied`, `ApprovalGranted`, `ApprovalRefused`,
+  `ApprovalUnavailable`, `PolicyUnavailable`) and how long the decision took, in parentheses.
+  For an approval-related outcome, the parenthetical breaks out how much of that time was
+  specifically spent waiting for a human to answer — see
+  `AuthorizationDecided.approval_wait_ms`, which is `None` (and so omitted here) whenever no
+  approval sink was ever asked.
+- `[tool]` — one per completed (or refused, or not-found) invocation, prefixed the same way with
+  who was asking, with execution and authorization time in parentheses where they apply.
 
 At the end of each turn, and again at the end of the whole session, a cumulative line is
 printed:
@@ -363,13 +369,12 @@ the order they happened, with correct phase labels (a `filesystem.list` on a dir
 one `Tool`, one `Resource` for the directory itself, and one `DiscoveredResource` per entry it
 found — visible directly in `-v` output).
 
-**Known display gap:** the verbose renderer does not print the `principal`/`on_behalf_of`
-fields the underlying `AuthorizationDecided` event actually carries — only the action, resource
-and outcome. The identity is correctly recorded and enforced (confirmed by the audit-attribution
-test suite in `crates/cli/tests/security.rs`, and independently by `aik-tools`'s own tests), it
-just is not surfaced in this particular text rendering. Not a security gap — a display
-limitation, worth knowing if you are trying to eyeball delegated-identity behaviour from `-v`
-output alone rather than from the raw events.
+The verbose renderer also prefixes each `[auth]`/`[tool]` line with who was asking — the
+`principal`/`on_behalf_of` fields the underlying `AuthorizationDecided`/`ToolInvoked` events
+carry — so delegated-identity behaviour (e.g. `assistant (Agent, on behalf of user)`) is visible
+directly in `-v` output, not only in the raw events. Identity is correctly recorded and enforced
+independently of this rendering (confirmed by the audit-attribution test suite in
+`crates/cli/tests/security.rs`, and independently by `aik-tools`'s own tests).
 
 ## Structured recording: `--record`/`-R`
 
@@ -407,6 +412,16 @@ swapped in at the last moment, or a directory renamed after being checked, canno
 write. A target with more than one hard link is refused outright, since a second name for the
 same inode could sit outside the root without any path ever showing it.
 
+Every refusal above — steps 2/3 above, the write tool's handle re-verification, its final-
+component symlink refusal, and its hard-link refusal — is reported as `Error::Confinement`,
+not `Error::InvalidArgument`. The two are deliberately distinct classifications
+(`ErrorKind::Confinement` vs. `ErrorKind::InvalidArgument` in `crates/core/src/error.rs`):
+step 1's syntax rejections and other malformed input (a missing field, a non-string path) never
+resolved anything, so they are `InvalidArgument`, while everything in this section resolved a
+path and then refused what it found — the audit trail (`InvocationOutcome::Failed { kind:
+"confinement" }` on `ToolInvoked`, see [Verbose mode](#verbose-mode)) lets a consumer alert on
+an actual escape attempt without also matching every typo'd filename.
+
 Directory listing (`filesystem.list`) authorizes the directory itself up front, then each entry
 individually as it is discovered while reading it — the `DiscoveredResource` phase visible in
 `-v` output. A refused entry is simply left out of the listing; it does not fail the call, so a
@@ -414,10 +429,10 @@ directory containing one restricted item still lists everything else.
 
 Verified directly against a real symlink pointing outside the configured root
 (`ln -s /outside/secret.txt ./escape-link`): reading it, writing through it, and listing a
-directory containing it all behave exactly as documented — read and write both refuse it
-(`path resolves outside the tool's allowed root` / `the path's final component is a symlink;
-this tool never writes through one`), and listing reports it as a `symlink` entry without
-following it.
+directory containing it all behave exactly as documented — read and write both refuse it with
+`Error::Confinement` (`path resolves outside the tool's allowed root` / `the path's final
+component is a symlink; this tool never writes through one`), and listing reports it as a
+`symlink` entry without following it.
 
 **What this does not close, by design:** the window between resolving a path and the syscall
 that acts on it is a property of the POSIX filesystem API, not of any one process's care.
@@ -579,8 +594,6 @@ These are documented, deliberate properties of the current implementation, not d
   reported `prompt_eval_count` and the CLI's own `window tokens` figure routinely differ by an
   order of magnitude once tool schemas are counted (see
   [Token and context cost](#token-and-context-cost-a-baseline)).
-- **Verbose mode does not display principal/delegation attribution**, even though the
-  underlying audit events carry it correctly (see [Verbose mode](#verbose-mode)).
 - **The TOCTOU window between resolving a path and acting on it is not fully closed** — a
   documented property of the POSIX filesystem API, mitigated but not eliminated by the write
   tool's handle-pinning; see [Filesystem confinement](#filesystem-confinement).
