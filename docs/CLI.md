@@ -366,13 +366,12 @@ the order they happened, with correct phase labels (a `filesystem.list` on a dir
 one `Tool`, one `Resource` for the directory itself, and one `DiscoveredResource` per entry it
 found — visible directly in `-v` output).
 
-**Known display gap:** the verbose renderer does not print the `principal`/`on_behalf_of`
-fields the underlying `AuthorizationDecided` event actually carries — only the action, resource
-and outcome. The identity is correctly recorded and enforced (confirmed by the audit-attribution
-test suite in `crates/cli/tests/security.rs`, and independently by `aik-tools`'s own tests), it
-just is not surfaced in this particular text rendering. Not a security gap — a display
-limitation, worth knowing if you are trying to eyeball delegated-identity behaviour from `-v`
-output alone rather than from the raw events.
+The verbose renderer also prefixes each `[auth]`/`[tool]` line with who was asking — the
+`principal`/`on_behalf_of` fields the underlying `AuthorizationDecided`/`ToolInvoked` events
+carry — so delegated-identity behaviour (e.g. `assistant (Agent, on behalf of user)`) is visible
+directly in `-v` output, not only in the raw events. Identity is correctly recorded and enforced
+independently of this rendering (confirmed by the audit-attribution test suite in
+`crates/cli/tests/security.rs`, and independently by `aik-tools`'s own tests).
 
 ## Structured recording: `--record`/`-R`
 
