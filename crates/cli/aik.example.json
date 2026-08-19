@@ -1,0 +1,68 @@
+{
+  "cli": {
+    "system_prompt": "You are a careful assistant working inside one project directory. Use the filesystem tools to look things up rather than guessing. Paths are relative to the project root.",
+    "user": "user",
+    "agent": "assistant"
+  },
+
+  "components": {
+    "model": {
+      "ollama": {
+        "endpoint": "http://localhost:11434",
+        "request_timeout_ms": 120000
+      }
+    }
+  },
+
+  "policy": {
+    "rules": [
+      {
+        "description": "Never read anything that looks like a credential, whatever else allows it. First, because the first matching rule decides.",
+        "action": "filesystem.*",
+        "resource": "*/.env*",
+        "effect": { "decision": "deny", "reason": "may contain credentials" }
+      },
+      {
+        "description": "Same, for private keys and the local kernel state.",
+        "action": "filesystem.*",
+        "resource": "*/.ssh/*",
+        "effect": { "decision": "deny", "reason": "may contain credentials" }
+      },
+
+      {
+        "description": "Reading and listing are allowed as capabilities. A rule with no `resource` answers only the capability-level question.",
+        "action": "filesystem.read",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "description": "And on any specific file. A rule with `\"*\"` answers questions about a named resource.",
+        "action": "filesystem.read",
+        "resource": "*",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "filesystem.list",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "filesystem.list",
+        "resource": "*",
+        "effect": { "decision": "allow" }
+      },
+
+      {
+        "description": "Writing is a capability the agent has, but every file it writes is put to a human. Only reachable at all when the frontend was started with --write.",
+        "action": "filesystem.write",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "filesystem.write",
+        "resource": "*",
+        "effect": {
+          "decision": "require_approval",
+          "prompt": "let the agent write to this file?"
+        }
+      }
+    ]
+  }
+}
