@@ -12,6 +12,11 @@
 //! Keeping them apart means the policy layer never depends on a UI, and a headless
 //! deployment simply has no approval sink — [`Decision::RequireApproval`] then becomes a
 //! denial rather than a hang.
+//!
+//! Neither trait enforces anything by itself; enforcement is a property of whoever calls
+//! them. For tools specifically, that caller is
+//! [`ToolRegistry`](crate::tool::ToolRegistry) — see its documentation for why the
+//! enforcement point matters as much as the policy itself.
 
 use aik_core::Result;
 use async_trait::async_trait;
@@ -165,4 +170,47 @@ pub trait ApprovalSink: Send + Sync + 'static {
         prompt: &str,
         cx: &ExecutionContext,
     ) -> Result<bool>;
+}
+
+/// Authorizes individual resources within one already-scoped operation.
+///
+/// This is the *asking* half of resource-level authorization, handed to a
+/// [`Tool`](crate::tool::Tool) for the duration of a single invocation. It deliberately
+/// takes no principal, no correlation id and no [`ExecutionContext`]: all of those are
+/// fixed when the authorizer is created, by the trusted code that created it. A tool
+/// cannot widen its own scope, ask on someone else's behalf, or outlive the call it was
+/// given for.
+///
+/// Handing this to a tool does **not** move policy into the tool. The tool asks; a
+/// [`PolicyEngine`] behind this handle decides; the tool only ever learns yes or no. The
+/// distinction that matters is between *asking* and *deciding*, and only the former is
+/// delegated.
+///
+/// # When a tool needs this
+///
+/// Most tools do not. Resources that are knowable from the arguments should be declared
+/// up front via [`Tool::planned_resources`](crate::tool::Tool::planned_resources), which
+/// the registry authorizes *before* the tool runs at all — a stronger position, because
+/// nothing has executed yet.
+///
+/// This handle exists for resources that only become known during execution:
+///
+/// * a path that turned out to be a symlink to somewhere else once resolved;
+/// * entries discovered while walking a directory or expanding a glob;
+/// * a redirect target a network request was pointed at.
+///
+/// In each case the resource the tool is *actually* about to touch differs from the one it
+/// declared, and re-asking is the only correct response. See the
+/// [TOCTOU discussion](crate::tool#time-of-check-to-time-of-use) for why this is a
+/// security requirement rather than a convenience.
+#[async_trait]
+pub trait ResourceAuthorizer: Send + Sync {
+    /// Authorizes one action against one resource.
+    ///
+    /// Returns `Ok(())` only if the operation is permitted. Anything else — a policy
+    /// denial, an approval that was refused, an approval that could not be obtained — is
+    /// [`Error::PermissionDenied`](aik_core::Error::PermissionDenied). There is
+    /// deliberately no boolean form: a `Result` that must be propagated is harder to
+    /// accidentally ignore than a `bool` that can be dropped.
+    async fn authorize(&self, action: &ActionId, resource: &ResourceId) -> Result<()>;
 }

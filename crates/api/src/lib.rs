@@ -9,9 +9,10 @@
 //! |---|---|
 //! | [`execution`] | The context an operation runs in: who, what for, until when |
 //! | [`model`] | Inference providers and embedders |
-//! | [`tool`] | Callable, schema-described capabilities |
+//! | [`tool`] | Callable, schema-described capabilities, and the invocation gate |
+//! | [`permission`] | Principals, policy, human approval and resource authorization |
+//! | [`audit`] | Structured authorization and invocation events |
 //! | [`memory`] | Persistent records and retrieval |
-//! | [`permission`] | Principals, policy and human approval |
 //! | [`scheduler`] | Time- and event-triggered jobs |
 //! | [`agent`] | Long-running work with streamed progress |
 //! | [`platform`] | The single seam to an OS or desktop |
@@ -69,6 +70,7 @@
 //! `aik-core` is the part that is meant to stay still.
 
 pub mod agent;
+pub mod audit;
 pub mod execution;
 pub mod memory;
 pub mod model;
@@ -79,14 +81,19 @@ pub mod tool;
 
 /// The contracts most implementations need.
 pub mod prelude {
+    pub use crate::audit::{AuthorizationDecided, AuthorizationPhase, ToolInvoked};
     pub use crate::execution::ExecutionContext;
     pub use crate::memory::{MemoryQuery, MemoryRecord, MemoryStore};
     pub use crate::model::{
         CompletionChunk, CompletionRequest, CompletionResponse, ContentPart, Embedder, Message,
         ModelId, ModelProvider, Role,
     };
-    pub use crate::permission::{Decision, PermissionRequest, PolicyEngine, Principal};
+    pub use crate::permission::{
+        Decision, PermissionRequest, PolicyEngine, Principal, ResourceAuthorizer,
+    };
     pub use crate::platform::{PlatformCapability, PlatformIntegration};
     pub use crate::scheduler::{JobHandler, JobSpec, Scheduler, Trigger};
-    pub use crate::tool::{Tool, ToolCatalog, ToolName, ToolOutcome, ToolSpec};
+    pub use crate::tool::{
+        ResourceClaim, Tool, ToolCatalog, ToolName, ToolOutcome, ToolRegistry, ToolSpec,
+    };
 }
