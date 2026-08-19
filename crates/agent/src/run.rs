@@ -20,9 +20,10 @@ use aik_api::agent::{AgentResponse, AgentUpdate, SessionId};
 use aik_api::context::{ContextEntry, ContextStore};
 use aik_api::execution::ExecutionContext;
 use aik_api::model::{
-    CompletionRequest, ContentPart, FinishReason, Message, ModelProvider, Role, Usage,
+    CompletionRequest, ContentPart, FinishReason, Message, ModelProvider, Role, ToolDefinition,
+    Usage,
 };
-use aik_api::tool::{ToolCall, ToolName, ToolOutcome, ToolRegistry};
+use aik_api::tool::{ToolCall, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::clock::{SharedClock, Timestamp};
 use aik_core::{Error, ErrorKind, Result};
 use serde_json::json;
@@ -52,7 +53,12 @@ pub(crate) struct Run {
     started: Timestamp,
 
     /// The tools offered to the model, fixed once at the start of the run.
-    available: Vec<ToolName>,
+    ///
+    /// Held as full [`ToolSpec`](aik_api::tool::ToolSpec)s because the run needs both halves
+    /// of them and they must agree: the name it admits a call under, and the description and
+    /// schema the model is told about. Only the model-facing subset is ever sent — see
+    /// [`ToolDefinition`].
+    available: Vec<ToolSpec>,
     prepared: bool,
     /// Tool calls the last turn asked for, not yet announced.
     pending: VecDeque<ToolCall>,
@@ -196,16 +202,9 @@ impl Run {
     /// trusted metadata, and re-reading it each turn would make what an agent may do depend
     /// on when it asked.
     async fn prepare(&mut self) -> Result<()> {
-        let mut available: Vec<ToolName> = self
-            .wiring
-            .tools
-            .list(&self.cx)
-            .await?
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect();
+        let mut available: Vec<ToolSpec> = self.wiring.tools.list(&self.cx).await?;
         if let Some(allowed) = &self.wiring.allowed {
-            available.retain(|name| allowed.contains(name));
+            available.retain(|spec| allowed.contains(&spec.name));
         }
         self.available = available;
 
@@ -259,7 +258,7 @@ impl Run {
         let request = CompletionRequest {
             model: self.wiring.settings.model.clone(),
             messages: window.messages,
-            tools: self.available.clone(),
+            tools: self.available.iter().map(ToolDefinition::from).collect(),
             parameters: self.wiring.settings.parameters.clone(),
         };
 
@@ -332,7 +331,7 @@ impl Run {
     /// restriction of its own and takes none away: a name outside the run's tool set never
     /// reaches the registry at all.
     async fn call_tool(&mut self, call: ToolCall) -> Result<Vec<AgentUpdate>> {
-        let outcome = if self.available.contains(&call.name) {
+        let outcome = if self.available.iter().any(|spec| spec.name == call.name) {
             match self
                 .wiring
                 .tools

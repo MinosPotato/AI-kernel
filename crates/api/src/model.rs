@@ -145,6 +145,61 @@ pub struct ModelDescriptor {
     pub capabilities: ModelCapabilities,
 }
 
+/// What a model is told about a tool it may call.
+///
+/// The model-facing subset of a [`ToolSpec`](crate::tool::ToolSpec): the name to call, what
+/// the tool is for, and the shape of its arguments. A provider needs all three — no
+/// provider's wire format accepts a bare name — and needs nothing else.
+///
+/// # Why this is not a `ToolSpec`
+///
+/// A [`ToolSpec`](crate::tool::ToolSpec) also carries
+/// [`required_permissions`](crate::tool::ToolSpec::required_permissions), which is
+/// authorization metadata: it tells the [`ToolRegistry`](crate::tool::ToolRegistry) what to
+/// ask the policy engine before the tool runs. Handing that to a model would tell it which
+/// capability names are worth asking for and which of its options are cheap, and it would
+/// travel to whatever remote service the provider talks to. Neither is any of the model's
+/// business, and the decision is not the model's to influence in any case.
+///
+/// Passing a distinct, smaller type is what makes that structural rather than a rule a
+/// provider has to remember: a provider is handed only these three fields and cannot reach
+/// the rest, whatever it does with them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// The name the model uses to call it, matching
+    /// [`ToolCall::name`](crate::tool::ToolCall::name).
+    pub name: ToolName,
+    /// What it does, written for a model to read.
+    pub description: String,
+    /// JSON Schema describing the input object.
+    pub input_schema: Value,
+}
+
+impl ToolDefinition {
+    /// Describes a tool to a model.
+    pub fn new(
+        name: impl Into<ToolName>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
+}
+
+impl From<&crate::tool::ToolSpec> for ToolDefinition {
+    fn from(spec: &crate::tool::ToolSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            input_schema: spec.input_schema.clone(),
+        }
+    }
+}
+
 /// A request for a completion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletionRequest {
@@ -153,8 +208,13 @@ pub struct CompletionRequest {
     /// The conversation so far.
     pub messages: Vec<Message>,
     /// Tools the model may call.
+    ///
+    /// Offering a tool here is not authorization to run it, and a provider that reports a
+    /// call is not a decision that the call may happen: what a model asks for still goes
+    /// through [`ToolRegistry::invoke`](crate::tool::ToolRegistry::invoke) and is still
+    /// refused if policy says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolName>,
+    pub tools: Vec<ToolDefinition>,
     /// Provider-specific settings: temperature, sampling, safety, anything.
     ///
     /// Opaque on purpose. The alternative — a struct with every provider's knobs — would
@@ -276,5 +336,55 @@ pub trait Embedder: Send + Sync + 'static {
     fn dimensions(&self, model: &ModelId) -> Option<usize> {
         let _ = model;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::ActionId;
+    use crate::tool::ToolSpec;
+    use serde_json::json;
+
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: ToolName::new("filesystem.read"),
+            description: "Reads a file".to_owned(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: Some(json!({ "type": "string" })),
+            required_permissions: vec![ActionId::new("filesystem.read")],
+            read_only: true,
+        }
+    }
+
+    #[test]
+    fn a_definition_carries_what_a_model_needs_to_call_a_tool() {
+        let definition = ToolDefinition::from(&spec());
+        assert_eq!(definition.name, ToolName::new("filesystem.read"));
+        assert_eq!(definition.description, "Reads a file");
+        assert_eq!(definition.input_schema, json!({ "type": "object" }));
+    }
+
+    #[test]
+    fn a_definition_cannot_carry_authorization_metadata() {
+        // The security property the type exists for: whatever a provider serialises, a
+        // model never learns which permissions a tool needs.
+        let json = serde_json::to_value(ToolDefinition::from(&spec())).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["description", "input_schema", "name"]);
+    }
+
+    #[test]
+    fn a_request_with_no_tools_serialises_without_the_field() {
+        let request = CompletionRequest::new("m", vec![Message::text(Role::User, "hi")]);
+        assert!(request.tools.is_empty());
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("tools").is_none(), "{json}");
     }
 }

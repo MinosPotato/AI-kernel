@@ -661,3 +661,12 @@ pub fn text_of(message: &Message) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// The names of the tools a request offered the model, for assertions.
+pub fn offered(request: &CompletionRequest) -> Vec<String> {
+    request
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect()
+}
