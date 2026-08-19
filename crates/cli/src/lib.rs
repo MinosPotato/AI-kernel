@@ -56,7 +56,7 @@ pub mod session;
 pub mod settings;
 pub mod wiring;
 
-use aik_core::Result;
+use aik_core::{Error, Result};
 
 use crate::args::{HELP, Invocation, Options};
 use crate::settings::Settings;
@@ -81,15 +81,32 @@ pub async fn main(args: impl IntoIterator<Item = String>) -> i32 {
         Ok(Invocation::Run(options)) => match run(&options).await {
             Ok(()) => 0,
             Err(error) => {
-                eprintln!("{}: {error}", args::PROGRAM);
+                eprintln!("{}: {}", args::PROGRAM, report(&error));
                 1
             }
         },
         Err(error) => {
-            eprintln!("{}: {error}", args::PROGRAM);
+            eprintln!("{}: {}", args::PROGRAM, report(&error));
             2
         }
     }
+}
+
+/// Renders an error together with its full chain of causes.
+///
+/// `Error`'s own `Display` prints only the context of whichever wraps it, deliberately —
+/// see `aik_core::Error::wrap` — so a lower-level failure such as a refused connection or a
+/// permission error is still reachable through `std::error::Error::source`, just not part
+/// of `{error}` itself. A person reading this on a terminal wants the whole chain, since
+/// this is the only place it is ever shown to them.
+fn report(error: &Error) -> String {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    message
 }
 
 /// Builds a kernel from `options` and drives one conversation through it.
@@ -149,5 +166,27 @@ fn banner(settings: &Settings) {
     }
     if settings.is_one_shot() {
         println!("  approvals: refused (no responder attached in one-shot mode)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_includes_only_the_context_when_there_is_no_source() {
+        assert_eq!(report(&Error::other("no such model")), "no such model");
+    }
+
+    #[test]
+    fn report_walks_the_full_chain_of_causes() {
+        let root = std::io::Error::other("connection refused");
+        let middle = Error::wrap("sending a completion request to Ollama", root);
+        let outer = Error::wrap("talking to the model provider", middle);
+
+        assert_eq!(
+            report(&outer),
+            "talking to the model provider: sending a completion request to Ollama: connection refused",
+        );
     }
 }
