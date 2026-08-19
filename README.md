@@ -292,9 +292,21 @@ model output to it that does not go through trusted code deciding to record some
 ## Actually using it
 
 [`aik-cli`](crates/cli) is the frontend: a terminal that starts a kernel, holds one
-conversation with the agent, prints what it does, and answers approval prompts.
+conversation with the agent, prints what it does, and answers approval prompts. See
+[`docs/CLI.md`](docs/CLI.md) for the full manual — every option explained with examples, how to
+write a policy without hitting its sharpest edge, verbose-mode output explained event by event,
+a token/context cost baseline, and a troubleshooting table. This section is the short version.
+
+### Prerequisites
+
+- Rust 1.85 or newer (edition 2024)
+- A running [Ollama](https://ollama.com) server (`ollama serve`) with at least one model pulled
+  (`ollama pull llama3.1:8b`). For tool-calling examples specifically, the model needs to report
+  the `tools` capability — check with `ollama show <model>`; not every model does, and one that
+  doesn't will still answer, just in prose rather than by calling anything.
 
 ```bash
+cargo build -p aik-cli
 cargo run -p aik-cli -- --config crates/cli/aik.example.json --root /path/to/project
 ```
 
@@ -402,16 +414,14 @@ Kernel settings:
 
 ## Development
 
+The full verification suite, in the order it is meaningful to run it:
+
 ```bash
+cargo fmt --all --check
+cargo check --workspace --all-targets
 cargo test --workspace
-```
-
-```bash
-cargo clippy --workspace --all-targets
-```
-
-```bash
-cargo doc --workspace --no-deps --open
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
 Requires Rust 1.85 or newer (edition 2024). No platform-specific code: the workspace
@@ -440,3 +450,13 @@ events. What comes next builds *on* the kernel rather than *into* it: measuremen
 real workloads actually cost, durable audit and transcript storage, and process execution
 behind an OS-level sandbox — each as a component in its own crate, following the same
 pattern.
+
+The full pipeline — filesystem confinement, policy evaluation, human approval, tool exposure
+narrowing, verbose auditing, and the CLI's own error and session handling — has been manually
+exercised end to end against a real Ollama server, not only through the automated suite; see
+[`docs/CLI.md`](docs/CLI.md#known-limitations-and-fixes-made-during-this-review) for what that
+covered, the two bugs it found and fixed, and the token/context cost baseline it produced.
+`docs/CLI.md`'s [limitations sections](docs/CLI.md#other-known-limitations-not-bugs) separate
+what is a genuine defect from what is a documented, deliberate property of the current
+implementation (no persistence, no summarisation, a heuristic token counter, an unclosed
+filesystem TOCTOU window bounded but not eliminated by handle-pinning).

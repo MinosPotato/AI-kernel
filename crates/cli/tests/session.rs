@@ -209,6 +209,33 @@ async fn a_failed_turn_is_reported_and_the_session_carries_on() {
 }
 
 #[tokio::test]
+async fn a_one_shot_run_that_fails_reports_the_error_to_its_caller() {
+    // Unlike an interactive session, a one-shot run has no next prompt to carry on to: its
+    // caller is a script or a process exit code, and it needs to be able to tell a failed
+    // run apart from a successful one rather than always seeing `Ok(())`.
+    let root = root();
+    let harness = harness(vec![Reply::fail("the model server went away")], root.path()).await;
+
+    let mut session = Session::new(
+        &harness.kernel.context(),
+        &harness.settings,
+        Console::new(&b""[..]),
+        None,
+    )
+    .expect("a session");
+    let error = session
+        .one_shot("hello".to_owned())
+        .await
+        .expect_err("the model failure must reach the caller");
+    assert!(
+        error.to_string().contains("the model server went away"),
+        "{error}"
+    );
+
+    harness.kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn input_running_out_ends_the_session() {
     let root = root();
     let harness = harness(vec![Reply::answer("only answer")], root.path()).await;

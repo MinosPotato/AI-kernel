@@ -239,8 +239,7 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
                 }
                 Step::Update(Some(Err(error))) => {
                     self.drain(&mut stats);
-                    println!("  error: {error}");
-                    break;
+                    return Err(error);
                 }
             }
         }
