@@ -26,7 +26,7 @@ use futures::StreamExt;
 use serde_json::json;
 use support::{
     Behaviour, FixedApprovals, Harness, ProbeTool, RecordingPolicy, Reply, ScriptedModel, call,
-    text_of, user,
+    offered, text_of, user,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -455,10 +455,7 @@ async fn a_tool_outside_the_agents_set_never_reaches_the_registry() {
         .unwrap();
 
     // Not offered to the model, not asked about, not invoked.
-    assert_eq!(
-        harness.model.request(0).tools,
-        vec![ToolName::new("allowed")]
-    );
+    assert_eq!(offered(&harness.model.request(0)), ["allowed"]);
     assert!(harness.policy.questions().is_empty());
     assert!(drain(&mut invocations).is_empty());
 
@@ -487,8 +484,8 @@ async fn an_agents_tool_set_cannot_widen_what_the_registry_holds() {
         .unwrap();
 
     assert_eq!(
-        harness.model.request(0).tools,
-        vec![ToolName::new("allowed")],
+        offered(&harness.model.request(0)),
+        ["allowed"],
         "a name the registry does not have stays absent",
     );
 }

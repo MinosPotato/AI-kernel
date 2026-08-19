@@ -1,0 +1,153 @@
+//! A terminal frontend for the AI kernel.
+//!
+//! Everything below this crate was a capability: a provider that answers, a registry that
+//! authorizes, tools that act, a broker that asks, a store that remembers, a loop that
+//! ties them together. None of it could be *used* — there was no way to type a question and
+//! no way to answer an approval prompt. This crate is that, and deliberately only that.
+//!
+//! ```text
+//!   argv ──▶ Options ──▶ Settings ──▶ wiring::assemble ──▶ Kernel
+//!                          │                                 │
+//!                          │                                 ▼
+//!                          │                          dyn Agent, resolved
+//!                          │                                 │
+//!                          ▼                                 ▼
+//!                    Principal(agent)                  Agent::stream
+//!                    on_behalf_of(user)                      │
+//!                          └───── ExecutionContext ──────────┤
+//!                                                            ▼
+//!                                              AgentUpdate ──▶ terminal
+//!                                              PendingApproval ──▶ y/N
+//! ```
+//!
+//! # What it is not allowed to be
+//!
+//! The frontend is the least trustworthy part of the system to put a decision in: it is the
+//! part a person is looking at, the part rendering untrusted text, and the part that would
+//! be tempting to make "helpful". So it holds none.
+//!
+//! * **It never authorizes.** There is no policy evaluation here, no `Decision`, no
+//!   allow-list of tools it consults before calling one. It cannot invoke a tool at all —
+//!   it holds a `dyn Agent`, and the agent holds a
+//!   [`ToolRegistry`](aik_api::tool::ToolRegistry) it cannot reach around.
+//! * **It never impersonates the user.** Every turn runs as
+//!   [`Principal::new(agent, Agent).on_behalf_of(user)`](crate::settings::Settings::principal),
+//!   so a policy can distinguish what a person may do from what a model acting for them may
+//!   do. Nothing in the frontend can widen that: the principal is built once from resolved
+//!   settings and handed to the agent, and a model has no way to influence it.
+//! * **It never invents a policy.** With none configured, every tool call is denied, and the
+//!   frontend says so at startup rather than shipping a permissive default that a hurried
+//!   person would never notice.
+//! * **It only ever narrows.** Choosing not to register the write tool, or any tool, removes
+//!   a capability. There is no switch here that adds one.
+//!
+//! # Interactive and one-shot are different security postures
+//!
+//! An interactive session holds an [`ApprovalGate`](aik_approval::ApprovalGate) — an
+//! assertion that a human will really be asked. A one-shot run does not, and the broker
+//! refuses every question immediately rather than waiting out a timeout in front of nobody.
+//! That is the whole difference, and it is one line in [`run`].
+
+pub mod approval;
+pub mod args;
+pub mod console;
+pub mod render;
+pub mod session;
+pub mod settings;
+pub mod wiring;
+
+use aik_core::Result;
+
+use crate::args::{HELP, Invocation, Options};
+use crate::settings::Settings;
+
+/// The version reported by `--version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Parses arguments and runs, returning the process exit code.
+///
+/// Errors are reported here rather than propagated out of `main`, so that a configuration
+/// mistake prints one readable line instead of a debug-formatted error.
+pub async fn main(args: impl IntoIterator<Item = String>) -> i32 {
+    match args::parse(args) {
+        Ok(Invocation::Help) => {
+            print!("{HELP}");
+            0
+        }
+        Ok(Invocation::Version) => {
+            println!("{} {VERSION}", args::PROGRAM);
+            0
+        }
+        Ok(Invocation::Run(options)) => match run(&options).await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{}: {error}", args::PROGRAM);
+                1
+            }
+        },
+        Err(error) => {
+            eprintln!("{}: {error}", args::PROGRAM);
+            2
+        }
+    }
+}
+
+/// Builds a kernel from `options` and drives one conversation through it.
+pub async fn run(options: &Options) -> Result<()> {
+    let settings = Settings::resolve(options)?;
+
+    let model = match &settings.model {
+        Some(model) => model.clone(),
+        None => {
+            let model = wiring::first_available_model(&settings).await?;
+            println!("model: {model} (first the provider reported)");
+            model
+        }
+    };
+
+    let assembled = wiring::assemble(&settings, model)?;
+    assembled.kernel.start().await?;
+
+    let outcome = converse(&assembled, &settings).await;
+
+    // Shut down whatever happened: stopping the approval component closes the broker, so
+    // anything still parked on an answer is refused rather than left waiting.
+    let shutdown = assembled.kernel.shutdown().await;
+    outcome.and(shutdown)
+}
+
+async fn converse(assembled: &wiring::Assembled, settings: &Settings) -> Result<()> {
+    let kernel = assembled.kernel.context();
+    banner(settings);
+
+    match &settings.prompt {
+        // One shot: no gate is attached, so the broker has nobody to ask and refuses
+        // immediately rather than parking the question in front of an empty terminal.
+        Some(prompt) => {
+            let mut session = session::stdio(&kernel, settings, None)?;
+            session.one_shot(prompt.clone()).await
+        }
+        // Interactive: subscribing holds a gate for as long as the session lasts, which is
+        // what tells the broker a human can actually be asked.
+        None => {
+            let approvals = assembled.broker.gate().subscribe();
+            let mut session = session::stdio(&kernel, settings, Some(approvals))?;
+            session.interactive().await.map(|_| ())
+        }
+    }
+}
+
+fn banner(settings: &Settings) {
+    println!("{} {VERSION}", args::PROGRAM);
+    println!("  agent:  {} acting for {}", settings.agent, settings.user);
+    println!("  root:   {}", settings.root.display());
+    if !settings.has_policy() {
+        println!(
+            "  policy: none configured, so every tool call will be denied.\n\
+             \x20         pass --policy <FILE> to allow anything."
+        );
+    }
+    if settings.is_one_shot() {
+        println!("  approvals: refused (no responder attached in one-shot mode)");
+    }
+}

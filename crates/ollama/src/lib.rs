@@ -48,6 +48,38 @@
 //!
 //! Only [`settings`], [`provider`] and [`component`] are public; everything else is an
 //! implementation detail that may change without notice.
+//!
+//! # Tool calling
+//!
+//! [`CompletionRequest::tools`](aik_api::model::CompletionRequest::tools) is translated into
+//! Ollama's `tools` array, and `tool_calls` in a response come back as
+//! [`ContentPart::ToolCall`](aik_api::model::ContentPart::ToolCall) parts. An assistant turn
+//! carrying calls and the [`Role::Tool`](aik_api::model::Role::Tool) messages answering them
+//! both replay onto the wire, which is what lets a conversation continue past a tool.
+//! `cargo run -p aik-ollama --example tools` is the whole exchange against a real server.
+//!
+//! Three things are worth knowing:
+//!
+//! * **Only the model-facing subset of a tool is sent.** A
+//!   [`ToolDefinition`](aik_api::model::ToolDefinition) is a name, a description and an input
+//!   schema. A tool's `required_permissions` are not part of that type, so nothing about what
+//!   a tool is allowed to do can reach a model or the server hosting it — and a call coming
+//!   back is a *request*, not a decision: it still goes through
+//!   [`ToolRegistry::invoke`](aik_api::tool::ToolRegistry::invoke) like any other.
+//! * **Content this provider cannot represent is rejected, never dropped.** A tool call
+//!   attributed to anyone but the assistant, a tool result on anything but a `tool` message,
+//!   or a blob is an [`Error::Unsupported`](aik_core::Error::Unsupported). Silently omitting
+//!   any of them would leave a well-formed conversation that never happened, and the model
+//!   would answer from it.
+//! * **Not every model can call tools.** Ollama reports a `tools` capability per model, and
+//!   one without it answers in prose instead. That is a model's choice rather than a provider
+//!   failure, so nothing here treats it as an error.
+//!
+//! Ollama assembles tool calls server-side and emits them complete, so
+//! [`ModelProvider::stream`](aik_api::model::ModelProvider::stream) yields whole
+//! [`CompletionChunk::ToolCall`](aik_api::model::CompletionChunk::ToolCall)s with no partial
+//! arguments to reassemble. Call ids come from the server where it supplies them and are
+//! synthesised per message where it does not, which older versions and some models do not.
 
 pub mod component;
 mod deadline;

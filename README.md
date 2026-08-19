@@ -23,11 +23,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
 | [`aik-context`](crates/context) | An agent's transcript, and the budgeted model window derived from it |
+| [`aik-agent`](crates/agent) | The agent loop: model turns, bounded context, authorization-gated tool calls |
+| [`aik-cli`](crates/cli) | The terminal frontend: a conversation, streamed updates, interactive approvals |
 
-`aik-core` does not depend on `aik-api`, and neither depends on `aik-ollama`, `aik-tools`,
-`aik-policy`, `aik-fs`, `aik-approval` or `aik-context`. A kernel can be built and run with
-none of the subsystem contracts present, no model provider, no tool registry, and no policy
-engine at all.
+`aik-core` does not depend on `aik-api`, and neither depends on any of the subsystem
+crates. A kernel can be built and run with none of the subsystem contracts present, no
+model provider, no tool registry, and no policy engine at all. Only `aik-cli` depends on
+all of them, because assembling them is the whole of what a frontend does.
 
 ## The mechanisms
 
@@ -103,10 +105,10 @@ store is a change to which component is registered, never a change to the kernel
 ## Talking to a real model
 
 [`aik-ollama`](crates/ollama) is the first real `ModelProvider`: a kernel component that
-talks to [Ollama](https://ollama.com) over HTTP, with streaming, cancellation and timeouts.
-Nothing about HTTP or Ollama's wire format leaves that crate — consumers depend on
-`dyn ModelProvider`, resolved through the registry, exactly like the `Notifier` example
-above.
+talks to [Ollama](https://ollama.com) over HTTP, with streaming, cancellation, timeouts and
+tool calling. Nothing about HTTP or Ollama's wire format leaves that crate — consumers
+depend on `dyn ModelProvider`, resolved through the registry, exactly like the `Notifier`
+example above.
 
 ```bash
 cargo run -p aik-ollama --example chat
@@ -117,6 +119,29 @@ Requires a running `ollama serve` with a model pulled; if it is not reachable, t
 prints a clear explanation and exits cleanly instead of failing loudly. The crate's own test
 suite (`cargo test -p aik-ollama`) needs no such server — it runs against a mocked HTTP
 server, deterministically.
+
+### Letting a model ask for a tool
+
+A provider that cannot carry tool calls makes the agent loop a chat box: the loop offers
+tools every turn, and every turn comes back as prose. So `CompletionRequest::tools` carries
+a `ToolDefinition` — a name, a description and an input schema — and the provider translates
+that, the `tool_calls` that come back, and the results that go in reply.
+
+```bash
+cargo run -p aik-ollama --example tools
+cargo run -p aik-ollama --example tools -- qwen3:8b
+```
+
+A `ToolDefinition` is deliberately *not* a `ToolSpec`. A spec also says which permissions a
+tool requires, and that is the tool registry's business, not the model's: telling a model
+which capability names exist is telling it what is worth asking for, and it would travel to
+whatever server the provider talks to. Passing a smaller type makes that structural rather
+than a rule each provider has to remember.
+
+Nothing about offering a tool authorizes it. A call arriving from a model is a request, and
+it goes through `ToolRegistry::invoke` — policy, resource checks, approval, audit — exactly
+like a call from anywhere else. Ollama reports a `tools` capability per model; one without
+it will answer in prose, which is a model's choice rather than a provider failure.
 
 ## Authorizing and touching real files
 
@@ -264,6 +289,95 @@ clock, not from the payload. A session is owned by the principal that created it
 `ContextStore` is not a `Tool` and must never be registered as one: there is no path from
 model output to it that does not go through trusted code deciding to record something.
 
+## Actually using it
+
+[`aik-cli`](crates/cli) is the frontend: a terminal that starts a kernel, holds one
+conversation with the agent, prints what it does, and answers approval prompts.
+
+```bash
+cargo run -p aik-cli -- --config crates/cli/aik.example.json --root /path/to/project
+```
+
+```
+aik 0.1.0
+  agent:  assistant acting for user
+  root:   /path/to/project
+
+› what is the codename in notes.txt?
+  → filesystem.read {"path":"notes.txt"}
+  ← {"content":"The project codename is Halibut.\n","path":"notes.txt"}
+The codename is Halibut.
+
+  [2 turns, 1 tool calls, 1181 in / 125 out tokens, window 95 tokens]
+```
+
+One prompt as an argument runs it once and exits:
+
+```bash
+cargo run -p aik-cli -- -c crates/cli/aik.example.json "what is in src?"
+```
+
+| Option | |
+|---|---|
+| `-m, --model <ID>` | model to use; otherwise the configured one, otherwise the provider's first |
+| `-a, --agent <ID>` | the agent's identity, as policy sees it (default `assistant`) |
+| `-u, --user <ID>` | the user's identity, as policy sees it (default `user`) |
+| `-r, --root <DIR>` | what the filesystem tools are confined to (default: the current directory) |
+| `-c, --config <FILE>` | JSON configuration, including the policy |
+| `-p, --policy <FILE>` | a policy document on its own, overriding the one in `--config` |
+| `--write` | also register the write tool |
+| `--no-tools` | register none |
+| `-v, --verbose` | print authorization and context events as they happen |
+
+In a session, `/new` starts a fresh conversation, `/session` says who is acting,
+`/tools` lists what the agent has, `/quit` leaves. Ctrl-C cancels the turn in progress.
+
+### The agent is not you
+
+Every turn runs as `Principal::new(agent, Agent).on_behalf_of(user)` — never as the user.
+So a policy can distinguish what a person may do from what a model acting for them may do,
+and a rule naming `alice` does not hand her permissions to whatever is answering on her
+behalf:
+
+```json
+{ "principal": { "id": "assistant", "kind": "agent" },
+  "action": "filesystem.read", "resource": "*",
+  "effect": { "decision": "allow" } }
+```
+
+That identity also owns the transcript, so a `ContextStore` session written by one agent is
+not readable as anyone else.
+
+### Interactive and one-shot are different security postures
+
+An `ApprovalBroker` parks a question only while a gate exists; with none, it refuses
+immediately. An interactive session holds one for as long as it runs. **A one-shot run does
+not**, so anything a policy defers to a human is refused rather than waiting out a timeout
+in front of an empty terminal:
+
+```
+  → filesystem.write {"content":"hi","path":"hello.txt"}
+  ✗ {"kind":"permission","message":"permission denied: no approval responder is attached, so nobody can answer"}
+```
+
+Scripted use therefore needs a policy that says `allow` outright, which is the point: the
+decision is written down in advance rather than made by whoever is not watching.
+
+### What the frontend is not allowed to do
+
+It authorizes nothing. It holds a `dyn Agent` and cannot reach a tool at all, so there is no
+path from the terminal to an operation that skips the registry. It never invents a policy —
+with none configured every tool call is denied, and it says so at startup rather than
+shipping a permissive default. And it can only narrow: not registering the write tool
+removes a capability that no policy can then restore.
+
+One thing it *does* own is the screen. Assistant text, tool arguments and file contents are
+all untrusted, and a terminal executes some bytes rather than printing them — a model that
+emits `\x1b[2K` or a bare `\r` could otherwise repaint a line, including the approval prompt
+somebody is about to answer. Every untrusted string is escaped before it is printed, and
+approval prompts deliberately show only what the policy engine and the registry wrote:
+the question, the action and the resource, never the tool's arguments.
+
 ## Configuration
 
 The kernel reads no files. It accepts JSON layers, deep-merged in order, so the host
@@ -313,10 +427,16 @@ authorization for resources discovered mid-run, and audit events on the existing
 `aik-fs` is where the system touches the host, with read, write and directory-listing tools,
 each confined to a configured root; `aik-approval` closes the last gap in that path, so a
 policy that defers to a human reaches one instead of failing closed by default; and
-`aik-context` is what will make the agent loop affordable, by making the transcript a piece
-of kernel state rather than something reassembled into every request. Each proves the
+`aik-context` makes the agent loop affordable, by making the transcript a piece of kernel
+state rather than something reassembled into every request; and `aik-agent` is the loop
+itself, the first thing that uses all of the above together. Each proves the
 registry/component architecture hosts a real capability cleanly, without changing `aik-core`
-itself. What comes next builds *on* the kernel rather than *into* it: process execution
-behind an OS-level sandbox, durable audit and transcript storage, a frontend that actually
-renders an approval prompt, and eventually the agent loop that will call all of this — each
-as a component in its own crate, following the same pattern.
+itself.
+
+The system works end to end: `aik-cli` starts a kernel, `aik-ollama` carries tool calls in
+both directions, and a model can ask for a tool, have the request authorized, have a human
+approve it, and answer from the result — with every step of that visible in the audit
+events. What comes next builds *on* the kernel rather than *into* it: measurement of what
+real workloads actually cost, durable audit and transcript storage, and process execution
+behind an OS-level sandbox — each as a component in its own crate, following the same
+pattern.

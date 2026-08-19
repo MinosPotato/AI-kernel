@@ -33,14 +33,15 @@ pub(crate) fn ndjson_chunks(
                     continue;
                 }
                 match parse_line(&line) {
-                    Ok(Some(chunk)) => {
-                        let done = matches!(chunk, CompletionChunk::Done { .. });
-                        yield Ok(chunk);
-                        if done {
-                            break 'outer;
+                    Ok(parsed) => {
+                        for chunk in parsed {
+                            let done = matches!(chunk, CompletionChunk::Done { .. });
+                            yield Ok(chunk);
+                            if done {
+                                break 'outer;
+                            }
                         }
                     }
-                    Ok(None) => continue,
                     Err(error) => {
                         yield Err(error);
                         break 'outer;
@@ -72,8 +73,10 @@ pub(crate) fn ndjson_chunks(
                             // `done`, matching what a client that lost the connection would
                             // see for any HTTP stream.
                             if !buffer.iter().all(u8::is_ascii_whitespace) {
-                                if let Ok(Some(chunk)) = parse_line(&buffer) {
-                                    yield Ok(chunk);
+                                if let Ok(parsed) = parse_line(&buffer) {
+                                    for chunk in parsed {
+                                        yield Ok(chunk);
+                                    }
                                 }
                             }
                             break 'outer;

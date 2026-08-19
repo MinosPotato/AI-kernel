@@ -11,8 +11,10 @@ use std::time::Duration;
 use aik_api::execution::ExecutionContext;
 use aik_api::model::{
     CompletionChunk, CompletionRequest, ContentPart, FinishReason, Message, ModelId, ModelProvider,
-    Role,
+    Role, ToolDefinition,
 };
+use aik_api::permission::ActionId;
+use aik_api::tool::{ToolCall, ToolName, ToolSpec};
 use aik_core::Error;
 use aik_core::clock::{ManualClock, SharedClock, SystemClock, Timestamp};
 use aik_core::prelude::*;
@@ -160,19 +162,174 @@ async fn complete_surfaces_a_404_as_an_error_carrying_ollamas_message() {
     );
 }
 
-#[tokio::test]
-async fn requesting_tools_fails_before_any_request_is_sent() {
-    // No mock is registered, so if a request were sent it would 404 from wiremock's
-    // default handler and this test would fail for the wrong reason.
-    let server = MockServer::start().await;
-    let mut request = CompletionRequest::new("llama3.2", vec![Message::text(Role::User, "hi")]);
-    request.tools.push(aik_api::tool::ToolName::new("fs.read"));
+// ---------------------------------------------------------------------------
+// tool calling
+// ---------------------------------------------------------------------------
 
-    let error = provider_for(&server)
+#[tokio::test]
+async fn a_whole_tool_call_round_trip_goes_over_the_wire() {
+    let server = MockServer::start().await;
+
+    // The second leg of the exchange: the model already asked for the tool, the loop ran it,
+    // and the transcript now holds the call and its result. This is the shape that has to
+    // reach Ollama for it to answer from a tool it can see it already used.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(wiremock::matchers::body_json(json!({
+            "model": "llama3.2",
+            "messages": [
+                { "role": "user", "content": "what is in a.txt?" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_a",
+                        "function": {
+                            "name": "filesystem.read",
+                            "arguments": { "path": "a.txt" }
+                        }
+                    }]
+                },
+                { "role": "tool", "content": "hello", "tool_call_id": "call_a" }
+            ],
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "filesystem.read",
+                    "description": "Reads a file",
+                    "parameters": { "type": "object" }
+                }
+            }]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": { "role": "assistant", "content": "a.txt says hello" },
+            "done": true,
+            "done_reason": "stop"
+        })))
+        .mount(&server)
+        .await;
+
+    let mut request = CompletionRequest::new(
+        "llama3.2",
+        vec![
+            Message::text(Role::User, "what is in a.txt?"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentPart::ToolCall(ToolCall {
+                    call_id: "call_a".into(),
+                    name: ToolName::new("filesystem.read"),
+                    arguments: json!({ "path": "a.txt" }),
+                })],
+                name: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::ToolResult {
+                    call_id: "call_a".into(),
+                    content: json!("hello"),
+                    is_error: false,
+                }],
+                name: None,
+            },
+        ],
+    );
+    request.tools.push(ToolDefinition::new(
+        "filesystem.read",
+        "Reads a file",
+        json!({ "type": "object" }),
+    ));
+
+    let response = provider_for(&server)
         .complete(request, &ExecutionContext::new())
         .await
-        .unwrap_err();
-    assert!(matches!(error, Error::Unsupported(_)), "{error}");
+        .unwrap();
+
+    assert_eq!(
+        response.message,
+        Message::text(Role::Assistant, "a.txt says hello")
+    );
+}
+
+#[tokio::test]
+async fn a_tool_call_in_the_response_arrives_as_a_content_part() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_a",
+                    "function": {
+                        "index": 0,
+                        "name": "filesystem.read",
+                        "arguments": { "path": "a.txt" }
+                    }
+                }]
+            },
+            "done": true,
+            "done_reason": "stop"
+        })))
+        .mount(&server)
+        .await;
+
+    let response = provider_for(&server)
+        .complete(
+            CompletionRequest::new("llama3.2", vec![Message::text(Role::User, "read a.txt")]),
+            &ExecutionContext::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+    assert_eq!(
+        response.message.content,
+        vec![ContentPart::ToolCall(ToolCall {
+            call_id: "call_a".into(),
+            name: ToolName::new("filesystem.read"),
+            arguments: json!({ "path": "a.txt" }),
+        })],
+    );
+}
+
+#[tokio::test]
+async fn nothing_about_a_tools_permissions_reaches_the_server() {
+    // A `ToolDefinition` cannot carry `required_permissions` at all — this pins the fact
+    // that the provider builds its wire format from one, so a future change that started
+    // sending a `ToolSpec` instead would fail here rather than quietly telling a model
+    // which capabilities are worth asking for.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": { "role": "assistant", "content": "ok" },
+            "done": true
+        })))
+        .mount(&server)
+        .await;
+
+    let spec = ToolSpec {
+        name: ToolName::new("filesystem.write"),
+        description: "Writes a file".to_owned(),
+        input_schema: json!({ "type": "object" }),
+        output_schema: None,
+        required_permissions: vec![ActionId::new("filesystem.write")],
+        read_only: false,
+    };
+    let mut request = CompletionRequest::new("llama3.2", vec![Message::text(Role::User, "hi")]);
+    request.tools.push(ToolDefinition::from(&spec));
+
+    provider_for(&server)
+        .complete(request, &ExecutionContext::new())
+        .await
+        .unwrap();
+
+    let sent = &server.received_requests().await.unwrap()[0];
+    let body = std::str::from_utf8(&sent.body).unwrap();
+    assert!(!body.contains("required_permissions"), "{body}");
+    assert!(!body.contains("read_only"), "{body}");
 }
 
 // ---------------------------------------------------------------------------
