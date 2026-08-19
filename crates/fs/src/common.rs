@@ -95,6 +95,21 @@ pub(crate) fn resolve_parent_within(root: &Path, requested: &str) -> Result<(Pat
     Ok((confine(canonical, root)?, name))
 }
 
+/// Resolves `requested` — a directory relative to `root`, or the empty string for `root`
+/// itself — to its canonical form, or refuses it.
+///
+/// Delegates to [`resolve_within`] for anything non-empty, so a directory is confined by
+/// exactly the same rule as a file: every symlink in it, including in intermediate
+/// components, is resolved and the result is checked component-wise against `root`. The
+/// empty string is the one shape [`resolve_within`] refuses that this accepts, because
+/// unlike a file, a directory may legitimately be the root itself.
+pub(crate) fn resolve_dir_within(root: &Path, requested: &str) -> Result<PathBuf> {
+    if requested.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    resolve_within(root, requested)
+}
+
 /// Refuses a resolved path that escaped `root`.
 ///
 /// The check is component-wise on the canonical form, not a string prefix, so `/root-secret`
@@ -312,6 +327,29 @@ mod tests {
                 "`{requested}` was accepted"
             );
         }
+    }
+
+    #[test]
+    fn an_empty_path_resolves_the_root_itself_only_for_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+
+        assert_eq!(resolve_dir_within(&canonical, "").unwrap(), canonical);
+        // `resolve_within` (used for files) still refuses the same empty string.
+        assert!(resolve_within(&canonical, "").is_err());
+    }
+
+    #[test]
+    fn a_nonempty_directory_request_still_goes_through_the_same_confinement() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        std::fs::create_dir(canonical.join("src")).unwrap();
+
+        assert_eq!(
+            resolve_dir_within(&canonical, "src").unwrap(),
+            canonical.join("src")
+        );
+        assert!(resolve_dir_within(&canonical, "../escape").is_err());
     }
 
     #[cfg(unix)]

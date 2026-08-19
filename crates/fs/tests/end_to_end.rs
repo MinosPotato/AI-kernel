@@ -9,11 +9,11 @@ use aik_api::audit::{
     AuthorizationDecided, AuthorizationOutcome, AuthorizationPhase, InvocationOutcome, ToolInvoked,
 };
 use aik_api::execution::ExecutionContext;
-use aik_api::permission::{ApprovalSink, PermissionRequest, Principal, PrincipalKind};
+use aik_api::permission::{ApprovalSink, PermissionRequest, Principal, PrincipalKind, ResourceId};
 use aik_api::tool::{ToolName, ToolRegistry};
 use aik_core::event::EventStream;
 use aik_core::prelude::*;
-use aik_fs::{FsReadTool, FsWriteTool};
+use aik_fs::{FsListTool, FsReadTool, FsWriteTool};
 use aik_policy::RuleBasedPolicyEngine;
 use aik_tools::ToolsComponent;
 use async_trait::async_trait;
@@ -534,6 +534,306 @@ async fn the_write_tools_confinement_holds_even_when_policy_allows_everything() 
         std::fs::read_to_string(outer.path().join("secret.txt")).unwrap(),
         "TOP SECRET"
     );
+
+    kernel.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Listing: the first tool that authorizes resources it only discovers by running
+// ---------------------------------------------------------------------------
+
+fn list_call(path: &str) -> (ToolName, serde_json::Value) {
+    (
+        ToolName::new(aik_fs::DEFAULT_LIST_NAME),
+        json!({ "path": path }),
+    )
+}
+
+#[tokio::test]
+async fn a_permitted_listing_flows_through_the_whole_stack_and_is_audited() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.md"), "hello").unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_tool(FsListTool::new(root.path()).unwrap())
+                .with_policy(Arc::new(engine(json!({ "rules": [
+                    { "action": "filesystem.list", "resource": format!("{}/*", canonical.display()),
+                      "effect": { "decision": "allow" } },
+                    { "action": "filesystem.list", "resource": canonical.display().to_string(),
+                      "effect": { "decision": "allow" } },
+                    { "action": "filesystem.list", "effect": { "decision": "allow" } }
+                ]})))),
+        )
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let (name, arguments) = list_call("");
+    let outcome = tools.invoke(&name, arguments, &agent("a1")).await.unwrap();
+    assert!(!outcome.is_error);
+    assert_eq!(outcome.output["entries"][0]["name"], json!("notes.md"));
+
+    let decided = drain(&mut decisions);
+    // Capability (Tool), the directory itself (Resource), then one DiscoveredResource
+    // decision per entry found while actually reading the directory.
+    assert_eq!(decided.len(), 3);
+    assert_eq!(decided[0].phase, AuthorizationPhase::Tool);
+    assert_eq!(decided[1].phase, AuthorizationPhase::Resource);
+    assert_eq!(
+        decided[1].resource,
+        Some(ResourceId::new(canonical.to_string_lossy()))
+    );
+    assert_eq!(decided[2].phase, AuthorizationPhase::DiscoveredResource);
+    assert!(
+        decided[2]
+            .resource
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .ends_with("/notes.md")
+    );
+    assert!(decided.iter().all(|d| d.outcome.is_allowed()));
+
+    let invoked = drain(&mut invocations);
+    assert_eq!(invoked.len(), 1);
+    assert_eq!(invoked[0].outcome, InvocationOutcome::Succeeded);
+
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn policy_narrows_which_discovered_entries_are_visible_without_failing_the_call() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.md"), "hello").unwrap();
+    std::fs::create_dir(root.path().join("secrets")).unwrap();
+    std::fs::write(root.path().join("secrets/token"), "sk-secret").unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+
+    let policy = engine(json!({ "rules": [
+        { "action": "filesystem.list", "resource": format!("{}/secrets", canonical.display()),
+          "effect": { "decision": "deny", "reason": "secret directory" } },
+        { "action": "filesystem.list", "resource": format!("{}/*", canonical.display()),
+          "effect": { "decision": "allow" } },
+        { "action": "filesystem.list", "resource": canonical.display().to_string(),
+          "effect": { "decision": "allow" } },
+        { "action": "filesystem.list", "effect": { "decision": "allow" } }
+    ]}));
+
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_tool(FsListTool::new(root.path()).unwrap())
+                .with_policy(Arc::new(policy)),
+        )
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let (name, arguments) = list_call("");
+    let outcome = tools.invoke(&name, arguments, &agent("a1")).await.unwrap();
+
+    // The call succeeded — narrowing a discovered resource is not a call failure — and only
+    // the entry policy allows is present in the result.
+    assert!(!outcome.is_error);
+    let names: std::collections::BTreeSet<String> = outcome.output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["notes.md".to_owned()])
+    );
+
+    // But the denial was not silent: it is in the audit trail, under its own phase, with the
+    // policy's reason.
+    let decided = drain(&mut decisions);
+    let denied = decided
+        .iter()
+        .find(|d| d.phase == AuthorizationPhase::DiscoveredResource && !d.outcome.is_allowed())
+        .expect("the secrets directory's denial must be audited");
+    assert!(
+        denied
+            .resource
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .ends_with("/secrets")
+    );
+    assert_eq!(
+        denied.outcome,
+        AuthorizationOutcome::Denied {
+            reason: "secret directory".into()
+        }
+    );
+    let allowed_entry = decided
+        .iter()
+        .find(|d| d.phase == AuthorizationPhase::DiscoveredResource && d.outcome.is_allowed())
+        .expect("the visible entry's allow must be audited too");
+    assert!(
+        allowed_entry
+            .resource
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .ends_with("/notes.md")
+    );
+
+    // The invocation itself is recorded as succeeded, not denied: the call as a whole was
+    // permitted, even though it did not reveal everything on disk.
+    let invoked = drain(&mut invocations);
+    assert_eq!(invoked.len(), 1);
+    assert_eq!(invoked[0].outcome, InvocationOutcome::Succeeded);
+
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn denying_the_directory_itself_refuses_the_whole_call_before_any_entry_is_seen() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("locked")).unwrap();
+    std::fs::write(root.path().join("locked/inside.txt"), "").unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+
+    let policy = engine(json!({ "rules": [
+        { "action": "filesystem.list", "resource": format!("{}/locked", canonical.display()),
+          "effect": { "decision": "deny", "reason": "locked directory" } },
+        { "action": "filesystem.list", "effect": { "decision": "allow" } }
+    ]}));
+
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_tool(FsListTool::new(root.path()).unwrap())
+                .with_policy(Arc::new(policy)),
+        )
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let (name, arguments) = list_call("locked");
+    let error = tools
+        .invoke(&name, arguments, &agent("a1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::PermissionDenied(_)), "{error}");
+
+    // Refused at the planned-resource phase, before the tool ever ran — so no
+    // `DiscoveredResource` decision exists at all for `inside.txt`.
+    let decided = drain(&mut decisions);
+    assert_eq!(decided.len(), 2);
+    assert_eq!(decided[1].phase, AuthorizationPhase::Resource);
+    assert!(
+        !decided
+            .iter()
+            .any(|d| d.phase == AuthorizationPhase::DiscoveredResource)
+    );
+
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_policy_configured_denies_listing_even_though_the_root_would_permit_it() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.md"), "hello").unwrap();
+
+    let kernel = Kernel::builder()
+        .component(ToolsComponent::new().with_tool(FsListTool::new(root.path()).unwrap()))
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let (name, arguments) = list_call("");
+    let error = tools
+        .invoke(&name, arguments, &agent("a1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::PermissionDenied(_)), "{error}");
+
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_list_tools_confinement_holds_even_when_policy_would_allow_everything() {
+    let outer = tempfile::tempdir().unwrap();
+    let root_dir = outer.path().join("root");
+    std::fs::create_dir(&root_dir).unwrap();
+    std::fs::write(outer.path().join("secret.txt"), "TOP SECRET").unwrap();
+
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_tool(FsListTool::new(&root_dir).unwrap())
+                .with_policy(Arc::new(engine(json!({ "rules": [
+                    { "action": "*", "resource": "*", "effect": { "decision": "allow" } },
+                    { "action": "*", "effect": { "decision": "allow" } }
+                ]})))),
+        )
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let (name, arguments) = list_call("..");
+    let error = tools
+        .invoke(&name, arguments, &agent("a1"))
+        .await
+        .unwrap_err();
+    // Refused by the tool's own resolution, before any policy question is even asked.
+    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn permission_to_list_does_not_imply_permission_to_read() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.md"), "secret contents").unwrap();
+
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_tool(FsListTool::new(root.path()).unwrap())
+                .with_tool(FsReadTool::new(root.path()).unwrap())
+                .with_policy(Arc::new(engine(json!({ "rules": [
+                    { "action": "filesystem.list", "resource": "*", "effect": { "decision": "allow" } },
+                    { "action": "filesystem.list", "effect": { "decision": "allow" } }
+                ]})))),
+        )
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    // Listing reveals that `notes.md` exists...
+    let (name, arguments) = list_call("");
+    let outcome = tools.invoke(&name, arguments, &agent("a1")).await.unwrap();
+    assert_eq!(outcome.output["entries"][0]["name"], json!("notes.md"));
+
+    // ...but does not carry any authority to read it: no `filesystem.read` rule exists, so
+    // the read is denied even though the exact same file was just visible in a listing.
+    let error = tools
+        .invoke(
+            &ToolName::new(aik_fs::DEFAULT_NAME),
+            json!({ "path": "notes.md" }),
+            &agent("a1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::PermissionDenied(_)), "{error}");
 
     kernel.shutdown().await.unwrap();
 }
