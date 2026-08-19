@@ -3,7 +3,7 @@
 //! These exercise the kernel the way a frontend would: build it, start it, use it through
 //! a [`KernelContext`], shut it down.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -102,6 +102,30 @@ impl Component for Faulty {
 
     async fn stop(&self, ctx: &ComponentContext) -> Result<()> {
         self.journal.record(format!("stop:{}", ctx.id()));
+        Ok(())
+    }
+}
+
+/// A component that spawns a background task on `start`, which only marks `finished` once
+/// it actually observes cancellation and returns — not merely once it is asked to stop.
+struct TaskSpawner {
+    id: &'static str,
+    finished: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Component for TaskSpawner {
+    fn descriptor(&self) -> ComponentDescriptor {
+        ComponentDescriptor::new(self.id)
+    }
+
+    async fn start(&self, ctx: &ComponentContext) -> Result<()> {
+        let finished = self.finished.clone();
+        ctx.tasks()
+            .spawn_cancellable("worker", move |token| async move {
+                token.cancelled().await;
+                finished.store(true, Ordering::SeqCst);
+            });
         Ok(())
     }
 }
@@ -277,6 +301,34 @@ async fn a_failed_start_rolls_back_what_was_already_running() {
             (ComponentId::new("a"), ComponentState::Stopped),
             (ComponentId::new("b"), ComponentState::Failed),
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_start_waits_for_tasks_the_rolled_back_components_spawned() {
+    // `a` came up and spawned a background task; `b` then failed to start, so `a` is
+    // rolled back. `Tasks::cancel` alone only *signals* the task to stop -- proving this
+    // requires a task that marks itself finished only after it actually observes that
+    // signal and returns, not one that is merely told to.
+    let finished = Arc::new(AtomicBool::new(false));
+    let kernel = Kernel::builder()
+        .component(TaskSpawner {
+            id: "a",
+            finished: finished.clone(),
+        })
+        .component(Faulty {
+            id: "b",
+            phase: "start",
+            journal: Journal::default(),
+        })
+        .build()
+        .unwrap();
+
+    kernel.start().await.unwrap_err();
+
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "rollback must wait for a background task to actually finish, not just cancel it",
     );
 }
 

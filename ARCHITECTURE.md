@@ -110,8 +110,9 @@ gets three phases:
 
 The kernel topologically sorts components by their declared dependencies (deterministically,
 so start order is reproducible), runs all `init`s in order, then all `start`s. A failure
-during startup rolls back everything already started, in reverse order. Shutdown is reverse
-order too.
+during startup rolls back everything already started, in reverse order, and — like an
+ordinary shutdown — waits for whatever background tasks those components spawned to actually
+finish before returning, not just for them to be told to stop. Shutdown is reverse order too.
 
 Components take `&self`, never `&mut self`: they own their own interior mutability, which
 keeps them shareable and avoids a kernel-wide lock.
