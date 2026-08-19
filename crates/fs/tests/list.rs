@@ -425,7 +425,7 @@ async fn a_symlinked_listing_target_that_escapes_the_root_is_rejected() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
 }
 
 #[cfg(unix)]

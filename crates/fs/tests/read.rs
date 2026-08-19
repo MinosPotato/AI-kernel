@@ -152,7 +152,7 @@ async fn a_symlink_escaping_the_root_is_rejected() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
 }
 
 #[cfg(unix)]

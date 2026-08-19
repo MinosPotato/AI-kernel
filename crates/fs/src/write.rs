@@ -276,7 +276,7 @@ fn check_target(file: &std::fs::File) -> Result<()> {
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.nlink() > 1 {
-            return Err(Error::InvalidArgument(
+            return Err(Error::Confinement(
                 "the target file has more than one hard link, so writing it could modify a \
                  file outside the tool's allowed root"
                     .into(),

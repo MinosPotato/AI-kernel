@@ -261,8 +261,11 @@ An allow rule for `/etc/*` does not make `filesystem.read` able to read `/etc/pa
 tool confined to `/home/user/project` — the tool never produces `/etc/passwd` as a resource to
 ask about; the call is refused as `path resolves outside the tool's allowed root` before
 authorization runs at all. Confirmed directly: `--policy` set to allow everything (`"*"`) still
-refuses an absolute path, a `../` traversal, and a symlink whose target resolves outside the
-root, all with `Error::InvalidArgument`, never reaching a permission decision.
+refuses an absolute path or a `../` traversal (`Error::InvalidArgument` — malformed input,
+rejected on syntax alone) and a symlink whose target resolves outside the root
+(`Error::Confinement` — the tool's own boundary, kept distinct from a malformed request so an
+audit consumer can tell a genuine escape attempt from a typo; see
+[Filesystem confinement](#filesystem-confinement)), never reaching a permission decision.
 
 ## Approvals and the one-shot security posture
 
@@ -409,6 +412,16 @@ swapped in at the last moment, or a directory renamed after being checked, canno
 write. A target with more than one hard link is refused outright, since a second name for the
 same inode could sit outside the root without any path ever showing it.
 
+Every refusal above — steps 2/3 above, the write tool's handle re-verification, its final-
+component symlink refusal, and its hard-link refusal — is reported as `Error::Confinement`,
+not `Error::InvalidArgument`. The two are deliberately distinct classifications
+(`ErrorKind::Confinement` vs. `ErrorKind::InvalidArgument` in `crates/core/src/error.rs`):
+step 1's syntax rejections and other malformed input (a missing field, a non-string path) never
+resolved anything, so they are `InvalidArgument`, while everything in this section resolved a
+path and then refused what it found — the audit trail (`InvocationOutcome::Failed { kind:
+"confinement" }` on `ToolInvoked`, see [Verbose mode](#verbose-mode)) lets a consumer alert on
+an actual escape attempt without also matching every typo'd filename.
+
 Directory listing (`filesystem.list`) authorizes the directory itself up front, then each entry
 individually as it is discovered while reading it — the `DiscoveredResource` phase visible in
 `-v` output. A refused entry is simply left out of the listing; it does not fail the call, so a
@@ -416,10 +429,10 @@ directory containing one restricted item still lists everything else.
 
 Verified directly against a real symlink pointing outside the configured root
 (`ln -s /outside/secret.txt ./escape-link`): reading it, writing through it, and listing a
-directory containing it all behave exactly as documented — read and write both refuse it
-(`path resolves outside the tool's allowed root` / `the path's final component is a symlink;
-this tool never writes through one`), and listing reports it as a `symlink` entry without
-following it.
+directory containing it all behave exactly as documented — read and write both refuse it with
+`Error::Confinement` (`path resolves outside the tool's allowed root` / `the path's final
+component is a symlink; this tool never writes through one`), and listing reports it as a
+`symlink` entry without following it.
 
 **What this does not close, by design:** the window between resolving a path and the syscall
 that acts on it is a property of the POSIX filesystem API, not of any one process's care.

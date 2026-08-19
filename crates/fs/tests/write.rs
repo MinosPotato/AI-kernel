@@ -198,7 +198,7 @@ async fn a_symlink_target_pointing_outside_the_root_is_refused() {
     let tool = FsWriteTool::new(&root_dir).unwrap();
 
     let error = write(&tool, "link", "OVERWRITTEN").await.unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
     assert_eq!(read(&secret), "TOP SECRET");
 }
 
@@ -215,7 +215,7 @@ async fn a_symlink_target_pointing_inside_the_root_is_refused_too() {
     let tool = FsWriteTool::new(root.path()).unwrap();
 
     let error = write(&tool, "link", "OVERWRITTEN").await.unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
     assert_eq!(read(&real), "original");
 }
 
@@ -230,7 +230,7 @@ async fn a_dangling_symlink_target_is_refused_rather_than_created_through() {
     let tool = FsWriteTool::new(&root_dir).unwrap();
 
     let error = write(&tool, "link", "CREATED").await.unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
     assert!(!missing.exists());
 }
 
@@ -248,7 +248,7 @@ async fn a_symlinked_parent_directory_escaping_the_root_is_refused() {
     let error = write(&tool, "escape/planted.txt", "PLANTED")
         .await
         .unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
     assert!(!elsewhere.join("planted.txt").exists());
 }
 
@@ -330,7 +330,7 @@ async fn a_hard_linked_file_is_refused_because_the_second_name_may_be_outside_th
     let tool = FsWriteTool::new(&root_dir).unwrap();
 
     let error = write(&tool, "inside.txt", "OVERWRITTEN").await.unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
     assert_eq!(read(&secret), "TOP SECRET");
     assert_eq!(read(root_dir.join("inside.txt")), "TOP SECRET");
 }
@@ -346,7 +346,7 @@ async fn a_hard_link_wholly_inside_the_root_is_refused_too() {
     let tool = FsWriteTool::new(root.path()).unwrap();
 
     let error = write(&tool, "b.txt", "OVERWRITTEN").await.unwrap_err();
-    assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    assert!(matches!(error, Error::Confinement(_)), "{error}");
     assert_eq!(read(root.path().join("a.txt")), "original");
 }
 

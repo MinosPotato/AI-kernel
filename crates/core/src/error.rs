@@ -61,6 +61,14 @@ pub enum ErrorKind {
     Unsupported,
     /// The operation was refused by policy.
     Permission,
+    /// A resource resolved outside a boundary the caller enforces on itself, independently
+    /// of any authorization decision — e.g. a symlink escaping a confined root.
+    ///
+    /// Distinct from [`ErrorKind::Permission`]: nothing was asked and refused, so this is not
+    /// an authorization outcome. Kept distinct from [`ErrorKind::InvalidArgument`] too, even
+    /// though both originate from validating input, so a consumer of this classification can
+    /// alert on an actual boundary violation without also matching every malformed request.
+    Confinement,
     /// The operation ran out of time.
     Timeout,
     /// The operation was cancelled.
@@ -152,6 +160,12 @@ pub enum Error {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    /// A resource resolved outside a boundary enforced independently of policy.
+    ///
+    /// See [`ErrorKind::Confinement`].
+    #[error("confinement violation: {0}")]
+    Confinement(String),
+
     /// The operation exceeded its time budget.
     #[error("operation timed out after {0:?}")]
     Timeout(Duration),
@@ -232,6 +246,7 @@ impl Error {
             Self::InvalidArgument(_) => ErrorKind::InvalidArgument,
             Self::Unsupported(_) => ErrorKind::Unsupported,
             Self::PermissionDenied(_) => ErrorKind::Permission,
+            Self::Confinement(_) => ErrorKind::Confinement,
             Self::Timeout(_) => ErrorKind::Timeout,
             Self::Cancelled => ErrorKind::Cancelled,
             Self::Serialization(_) => ErrorKind::Serialization,
@@ -249,6 +264,18 @@ impl From<serde_json::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confinement_is_classified_distinctly_from_invalid_argument_and_permission() {
+        let error = Error::Confinement("path resolves outside the tool's allowed root".into());
+        assert_eq!(error.kind(), ErrorKind::Confinement);
+        assert_ne!(error.kind(), ErrorKind::InvalidArgument);
+        assert_ne!(error.kind(), ErrorKind::Permission);
+        assert_eq!(
+            error.to_string(),
+            "confinement violation: path resolves outside the tool's allowed root"
+        );
+    }
 
     #[test]
     fn wrapped_errors_keep_their_source() {

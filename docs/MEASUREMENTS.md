@@ -296,6 +296,17 @@ Inspect `*.jsonl` for the structured form of everything `-v` printed.
   `crates/tools/src/registry.rs`, and
   `a_resource_claim_that_cannot_be_built_is_audited_as_failed_not_denied` in
   `crates/tools/tests/authorization.rs`.
+* **Follow-up fix, same theme:** the `Failed { kind }` this produces was itself too coarse for
+  one specific case. `crates/fs`'s confinement checks (a symlink escaping a tool's root, a
+  final-component symlink the write tool refuses to follow, a hard-linked write target) used
+  to return `Error::InvalidArgument` — the same variant as a missing field or a NUL byte in a
+  path — so `InvocationOutcome::Failed { kind: "invalidargument" }` could not distinguish an
+  actual boundary-escape attempt from a malformed request. `aik_core::Error` now has a
+  dedicated `Confinement` variant (`ErrorKind::Confinement`) for exactly this, so the same
+  scenario now audits as `Failed { kind: "confinement" }`. See
+  `crates/core/src/error.rs`, `crates/fs/src/{common,write}.rs`, and
+  `a_symlinked_parent_escape_is_audited_as_failed_not_denied_even_with_a_permissive_policy` in
+  `crates/fs/tests/end_to_end.rs`.
 
 ## Recommended next step
 
