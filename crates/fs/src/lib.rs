@@ -20,24 +20,27 @@
 //!    confined, and what that does and does not guarantee against a concurrent, adversarial
 //!    filesystem.
 //!
-//! # The two capabilities are separate on purpose
+//! # The capabilities are separate on purpose
 //!
-//! [`FsReadTool`] and [`FsWriteTool`] are distinct tools requiring distinct permissions
-//! ([`DEFAULT_PERMISSION`] and [`DEFAULT_WRITE_PERMISSION`]), and are registered
-//! independently. A deployment that wants an agent to read its project and not change it
-//! simply does not register the write tool — or registers it and denies
-//! `filesystem.write` in policy, which is the same guarantee obtained a second, independent
-//! way. Nothing about holding one capability implies the other, and the two tools share no
-//! state: even pointed at the same root, neither can act through the other.
+//! [`FsReadTool`], [`FsWriteTool`] and [`FsListTool`] are distinct tools requiring distinct
+//! permissions ([`DEFAULT_PERMISSION`], [`DEFAULT_WRITE_PERMISSION`] and
+//! [`DEFAULT_LIST_PERMISSION`]), and are registered independently. A deployment that wants
+//! an agent to see what exists in its project without reading or changing any of it
+//! registers only [`FsListTool`] — or registers all three and denies the other two actions
+//! in policy, which is the same guarantee obtained a second, independent way. Nothing about
+//! holding one capability implies another, and the tools share no state: even pointed at the
+//! same root, none of them can act through another.
 //!
-//! Confinement itself is shared, because it must be: a read and a write given the same root
-//! and the same argument resolve that argument through the same code, so the two boundaries
-//! cannot drift apart.
+//! Confinement itself is shared, because it must be: every tool here resolves a path
+//! argument relative to the same root through the same code, so the boundaries cannot drift
+//! apart from one another.
 
 mod common;
+mod list;
 mod tool;
 mod write;
 
+pub use list::{DEFAULT_LIST_NAME, DEFAULT_LIST_PERMISSION, DEFAULT_MAX_ENTRIES, FsListTool};
 pub use tool::{DEFAULT_MAX_BYTES, DEFAULT_NAME, DEFAULT_PERMISSION, DEFAULT_TIMEOUT, FsReadTool};
 pub use write::{
     DEFAULT_CREATE_MODE, DEFAULT_MAX_WRITE_BYTES, DEFAULT_WRITE_NAME, DEFAULT_WRITE_PERMISSION,

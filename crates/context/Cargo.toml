@@ -1,0 +1,21 @@
+[package]
+name = "aik-context"
+description = "An agent context store for the AI kernel: a durable transcript, and budgeted model windows derived from it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aik-core.workspace = true
+aik-api.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

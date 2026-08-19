@@ -22,11 +22,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-policy`](crates/policy) | A deterministic, configuration-driven `PolicyEngine` |
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
+| [`aik-context`](crates/context) | An agent's transcript, and the budgeted model window derived from it |
 
 `aik-core` does not depend on `aik-api`, and neither depends on `aik-ollama`, `aik-tools`,
-`aik-policy`, `aik-fs` or `aik-approval`. A kernel can be built and run with none of the
-subsystem contracts present, no model provider, no tool registry, and no policy engine at
-all.
+`aik-policy`, `aik-fs`, `aik-approval` or `aik-context`. A kernel can be built and run with
+none of the subsystem contracts present, no model provider, no tool registry, and no policy
+engine at all.
 
 ## The mechanisms
 
@@ -213,6 +214,56 @@ immediately rather than waiting out its timeout, so a headless deployment behave
 like one with no approval sink at all. An answer that arrives after the requester gave up
 does nothing, and the responder is told so.
 
+## Not re-sending everything, every turn
+
+`ModelProvider::complete` takes a `Vec<Message>`, and nothing holds one between calls. An
+agent written against that directly has one option: keep the whole history locally and send
+all of it, every turn. The same system prompt, the same early turns and the same 4 KB file
+read get paid for again on every request, cost grows quadratically in turns, and when the
+history outgrows the model's context window there is no answer at all.
+
+[`aik-context`](crates/context) is the fix, and it is not a compressor. It stops treating the
+model payload as the place state lives:
+
+```rust,ignore
+// Append what happened. Full fidelity, kept forever, never sent anywhere.
+store.append(&session, ContextEntry::new(system_prompt).pinned(), &cx).await?;
+store.append(&session, ContextEntry::new(tool_result), &cx).await?;
+
+// Derive what to send. Recomputed each turn under a budget, then thrown away.
+let budget = ContextBudget::tokens(8_000).with_max_part_tokens(512);
+let window = store.window(&session, &budget, &cx).await?;
+
+let request = CompletionRequest::new(model, window.messages);
+```
+
+The store is append-only and the window is a pure function of it, so the same records under
+two budgets give two windows and change nothing. Assembly is deterministic — no model call,
+no invented text:
+
+* **pinned records always survive**, so a system prompt is never silently dropped to hit a
+  number;
+* **oversized parts are elided**, with the bulk of a file read, a directory listing or a
+  base64 image replaced by a marker naming the record it came from — the full value is still
+  in the store and still fetchable by `ContextStore::get`;
+* **the oldest turns are evicted**, keeping a contiguous run of the most recent ones rather
+  than whichever happen to fit;
+* **a tool result whose call was evicted is removed**, because a result answering nothing is
+  a request most providers reject.
+
+Every window reports what it cost and what it left out, and publishes a `ContextAssembled`
+event on the same bus the audit events use — counts only, never conversation content.
+Counting itself goes through `dyn TokenCounter`: a documented byte-length heuristic by
+default, so budgeting works everywhere without the kernel acquiring a tokenizer, and
+replaceable by a provider that knows its own.
+
+Security is about what a model can influence. It can influence the text of a record. It
+cannot influence who the record is attributed to, where it sits, whether it is pinned, or
+which sessions it can see — all of those come from the `ExecutionContext` and the kernel
+clock, not from the payload. A session is owned by the principal that created it, and a
+`ContextStore` is not a `Tool` and must never be registered as one: there is no path from
+model output to it that does not go through trusted code deciding to record something.
+
 ## Configuration
 
 The kernel reads no files. It accepts JSON layers, deep-merged in order, so the host
@@ -259,11 +310,13 @@ The kernel is complete and tested. The `ModelProvider` contract has one real imp
 implementation (`aik-tools`) with resource-level authorization, tool-initiated
 authorization for resources discovered mid-run, and audit events on the existing
 `EventBus`; a real `PolicyEngine` (`aik-policy`) makes that enforceable from configuration;
-`aik-fs` is where the system touches the host, with a read tool and a write tool, each
-confined to a configured root; and `aik-approval` closes the last gap in that path, so a
-policy that defers to a human reaches one instead of failing closed by default. Each proves
-the registry/component architecture hosts a real capability cleanly, without changing
-`aik-core` itself. What comes next builds *on* the kernel rather than *into* it: confined
-directory listing, process execution behind an OS-level sandbox, durable audit storage, a
-frontend that actually renders an approval prompt, and eventually the agent loop that will
-call all of this — each as a component in its own crate, following the same pattern.
+`aik-fs` is where the system touches the host, with read, write and directory-listing tools,
+each confined to a configured root; `aik-approval` closes the last gap in that path, so a
+policy that defers to a human reaches one instead of failing closed by default; and
+`aik-context` is what will make the agent loop affordable, by making the transcript a piece
+of kernel state rather than something reassembled into every request. Each proves the
+registry/component architecture hosts a real capability cleanly, without changing `aik-core`
+itself. What comes next builds *on* the kernel rather than *into* it: process execution
+behind an OS-level sandbox, durable audit and transcript storage, a frontend that actually
+renders an approval prompt, and eventually the agent loop that will call all of this — each
+as a component in its own crate, following the same pattern.

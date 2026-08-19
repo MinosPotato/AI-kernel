@@ -12,6 +12,7 @@
 //! | [`tool`] | Callable, schema-described capabilities, and the invocation gate |
 //! | [`permission`] | Principals, policy, human approval and resource authorization |
 //! | [`audit`] | Structured authorization and invocation events |
+//! | [`context`] | An agent's transcript, and the bounded view of it a model is sent |
 //! | [`memory`] | Persistent records and retrieval |
 //! | [`scheduler`] | Time- and event-triggered jobs |
 //! | [`agent`] | Long-running work with streamed progress |
@@ -71,6 +72,7 @@
 
 pub mod agent;
 pub mod audit;
+pub mod context;
 pub mod execution;
 pub mod memory;
 pub mod model;
@@ -82,6 +84,9 @@ pub mod tool;
 /// The contracts most implementations need.
 pub mod prelude {
     pub use crate::audit::{AuthorizationDecided, AuthorizationPhase, ToolInvoked};
+    pub use crate::context::{
+        ContextBudget, ContextEntry, ContextRecord, ContextStore, ContextWindow, TokenCounter,
+    };
     pub use crate::execution::ExecutionContext;
     pub use crate::memory::{MemoryQuery, MemoryRecord, MemoryStore};
     pub use crate::model::{
