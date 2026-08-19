@@ -374,6 +374,14 @@ impl Run {
     /// restriction of its own and takes none away: a name outside the run's tool set never
     /// reaches the registry at all.
     async fn call_tool(&mut self, call: ToolCall) -> Result<Vec<AgentUpdate>> {
+        // Set only when the call itself completed but the run must stop anyway — checked
+        // after the transcript is written, never before. `tools.invoke` already returned by
+        // the time `guard` is consulted below, so the call is not "outstanding" in the sense
+        // `abandon_outstanding_calls` means: it has a real, known outcome, and that outcome —
+        // not a fabricated "the run stopped before this call was made" — is what belongs in
+        // the transcript, whether or not the run goes on to use it.
+        let mut stop = None;
+
         let outcome = if self.available.iter().any(|spec| spec.name == call.name) {
             match self
                 .wiring
@@ -382,27 +390,31 @@ impl Run {
                 .await
             {
                 Ok(outcome) => outcome,
-                Err(error) => match self.guard() {
-                    // A refusal, a bad argument or a broken tool is something the model
-                    // should see and can react to, so it becomes an error result rather than
-                    // ending the run.
-                    Ok(()) => {
-                        tracing::debug!(
+                Err(error) => {
+                    match self.guard() {
+                        // A refusal, a bad argument or a broken tool is something the model
+                        // should see and can react to, so it becomes an error result rather
+                        // than ending the run.
+                        Ok(()) => tracing::debug!(
                             tool = %call.name,
                             kind = ?error.kind(),
                             "tool call failed; reporting it to the model",
-                        );
-                        failed(&error)
+                        ),
+                        // The run's own lifecycle is not something to tell the model about —
+                        // no further turn will read this result — but the call still
+                        // happened and still has a real outcome, so it is recorded exactly
+                        // as it would be if the run were continuing.
+                        Err(stopped) => {
+                            tracing::debug!(
+                                tool = %call.name,
+                                kind = ?error.kind(),
+                                "tool call failed as the run was stopping; recording its real outcome",
+                            );
+                            stop = Some(stopped);
+                        }
                     }
-                    // The run's own lifecycle is not something to tell the model about: if it
-                    // has been cancelled or has run out of time, stop instead of going round
-                    // again. Handing the call back leaves it to be closed off in the
-                    // transcript with everything else that will now not happen.
-                    Err(stopped) => {
-                        self.running = Some(call);
-                        return Err(stopped);
-                    }
-                },
+                    failed(&error)
+                }
             }
         } else {
             tracing::debug!(tool = %call.name, "model asked for a tool this agent does not have");
@@ -419,6 +431,10 @@ impl Run {
             name: None,
         }))
         .await?;
+
+        if let Some(stopped) = stop {
+            return Err(stopped);
+        }
 
         Ok(vec![AgentUpdate::ToolResult {
             call_id: call.call_id,

@@ -247,6 +247,10 @@ pub enum Behaviour {
     ReportError(String),
     /// Cancels a token, standing in for anything that stops the run mid-flight.
     Cancel(tokio_util::sync::CancellationToken),
+    /// Cancels a token *and* fails, standing in for a call that reached a real, specific
+    /// outcome (e.g. a denial discovered mid-execution) at the same moment something else
+    /// independently stopped the run.
+    FailAndCancel(String, tokio_util::sync::CancellationToken),
     /// Moves a clock forward, standing in for work that consumes the run's deadline.
     Advance(Arc<ManualClock>, Duration),
     /// Declares a resource claim, so resource-level authorization has something to decide.
@@ -263,6 +267,7 @@ impl std::fmt::Debug for Behaviour {
             Self::Fail(_) => "Fail",
             Self::ReportError(_) => "ReportError",
             Self::Cancel(_) => "Cancel",
+            Self::FailAndCancel(..) => "FailAndCancel",
             Self::Advance(..) => "Advance",
             Self::Claiming(..) => "Claiming",
             Self::Forbidden => "Forbidden",
@@ -364,6 +369,10 @@ impl Tool for ProbeTool {
             Behaviour::Cancel(token) => {
                 token.cancel();
                 Ok(ToolOutcome::ok(json!({ "cancelled": true })))
+            }
+            Behaviour::FailAndCancel(reason, token) => {
+                token.cancel();
+                Err(Error::other(reason.clone()))
             }
             Behaviour::Advance(clock, duration) => {
                 clock.advance(*duration);
