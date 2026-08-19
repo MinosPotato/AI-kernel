@@ -16,10 +16,11 @@ use aik_api::permission::{
     ActionId, ApprovalSink, Decision, PermissionRequest, PolicyEngine, Principal, PrincipalId,
     PrincipalKind, ResourceId,
 };
-use aik_api::tool::{ToolName, ToolRegistry};
+use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::event::EventStream;
 use aik_core::prelude::*;
 use aik_tools::{EchoTool, ToolsComponent};
+use async_trait::async_trait;
 use serde_json::json;
 
 const ACTION: &str = aik_tools::DEFAULT_PERMISSION;
@@ -494,6 +495,68 @@ async fn a_missing_policy_is_audited_as_a_misconfiguration_not_as_a_refusal() {
     assert_eq!(decided.len(), 1);
     assert_eq!(decided[0].outcome, AuthorizationOutcome::PolicyUnavailable);
     assert!(!decided[0].outcome.is_allowed());
+
+    kernel.shutdown().await.unwrap();
+}
+
+/// A tool whose resource claim can never be constructed — stands in for a real tool (e.g. a
+/// filesystem read) resolving a path that turns out not to exist. Never reached the policy
+/// engine at all, so it must not be recorded as a policy refusal.
+struct BadClaim;
+
+#[async_trait]
+impl Tool for BadClaim {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::new("bad-claim"),
+            description: "cannot describe its own resources".into(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            required_permissions: vec![],
+            read_only: true,
+        }
+    }
+
+    fn planned_resources(&self, _arguments: &serde_json::Value) -> Result<Vec<ResourceClaim>> {
+        Err(Error::not_found("file", "does-not-exist.txt"))
+    }
+
+    async fn invoke(
+        &self,
+        _arguments: serde_json::Value,
+        _authorizer: &dyn aik_api::permission::ResourceAuthorizer,
+        _cx: &ExecutionContext,
+    ) -> Result<ToolOutcome> {
+        panic!("must not run when its resource claims could not be built");
+    }
+}
+
+#[tokio::test]
+async fn a_resource_claim_that_cannot_be_built_is_audited_as_failed_not_denied() {
+    let kernel = Kernel::builder()
+        .component(ToolsComponent::new().with_tool(BadClaim))
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+    let error = tools
+        .invoke(&ToolName::new("bad-claim"), json!({}), &agent("a1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotFound { .. }), "{error}");
+
+    let invoked = drain(&mut invocations);
+    assert_eq!(invoked.len(), 1);
+    assert_eq!(
+        invoked[0].outcome,
+        InvocationOutcome::Failed {
+            kind: "notfound".into()
+        },
+        "a resource claim that failed to resolve is not a policy decision — it never reached \
+         one — so it must not be indistinguishable from an actual denial in the audit trail"
+    );
 
     kernel.shutdown().await.unwrap();
 }

@@ -281,17 +281,21 @@ Inspect `*.jsonl` for the structured form of everything `-v` printed.
 * **The heuristic token counter is not a real tokenizer**, by design (see
   `crates/context/src/tokens.rs`) — every number in this document labelled "estimated"
   should be read as a consistent, monotonic, but not billing-accurate figure.
-* **An observation, not a bug found by this pass:** `ToolInvoked.outcome` is
-  `InvocationOutcome::Denied` for *any* error `InProcessToolRegistry::authorize` returns —
-  including a `Tool::planned_resources` failure that has nothing to do with a policy
-  decision, such as reading a file that does not exist (`resolve_within` cannot canonicalise
-  a path that is not there, so the read tool's own resource-claim construction fails before
-  any policy question is even asked). This was true before this pass — the `if let
-  Err(error) = self.authorize(...)` branch that produces it predates this work — and
-  `duration_ms`/`authorization_duration_ms` are correctly populated for it regardless of
-  what the outcome label means; it is noted here because it was visible in scenario H's
-  audit trail and is worth knowing when reading `ToolInvoked` events, not because it affects
-  anything this pass implemented.
+* **Fixed since this pass:** `ToolInvoked.outcome` used to be `InvocationOutcome::Denied` for
+  *any* error `InProcessToolRegistry::authorize` returned, including a
+  `Tool::planned_resources` failure that has nothing to do with a policy decision, such as
+  reading a file that does not exist (`resolve_within` cannot canonicalise a path that is not
+  there, so the read tool's own resource-claim construction fails before any policy question
+  is even asked). It was visible in scenario H's audit trail as a `NotFound` read recorded
+  identically to an actual policy refusal. `InProcessToolRegistry::invoke` now calls
+  `Tool::planned_resources` before entering the authorization phase, so a claim that fails to
+  build is recorded as `InvocationOutcome::Failed { kind: "notfound" }` and a claim that is
+  actually refused (including by a broken policy engine or approval sink, which fails closed)
+  is recorded as `InvocationOutcome::Denied` — see
+  `classify_authorization_error`/`InProcessToolRegistry::authorize` in
+  `crates/tools/src/registry.rs`, and
+  `a_resource_claim_that_cannot_be_built_is_audited_as_failed_not_denied` in
+  `crates/tools/tests/authorization.rs`.
 
 ## Recommended next step
 

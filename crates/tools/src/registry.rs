@@ -12,7 +12,7 @@ use aik_api::permission::{
     ActionId, ApprovalSink, Decision, PermissionRequest, PolicyEngine, Principal, PrincipalId,
     ResourceAuthorizer, ResourceId,
 };
-use aik_api::tool::{Tool, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
+use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::clock::{SharedClock, SystemClock};
 use aik_core::event::{Envelope, Event, EventBus};
 use aik_core::id::ComponentId;
@@ -337,14 +337,23 @@ impl InProcessToolRegistry {
         }
     }
 
-    /// Runs both pre-execution authorization phases.
+    /// Runs both pre-execution authorization phases against an already-built set of resource
+    /// claims.
+    ///
+    /// Takes `claims` rather than the tool and its arguments deliberately: building a claim
+    /// (`Tool::planned_resources`) and asking whether it is allowed (`decide`) are different
+    /// kinds of failure. Every error this method can return came from an actual authorization
+    /// question being asked and refused — [`InProcessToolRegistry::invoke`] relies on that to
+    /// tell "the tool was refused" apart from "the tool's resource claim could not even be
+    /// built", which is not a policy decision at all. See [`classify_authorization_error`]'s
+    /// documentation, and the [`decide`](Self::decide) doc comment for why even a broken
+    /// policy engine or approval sink still counts as refused rather than merely failed.
     async fn authorize(
         &self,
         cx: &ExecutionContext,
         spec: &ToolSpec,
-        tool: &dyn Tool,
         principal: &Principal,
-        arguments: &serde_json::Value,
+        claims: Vec<ResourceClaim>,
     ) -> Result<()> {
         for action in &spec.required_permissions {
             self.decide(&Question {
@@ -358,7 +367,7 @@ impl InProcessToolRegistry {
             .await?;
         }
 
-        for claim in tool.planned_resources(arguments)? {
+        for claim in claims {
             self.decide(&Question {
                 cx,
                 tool: &spec.name,
@@ -466,10 +475,29 @@ impl ToolRegistry for InProcessToolRegistry {
 
         let spec = tool.spec();
         let authorization_started = Instant::now();
-        if let Err(error) = self
-            .authorize(cx, &spec, tool.as_ref(), &principal, &arguments)
-            .await
-        {
+
+        // Building a resource claim is not an authorization question — no `decide` was ever
+        // asked, so a failure here (e.g. a path that does not resolve) is not a policy
+        // decision and must not be recorded as one.
+        let claims = match tool.planned_resources(&arguments) {
+            Ok(claims) => claims,
+            Err(error) => {
+                self.record_invocation(
+                    cx,
+                    name,
+                    &principal,
+                    InvocationOutcome::Failed {
+                        kind: format!("{:?}", error.kind()).to_lowercase(),
+                    },
+                    started.elapsed(),
+                    Some(authorization_started.elapsed()),
+                    None,
+                );
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self.authorize(cx, &spec, &principal, claims).await {
             self.record_invocation(
                 cx,
                 name,
@@ -499,12 +527,7 @@ impl ToolRegistry for InProcessToolRegistry {
             Ok(_) => InvocationOutcome::Succeeded,
             // A tool that refuses a discovered resource surfaces the denial here; record it
             // as denied rather than as a generic failure.
-            Err(error) if error.kind() == aik_core::ErrorKind::Permission => {
-                InvocationOutcome::Denied
-            }
-            Err(error) => InvocationOutcome::Failed {
-                kind: format!("{:?}", error.kind()).to_lowercase(),
-            },
+            Err(error) => classify_authorization_error(error),
         };
         self.record_invocation(
             cx,
@@ -524,6 +547,26 @@ impl ToolRegistry for InProcessToolRegistry {
 /// implausibly long one.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Classifies an error returned by [`Tool::invoke`] as [`InvocationOutcome::Denied`] or
+/// [`InvocationOutcome::Failed`].
+///
+/// Used only for a tool's own execution result, where — unlike the two pre-execution phases
+/// in [`InProcessToolRegistry::invoke`], which know structurally whether they are reporting a
+/// refused claim or a decision — there is no such structural signal: a running tool can fail
+/// for its own reasons (cancellation, timeout, I/O) or because a
+/// [`ResourceAuthorizer::authorize`](aik_api::permission::ResourceAuthorizer::authorize) call
+/// it made mid-run was refused. [`aik_core::ErrorKind::Permission`] is the best available
+/// signal for the latter.
+fn classify_authorization_error(error: &Error) -> InvocationOutcome {
+    if error.kind() == aik_core::ErrorKind::Permission {
+        InvocationOutcome::Denied
+    } else {
+        InvocationOutcome::Failed {
+            kind: format!("{:?}", error.kind()).to_lowercase(),
+        }
+    }
 }
 
 /// A [`PrincipalId`] for the implicit system principal, for policy engines that want to
