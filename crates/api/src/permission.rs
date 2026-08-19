@@ -75,6 +75,9 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// The identifier of the implicit system principal.
+    pub const SYSTEM: &'static str = "system";
+
     /// Creates a principal of the given kind.
     pub fn new(id: impl Into<PrincipalId>, kind: PrincipalKind) -> Self {
         Self {
@@ -82,6 +85,17 @@ impl Principal {
             kind,
             on_behalf_of: None,
         }
+    }
+
+    /// The system acting on its own behalf.
+    ///
+    /// This is what an [`ExecutionContext`] with no principal means — a scheduled job,
+    /// startup work — and it is a distinct identity, not a wildcard and not
+    /// "unauthenticated". Subsystems that need to attribute such a context should use this
+    /// rather than inventing their own name for it, so a policy rule written against
+    /// `system` matches everywhere.
+    pub fn system() -> Self {
+        Self::new(Self::SYSTEM, PrincipalKind::System)
     }
 
     /// Records that this principal is acting for another.

@@ -134,6 +134,7 @@ Object-safe, async trait definitions only. Nothing here is implemented, and noth
 | `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     |
 | `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    |
 | `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       |
+| `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload |
 | `memory`     | `MemoryStore`: records, queries, optional embeddings                   |
 | `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               |
 | `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) |

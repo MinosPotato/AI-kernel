@@ -9,7 +9,7 @@ use aik_api::audit::{
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{
     ActionId, ApprovalSink, Decision, PermissionRequest, PolicyEngine, Principal, PrincipalId,
-    PrincipalKind, ResourceAuthorizer, ResourceId,
+    ResourceAuthorizer, ResourceId,
 };
 use aik_api::tool::{Tool, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::clock::{SharedClock, SystemClock};
@@ -24,7 +24,7 @@ use serde_json::json;
 /// A context with no principal is the system acting on its own behalf — a scheduled job,
 /// startup work — not an unauthenticated caller. Policy engines should treat it as its own
 /// identity rather than as a wildcard.
-const SYSTEM_PRINCIPAL: &str = "system";
+const SYSTEM_PRINCIPAL: &str = Principal::SYSTEM;
 
 /// A [`ToolRegistry`] that holds its tools in memory and runs them in the same process.
 ///
@@ -165,9 +165,7 @@ impl InProcessToolRegistry {
     }
 
     fn principal_of(cx: &ExecutionContext) -> Principal {
-        cx.principal
-            .clone()
-            .unwrap_or_else(|| Principal::new(SYSTEM_PRINCIPAL, PrincipalKind::System))
+        cx.principal.clone().unwrap_or_else(Principal::system)
     }
 
     /// Publishes an audit event, correlated and attributed, if a bus is configured.
