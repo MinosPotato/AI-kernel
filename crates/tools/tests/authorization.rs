@@ -797,3 +797,107 @@ async fn audit_events_do_not_cross_between_kernels() {
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// A mechanism that fails is not a mechanism that allowed
+// ---------------------------------------------------------------------------
+
+/// A policy engine that cannot answer at all.
+struct BrokenPolicy;
+
+#[async_trait]
+impl PolicyEngine for BrokenPolicy {
+    async fn evaluate(
+        &self,
+        _request: &PermissionRequest,
+        _cx: &ExecutionContext,
+    ) -> Result<Decision> {
+        Err(Error::other("the policy store is unreachable"))
+    }
+}
+
+/// An approval sink that cannot reach anyone — the shape a real frontend takes when it has
+/// gone away, timed out or was never attached.
+struct BrokenApproval;
+
+#[async_trait]
+impl ApprovalSink for BrokenApproval {
+    async fn request_approval(
+        &self,
+        _request: &PermissionRequest,
+        _prompt: &str,
+        _cx: &ExecutionContext,
+    ) -> Result<bool> {
+        Err(Error::Timeout(Duration::from_secs(1)))
+    }
+}
+
+#[tokio::test]
+async fn a_policy_engine_that_fails_denies_and_is_audited_as_unavailable() {
+    let kernel = kernel_with(Arc::new(BrokenPolicy)).await;
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let error = tools
+        .invoke(&ToolName::new(TOOL), json!({ "text": "hi" }), &agent("a1"))
+        .await
+        .unwrap_err();
+
+    // The engine's own error reaches the caller unchanged, rather than being flattened into
+    // a denial that would hide a broken deployment.
+    assert_eq!(error.kind(), aik_core::ErrorKind::Other, "{error}");
+
+    // A failure to decide is still recorded as a decision point, so an audit trail cannot
+    // silently omit the calls a broken policy engine was asked about.
+    let decided = drain(&mut decisions);
+    assert_eq!(decided.len(), 1);
+    assert_eq!(decided[0].phase, AuthorizationPhase::Tool);
+    assert_eq!(decided[0].outcome, AuthorizationOutcome::PolicyUnavailable);
+    assert!(!decided[0].outcome.is_allowed());
+
+    assert_eq!(
+        drain(&mut invocations)[0].outcome,
+        InvocationOutcome::Denied
+    );
+
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_approval_sink_that_fails_denies_and_is_audited_as_unavailable() {
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_tool(EchoTool::new())
+                .with_policy(Arc::new(AskForResources))
+                .with_approvals(Arc::new(BrokenApproval)),
+        )
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+
+    let error = tools
+        .invoke(
+            &ToolName::new(TOOL),
+            json!({ "text": "hi", "resource": "/workspace/notes.md" }),
+            &agent("a1"),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), aik_core::ErrorKind::Timeout, "{error}");
+
+    // Distinct from `ApprovalRefused`: nobody said no, the question never got an answer.
+    let decided = drain(&mut decisions);
+    assert_eq!(decided.len(), 2);
+    assert_eq!(decided[1].phase, AuthorizationPhase::Resource);
+    assert_eq!(
+        decided[1].outcome,
+        AuthorizationOutcome::ApprovalUnavailable
+    );
+
+    kernel.shutdown().await.unwrap();
+}

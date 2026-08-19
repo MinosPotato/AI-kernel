@@ -79,14 +79,17 @@ pub enum AuthorizationOutcome {
     ApprovalGranted,
     /// The policy engine deferred to a human, who refused.
     ApprovalRefused,
-    /// The policy engine deferred to a human, but no approval sink was available.
+    /// The policy engine deferred to a human, but no answer could be obtained.
     ///
-    /// Treated as a denial. Recorded distinctly because it means the deployment is
-    /// misconfigured, not that anyone actually said no.
+    /// Covers both "no approval sink is configured" and a sink that failed to produce an
+    /// answer — nobody attached to ask, nobody answered before the deadline, the frontend
+    /// went away. Treated as a denial. Recorded distinctly because it means the deployment
+    /// is misconfigured or unattended, not that anyone actually said no.
     ApprovalUnavailable,
-    /// No policy engine was configured, so nothing could be allowed.
+    /// No policy decision could be obtained, so nothing could be allowed.
     ///
-    /// Also a denial, also a misconfiguration rather than a decision.
+    /// Covers both "no policy engine is configured" and an engine that failed to evaluate.
+    /// Also a denial, also a broken mechanism rather than a decision.
     PolicyUnavailable,
 }
 
