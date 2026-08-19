@@ -2,11 +2,13 @@
 
 The core of a long-term AI operating layer — the small, permanent foundation that agents,
 model providers, tools, memory, permissions, scheduling, desktop integration and every
-frontend will be built on.
+frontend are built on.
 
-This stage is the kernel only. It is not an LLM wrapper: it contains no models, no agents,
-no tools, no storage, no UI and no operating-system code. It contains the mechanisms that
-such things need in order to coexist.
+At its center is the kernel (`aik-core`, `aik-api`) — not an LLM wrapper: it knows nothing
+about models, agents, tools, storage, a UI or the operating system, only the mechanisms such
+things need in order to coexist. Everything that does know about those things — a real
+model provider, real tools, an agent loop, a terminal frontend — lives downstream of the
+kernel, each in its own crate, listed below.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind it.
 

@@ -1,13 +1,16 @@
 # Architecture
 
-This repository contains the **kernel** of an AI operating layer: the small, permanent
-foundation that every future part of the system (Quickshell UI, CLI, chat bridges,
-background services, external apps) is built on top of.
+At the center of this repository is the **kernel** (`aik-core`, `aik-api`): the small,
+permanent foundation everything else in the workspace is built on top of, and that any future
+part of the system (Quickshell UI, chat bridges, background services, external apps) would be
+built on top of too.
 
 The kernel is deliberately *not* an LLM wrapper. It knows nothing about models, agents,
 tools, memory, Linux, Hyprland or Docker. It knows how to **hold** such things: how they
 are named, wired together, started, stopped, configured, discovered and how they talk to
-each other.
+each other. Everything that *does* know about models, tools, agents or a terminal — a real
+`ModelProvider`, a real `ToolRegistry`, the agent loop, the `aik` CLI binary — lives in its
+own crate downstream of the kernel; see [Workspace layout](#workspace-layout).
 
 ## Design rules
 
@@ -26,14 +29,35 @@ each other.
 ```
 AI-kernel/
 ├─ crates/
-│  ├─ core/   → aik-core : the kernel itself (mechanisms)
-│  ├─ api/    → aik-api  : domain contracts for future subsystems (no implementations)
-│  └─ aik/    → aik      : thin facade re-exporting both
+│  ├─ core/     → aik-core     : the kernel itself (mechanisms)
+│  ├─ api/      → aik-api      : domain contracts for downstream subsystems
+│  ├─ aik/      → aik          : thin facade re-exporting both
+│  ├─ ollama/   → aik-ollama   : a ModelProvider, talking to a local Ollama server
+│  ├─ tools/    → aik-tools    : the reference ToolRegistry (authorization-gated)
+│  ├─ policy/   → aik-policy   : a deterministic, configuration-driven PolicyEngine
+│  ├─ fs/       → aik-fs       : filesystem Tools, confined to a configured root
+│  ├─ approval/ → aik-approval : a human-in-the-loop ApprovalSink
+│  ├─ context/  → aik-context  : a durable transcript and budgeted model windows
+│  ├─ agent/    → aik-agent    : the agent loop tying every capability above together
+│  └─ cli/      → aik-cli      : a terminal frontend (the `aik` binary)
 ```
 
-The split matters: `aik-core` must be able to compile and be reasoned about without any
-opinion at all about agents or models. `aik-api` is where the *shape* of the future system
-lives, and it is allowed to churn while `aik-core` stays stable.
+`aik-core` and `aik-api` are the kernel proper: `aik-core` must be able to compile and be
+reasoned about without any opinion at all about agents or models, and `aik-api` is where the
+*shape* of everything downstream lives — object-safe trait definitions only, nothing
+implemented, allowed to churn while `aik-core` stays stable.
+
+Every other crate is a concrete implementation of one or more `aik-api` contracts, built in
+dependency order: `aik-ollama` implements `ModelProvider`; `aik-policy` implements
+`PolicyEngine`; `aik-tools` is the reference `ToolRegistry`, gating every call through
+whichever `PolicyEngine` and `ApprovalSink` (`aik-approval`) it is given; `aik-fs` is the
+first `Tool` implementation, and the first code in the workspace that touches the host
+filesystem; `aik-context` implements `ContextStore`; `aik-agent` composes a `ModelProvider`,
+a `ToolRegistry` and a `ContextStore` into a request/response loop; `aik-cli` is the first
+and, so far, only thing that assembles a real kernel, wires every crate above into it, and
+lets a human type a question. None of this layer is itself part of the kernel — see
+[What deliberately is not in the kernel](#what-deliberately-is-not-in-the-kernel) — but it is
+part of this repository, developed against `aik-api`'s contracts to keep them honest.
 
 ## `aik-core` — the kernel
 
@@ -124,30 +148,39 @@ covers compiled-in extensions today; dynamic loading later only needs a loader t
 Time is injected (`Arc<dyn Clock>`), so scheduling and anything time-dependent stays
 testable. `SystemClock` and `ManualClock` are provided.
 
-## `aik-api` — contracts for what comes later
+## `aik-api` — contracts for downstream subsystems
 
-Object-safe, async trait definitions only. Nothing here is implemented, and nothing in
-`aik-core` depends on it — a kernel can be built and run with none of these present.
+Object-safe, async trait definitions. Nothing in `aik-core` depends on `aik-api` — a kernel
+can be built and run with none of these present — and `aik-api` itself implements nothing;
+every "Implemented by" column below is a separate crate.
 
-| Module       | Contract                                                              |
-|--------------|-----------------------------------------------------------------------|
-| `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     |
-| `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    |
-| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       |
-| `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload |
-| `memory`     | `MemoryStore`: records, queries, optional embeddings                   |
-| `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               |
-| `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) |
-| `agent`      | `Agent`, sessions, streaming updates                                   |
-| `platform`   | `PlatformIntegration`: the single seam for Hyprland/Wayland/OS backends |
+| Module       | Contract                                                              | Implemented by |
+|--------------|------------------------------------------------------------------------|----------------|
+| `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     | — (a plain value type, not a trait) |
+| `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (`ModelProvider`; no `Embedder` yet) |
+| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` (`Tool`) |
+| `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
+| `memory`     | `MemoryStore`: records, queries, optional embeddings                   | not yet implemented |
+| `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               | `aik-policy` (`PolicyEngine`), `aik-approval` (`ApprovalSink`) |
+| `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) | not yet implemented |
+| `agent`      | `Agent`, sessions, streaming updates                                   | `aik-agent` (`AgentLoop`) |
+| `platform`   | `PlatformIntegration`: the single seam for Hyprland/Wayland/OS backends | not yet implemented |
 
-These types are provisional by design and will evolve as the subsystems are built. They
-exist now so that subsystems can be developed in parallel against a shared shape, and so
-that the kernel's registry and event mechanisms have real consumers to be validated against.
+These types are provisional by design and evolve as the subsystems built against them reveal
+what the shape should actually be — `aik-tools`, `aik-fs`, `aik-agent` and the rest exist
+in part to validate that this contract layer holds up against a real implementation, not
+just a plan for one. `memory`, `scheduler` and `platform` remain exactly that: a shape with
+no implementation yet, deliberately not built ahead of the evidence that would justify one.
 
-## What deliberately is not here
+## What deliberately is not in the kernel
 
-UI, Quickshell, Hyprland, Wayland, any OS-specific code, LLM clients, memory backends, tool
-implementations, agent loops, Docker, CLI, bots, databases, signal handling, logging setup.
-All of these are downstream of the kernel and reach it through the registry, the event bus
-and the component lifecycle.
+`aik-core` itself knows nothing about UI, Quickshell, Hyprland, Wayland, any OS-specific
+code, LLM clients, memory backends, tool implementations, agent loops, Docker, a CLI, bots,
+databases, signal handling, or logging setup. Several of these now exist in this repository
+as the implementation crates listed under [Workspace layout](#workspace-layout) — an LLM
+client (`aik-ollama`), tool implementations (`aik-fs`), an agent loop (`aik-agent`), a CLI
+(`aik-cli`) — but every one of them reaches `aik-core` only through the registry, the event
+bus and the component lifecycle, exactly as any other downstream consumer would; none of
+them is compiled into, or required by, `aik-core` itself. What genuinely is not here yet:
+Quickshell, Hyprland/Wayland or any other platform integration, a memory backend, a
+scheduler, and any UI beyond the terminal.
