@@ -1,0 +1,261 @@
+//! [`AgentLoop`]: the [`Agent`] implementation.
+
+use std::sync::Arc;
+
+use aik_api::agent::{Agent, AgentDescriptor, AgentId, AgentRequest, AgentResponse, AgentUpdate};
+use aik_api::context::ContextStore;
+use aik_api::execution::ExecutionContext;
+use aik_api::model::ModelProvider;
+use aik_api::tool::{ToolName, ToolRegistry};
+use aik_core::Result;
+use aik_core::clock::{SharedClock, SystemClock};
+use async_trait::async_trait;
+use futures_core::stream::BoxStream;
+
+use crate::run::{Run, Wiring};
+use crate::settings::AgentLoopSettings;
+
+/// The execution-context attribute naming the agent a run belongs to.
+///
+/// Set by the loop from its own identity, never from a request and never from a message. A
+/// policy rule may match on it — [`ExecutionContext::attributes`] is one of the two places a
+/// rule's `context` constraint is resolved against — which is exactly why nothing a caller
+/// or a model supplies is ever allowed to reach it.
+pub const AGENT_ATTRIBUTE: &str = "aik.agent";
+
+/// The execution-context attribute naming the session a run belongs to.
+///
+/// Taken from [`AgentRequest::session`], so it is the caller's, not the model's. It is what
+/// ties the model calls and tool invocations of one conversation together in a trace, and
+/// what lets a policy rule be scoped to a session.
+pub const SESSION_ATTRIBUTE: &str = "aik.agent.session";
+
+/// A model/tool loop built from the kernel's existing primitives.
+///
+/// One run is: record the input, assemble a bounded window from the
+/// [`ContextStore`], ask the [`ModelProvider`], run whatever tools it asked for through the
+/// [`ToolRegistry`], record the results, repeat — until a turn comes back without a tool
+/// call, which is the end.
+///
+/// # What it adds, and what it deliberately does not
+///
+/// The loop implements no policy, no confinement and no auditing of its own. Every one of
+/// those already exists behind a contract, and the loop's job is to route through them
+/// rather than around them:
+///
+/// | Concern | Where it is handled |
+/// |---|---|
+/// | May this tool run at all? | [`ToolRegistry::invoke`] → `PolicyEngine` |
+/// | May it touch this resource? | `Tool::planned_resources` → the same engine |
+/// | Does a human need to say yes? | `Decision::RequireApproval` → `ApprovalSink` |
+/// | What is recorded about it? | [`ToolInvoked`](aik_api::audit::ToolInvoked) and friends |
+/// | What does the model remember? | [`ContextStore`] |
+/// | What does the model get sent? | [`ContextStore::window`] under a [budget](AgentLoopSettings::budget) |
+///
+/// It adds exactly two rules of its own, both about *bounding*, and both fixed before the
+/// conversation starts: a run may take at most
+/// [`max_turns`](AgentLoopSettings::max_turns) model turns and invoke at most
+/// [`max_tool_calls`](AgentLoopSettings::max_tool_calls) tools, and it may only invoke tools
+/// in the set it was given.
+///
+/// # The trust boundary
+///
+/// Everything a model produces is data. It reaches exactly three places, and nowhere else:
+///
+/// * the transcript, as a [`ContextEntry`](aik_api::context::ContextEntry) whose
+///   attribution, session, ordering, timestamp and `pinned` flag are all assigned by the
+///   store from the [`ExecutionContext`] — so a model can influence what a record *says* and
+///   nothing about what it *is*;
+/// * a tool's arguments, passed to [`ToolRegistry::invoke`] verbatim and never inspected,
+///   rewritten or mined for resource identifiers by the loop, because deriving a resource
+///   from arbitrary arguments is the tool's job and the registry says why;
+/// * a `call_id`, echoed back into the transcript so a result can be matched to its call.
+///   It is a correlation token inside the conversation and is never used as a
+///   [`CorrelationId`](aik_core::CorrelationId), a principal, a session or an audit field.
+///
+/// What a model emits can therefore never change who the run is acting as, which session it
+/// is writing to, which model it talks to, which tools exist, how much it may spend, or when
+/// it stops.
+///
+/// [`AgentRequest::context`] is *not* merged into the execution context either, and that is
+/// a security decision rather than an omission. A policy rule's `context` constraint is
+/// resolved against [`ExecutionContext::attributes`], so anything that lands there can widen
+/// or narrow what the run is permitted to do; `AgentRequest::context` is arbitrary
+/// caller-supplied JSON that may well be a relay of model output. The only attributes the
+/// loop sets are [`AGENT_ATTRIBUTE`] and [`SESSION_ATTRIBUTE`], from its own identity and
+/// the caller's session id.
+///
+/// # Cancellation and deadlines
+///
+/// The caller's context is propagated, never replaced: each model call and each tool
+/// invocation gets a [`child`](ExecutionContext::child) of it, keeping the correlation id,
+/// principal and deadline while getting its own cancellation token. The loop checks for
+/// cancellation and deadline expiry before every action — including between announcing a
+/// tool call and running it — so an expired run never starts anything new. It does not wrap
+/// model calls or tool invocations in a timeout: interrupting the work is the provider's and
+/// the tool's own obligation, and a wrapper that merely stopped waiting would look like
+/// cancellation without being it.
+///
+/// A run that stops for any reason — cancelled, out of time, out of budget — closes off, in
+/// the transcript, every tool call it will now not make. An assistant turn asking for a tool
+/// with no result following it is a conversation most providers reject outright, so leaving
+/// one behind would mean a stopped run had quietly poisoned the session for whoever resumes
+/// it. The one case that cannot be tidied is a caller that *drops* a stream mid-run: dropping
+/// a future cannot await anything, so nothing can be written. Cancel the context instead of
+/// dropping the stream if the session is to be continued afterwards.
+pub struct AgentLoop {
+    id: AgentId,
+    description: Option<String>,
+    models: Arc<dyn ModelProvider>,
+    tools: Arc<dyn ToolRegistry>,
+    context: Arc<dyn ContextStore>,
+    clock: SharedClock,
+    settings: AgentLoopSettings,
+    allowed: Option<Vec<ToolName>>,
+}
+
+impl std::fmt::Debug for AgentLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentLoop")
+            .field("id", &self.id)
+            .field("model", &self.settings.model)
+            .field("max_turns", &self.settings.max_turns)
+            .field("max_tool_calls", &self.settings.max_tool_calls)
+            .field("tools", &self.allowed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentLoop {
+    /// Creates an agent wired to a model provider, a tool registry and a context store.
+    ///
+    /// The three are supplied rather than looked up, so a loop can be built and tested
+    /// without a kernel; [`AgentComponent`](crate::AgentComponent) is the wiring that
+    /// resolves them from the registry.
+    pub fn new(
+        id: impl Into<AgentId>,
+        models: Arc<dyn ModelProvider>,
+        tools: Arc<dyn ToolRegistry>,
+        context: Arc<dyn ContextStore>,
+        settings: AgentLoopSettings,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            description: None,
+            models,
+            tools,
+            context,
+            clock: Arc::new(SystemClock),
+            settings,
+            allowed: None,
+        }
+    }
+
+    /// Describes the agent, for a catalogue or a UI.
+    #[must_use]
+    pub fn described(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Restricts the agent to a fixed set of tools.
+    ///
+    /// Without this the agent offers whatever [`ToolRegistry::list`] reports. With it, the
+    /// run's tool set is the intersection of that list and this one, and a model asking for
+    /// anything else is told the tool does not exist rather than having the request
+    /// forwarded. This narrows what an agent can reach and never widens it: a tool named
+    /// here that the registry does not have stays absent, and a tool named here that policy
+    /// refuses is still refused.
+    #[must_use]
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = ToolName>) -> Self {
+        self.allowed = Some(tools.into_iter().collect());
+        self
+    }
+
+    /// Overrides the clock used for deadline checks. Defaults to the system clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: SharedClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Starts a run, deriving its execution context from the caller's.
+    fn begin(&self, request: AgentRequest, cx: &ExecutionContext) -> Run {
+        let session = request.session;
+        // A child context: same correlation, principal and deadline, its own cancellation.
+        // The attributes are the loop's own identity and the caller's session — never
+        // `request.context`, which is arbitrary caller-supplied JSON.
+        let cx = cx
+            .child()
+            .with_attribute(AGENT_ATTRIBUTE, self.id.as_str())
+            .with_attribute(SESSION_ATTRIBUTE, session.to_string());
+
+        Run::new(
+            Wiring {
+                models: self.models.clone(),
+                tools: self.tools.clone(),
+                context: self.context.clone(),
+                clock: self.clock.clone(),
+                settings: self.settings.clone(),
+                allowed: self.allowed.clone(),
+            },
+            session,
+            request.input,
+            cx,
+        )
+    }
+}
+
+#[async_trait]
+impl Agent for AgentLoop {
+    fn descriptor(&self) -> AgentDescriptor {
+        AgentDescriptor {
+            id: self.id.clone(),
+            description: self.description.clone(),
+            tools: self.allowed.clone().unwrap_or_default(),
+        }
+    }
+
+    async fn stream(
+        &self,
+        request: AgentRequest,
+        cx: &ExecutionContext,
+    ) -> Result<BoxStream<'static, Result<AgentUpdate>>> {
+        let mut run = self.begin(request, cx);
+
+        // The run lives inside the generator, so dropping the stream drops the run: a
+        // consumer that stops listening stops the loop, rather than leaving it going in a
+        // detached task.
+        Ok(Box::pin(async_stream::stream! {
+            loop {
+                match run.advance().await {
+                    Ok(updates) => {
+                        let mut finished = false;
+                        for update in updates {
+                            finished |= matches!(update, AgentUpdate::Finished(_));
+                            yield Ok(update);
+                        }
+                        if finished {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        break;
+                    }
+                }
+            }
+        }))
+    }
+
+    async fn run(&self, request: AgentRequest, cx: &ExecutionContext) -> Result<AgentResponse> {
+        let mut run = self.begin(request, cx);
+        loop {
+            for update in run.advance().await? {
+                if let AgentUpdate::Finished(response) = update {
+                    return Ok(response);
+                }
+            }
+        }
+    }
+}

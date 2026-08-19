@@ -10,6 +10,7 @@ members = [
     "crates/fs",
     "crates/approval",
     "crates/context",
+    "crates/agent",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ aik-policy = { version = "0.1.0", path = "crates/policy" }
 aik-fs = { version = "0.1.0", path = "crates/fs" }
 aik-approval = { version = "0.1.0", path = "crates/approval" }
 aik-context = { version = "0.1.0", path = "crates/context" }
+aik-agent = { version = "0.1.0", path = "crates/agent" }
 
 async-trait = "0.1"
 futures-core = "0.3"
