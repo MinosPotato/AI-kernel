@@ -1,0 +1,29 @@
+[package]
+name = "aik-fs"
+description = "Sandboxed filesystem Tools for the AI kernel, each confined to a configured root."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aik-core.workspace = true
+aik-api.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile.workspace = true
+aik-tools.workspace = true
+aik-policy.workspace = true

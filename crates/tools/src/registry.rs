@@ -57,7 +57,11 @@ const SYSTEM_PRINCIPAL: &str = "system";
 /// Denial is fail-closed at every point where it would be easy to get backwards: a
 /// required permission with no policy engine configured is a denial, and a
 /// [`Decision::RequireApproval`] with no approval sink configured is a denial rather than a
-/// hang or a silent allow.
+/// hang or a silent allow. A configured policy engine or approval sink that *fails* is the
+/// same: its error stops the call and is recorded as
+/// [`AuthorizationOutcome::PolicyUnavailable`] or
+/// [`AuthorizationOutcome::ApprovalUnavailable`], never allowed through and never left out
+/// of the audit trail.
 pub struct InProcessToolRegistry {
     tools: HashMap<ToolName, Arc<dyn Tool>>,
     policy: Option<Arc<dyn PolicyEngine>>,
@@ -240,7 +244,19 @@ impl InProcessToolRegistry {
             context: json!({ "tool": tool.as_str() }),
         };
 
-        let (outcome, error) = match policy.evaluate(&request, question.cx).await? {
+        // A policy engine that fails to answer has not allowed anything. The failure is
+        // recorded before it is propagated, so a mechanism that broke is as visible in the
+        // audit trail as one that refused — otherwise the only trace of it would be the
+        // absence of a decision, which is indistinguishable from never having asked.
+        let decision = match policy.evaluate(&request, question.cx).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.record_decision(question, AuthorizationOutcome::PolicyUnavailable);
+                return Err(error);
+            }
+        };
+
+        let (outcome, error) = match decision {
             Decision::Allow => (AuthorizationOutcome::Allowed, None),
             Decision::Deny { reason } => (
                 AuthorizationOutcome::Denied {
@@ -256,16 +272,23 @@ impl InProcessToolRegistry {
                     )),
                 ),
                 Some(sink) => {
-                    if sink
-                        .request_approval(&request, &prompt, question.cx)
-                        .await?
-                    {
-                        (AuthorizationOutcome::ApprovalGranted, None)
-                    } else {
-                        (
+                    match sink.request_approval(&request, &prompt, question.cx).await {
+                        Ok(true) => (AuthorizationOutcome::ApprovalGranted, None),
+                        Ok(false) => (
                             AuthorizationOutcome::ApprovalRefused,
                             Some(format!("{subject} was not approved")),
-                        )
+                        ),
+                        // Nobody to ask, nobody answered in time, the frontend went away:
+                        // not a refusal by a human, and emphatically not an allow. The
+                        // error itself is propagated unchanged, so a timeout stays a
+                        // timeout for the caller.
+                        Err(error) => {
+                            self.record_decision(
+                                question,
+                                AuthorizationOutcome::ApprovalUnavailable,
+                            );
+                            return Err(error);
+                        }
                     }
                 }
             },

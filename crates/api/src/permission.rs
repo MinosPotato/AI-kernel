@@ -164,6 +164,16 @@ pub trait ApprovalSink: Send + Sync + 'static {
     ///
     /// Implementations must respect `cx`'s cancellation and deadline: an approval prompt
     /// nobody answers must not block the system forever.
+    ///
+    /// # Obligations
+    ///
+    /// * `Ok(true)` means a human actually approved *this* request. Nothing else may
+    ///   produce it — not a default, not a retry, not an unreachable frontend.
+    /// * `Ok(false)` means a human actually refused.
+    /// * Everything else — nobody to ask, nobody answered in time, the frontend failed — is
+    ///   `Err`. Callers treat that as a denial either way, but the distinction is what lets
+    ///   an audit trail tell a refusal apart from a broken mechanism: see
+    ///   [`AuthorizationOutcome::ApprovalUnavailable`](crate::audit::AuthorizationOutcome::ApprovalUnavailable).
     async fn request_approval(
         &self,
         request: &PermissionRequest,

@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/api", "crates/aik", "crates/ollama", "crates/tools"]
+members = [
+    "crates/core",
+    "crates/api",
+    "crates/aik",
+    "crates/ollama",
+    "crates/tools",
+    "crates/policy",
+    "crates/fs",
+    "crates/approval",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +22,10 @@ authors = ["AI-kernel contributors"]
 [workspace.dependencies]
 aik-core = { version = "0.1.0", path = "crates/core" }
 aik-api = { version = "0.1.0", path = "crates/api" }
+aik-tools = { version = "0.1.0", path = "crates/tools" }
+aik-policy = { version = "0.1.0", path = "crates/policy" }
+aik-fs = { version = "0.1.0", path = "crates/fs" }
+aik-approval = { version = "0.1.0", path = "crates/approval" }
 
 async-trait = "0.1"
 futures-core = "0.3"
@@ -31,6 +44,9 @@ async-stream = "0.3"
 bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 wiremock = "0.6"
+
+libc = "0.2"
+tempfile = "3"
 
 [workspace.lints.rust]
 missing_docs = "warn"
