@@ -320,7 +320,7 @@ conversation output:
   [req]  provider usage: 337 in / 20 out (exact, as reported)
   [req]  model latency: 401ms
   [auth] Tool filesystem.write → Allowed (0ms)
-  [auth] Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted (118ms)
+  [auth] Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted (118ms, 115ms of it waiting on approval)
   [tool] filesystem.write → Succeeded (4ms exec, 118ms auth)
 ```
 
@@ -340,8 +340,9 @@ conversation output:
   see [Filesystem confinement](#filesystem-confinement) for what the third phase is), with the
   outcome (`Allowed`, `Denied`, `ApprovalGranted`, `ApprovalRefused`, `ApprovalUnavailable`,
   `PolicyUnavailable`) and how long the decision took, in parentheses. For an approval-related
-  outcome that duration *is* how long the human took to answer — there is no separate event for
-  that wait.
+  outcome, the parenthetical breaks out how much of that time was specifically spent waiting for
+  a human to answer — see `AuthorizationDecided.approval_wait_ms`, which is `None` (and so
+  omitted here) whenever no approval sink was ever asked.
 - `[tool]` — one per completed (or refused, or not-found) invocation, with execution and
   authorization time in parentheses where they apply.
 

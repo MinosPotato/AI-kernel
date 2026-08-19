@@ -132,15 +132,30 @@ pub struct AuthorizationDecided {
     /// How long this one decision took to reach, in milliseconds.
     ///
     /// Measured from the moment the question was formed to the moment
-    /// [`AuthorizationOutcome`] was decided — policy evaluation for
-    /// [`AuthorizationOutcome::Allowed`]/[`AuthorizationOutcome::Denied`], and *including
-    /// the human's response time* for [`AuthorizationOutcome::ApprovalGranted`]/
-    /// [`AuthorizationOutcome::ApprovalRefused`]/[`AuthorizationOutcome::ApprovalUnavailable`]
-    /// — since asking a human is the dominant cost of that phase and there is no coarser
-    /// event this crate publishes to separate the two. A locally measured wall-clock
-    /// duration (`std::time::Instant`), not a provider- or policy-engine-reported figure.
+    /// [`AuthorizationOutcome`] was decided. Includes both policy evaluation and, when the
+    /// policy asked for one, the approval wait — see [`AuthorizationDecided::approval_wait_ms`]
+    /// to isolate the latter. A locally measured wall-clock duration (`std::time::Instant`),
+    /// not a provider- or policy-engine-reported figure.
     #[serde(default)]
     pub duration_ms: u64,
+    /// How long of `duration_ms` was spent specifically waiting on
+    /// [`ApprovalSink::request_approval`](crate::permission::ApprovalSink::request_approval),
+    /// in milliseconds.
+    ///
+    /// `Some` for [`AuthorizationOutcome::ApprovalGranted`]/
+    /// [`AuthorizationOutcome::ApprovalRefused`], and for [`AuthorizationOutcome::ApprovalUnavailable`]
+    /// when it resulted from a sink that was asked and failed. `None` for
+    /// [`AuthorizationOutcome::Allowed`]/[`AuthorizationOutcome::Denied`]/
+    /// [`AuthorizationOutcome::PolicyUnavailable`], and for the [`AuthorizationOutcome::ApprovalUnavailable`]
+    /// case where no sink was configured to ask in the first place — in both, no approval
+    /// wait happened at all.
+    ///
+    /// Broken out from `duration_ms` because the two have wildly different distributions: a
+    /// policy check is sub-millisecond and in-memory, an approval wait is a human being asked
+    /// a question and can run to minutes. Folding them into one number makes that number
+    /// bimodal and useless for alerting on either half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_wait_ms: Option<u64>,
     /// The answer.
     #[serde(flatten)]
     pub outcome: AuthorizationOutcome,
@@ -261,6 +276,7 @@ mod tests {
             resource: Some(ResourceId::new("/tmp/x")),
             phase: AuthorizationPhase::Resource,
             duration_ms: 5,
+            approval_wait_ms: None,
             outcome: AuthorizationOutcome::Allowed,
         }
     }
@@ -272,6 +288,23 @@ mod tests {
         assert_eq!(json["outcome"], json!("allowed"));
         assert_eq!(json["phase"], json!("resource"));
         assert_eq!(json["resource"], json!("/tmp/x"));
+        assert!(json.get("approval_wait_ms").is_none());
+
+        let parsed: AuthorizationDecided = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn an_approval_decision_reports_the_wait_separately_from_the_total() {
+        let event = AuthorizationDecided {
+            duration_ms: 4_012,
+            approval_wait_ms: Some(4_009),
+            outcome: AuthorizationOutcome::ApprovalGranted,
+            ..decision()
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["duration_ms"], json!(4_012));
+        assert_eq!(json["approval_wait_ms"], json!(4_009));
 
         let parsed: AuthorizationDecided = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, event);
