@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aik_api::agent::{Agent, AgentId};
-use aik_api::context::ContextStore;
+use aik_api::context::{ContextStore, TokenCounter};
 use aik_api::model::ModelProvider;
 use aik_api::tool::{ToolName, ToolRegistry};
 use aik_core::prelude::*;
@@ -150,7 +150,16 @@ impl Component for AgentComponent {
             context,
             self.settings.clone(),
         )
-        .with_clock(ctx.clock().clone());
+        .with_clock(ctx.clock().clone())
+        .with_events(ctx.events().clone(), self.id.clone());
+        // The same counter the context store uses, when one is registered, so
+        // `RequestMeasured` and `ContextAssembled` report consistent numbers for the same
+        // window. Its absence is not fatal — measurement degrades to an internal fallback
+        // heuristic rather than the agent failing to start over a capability it does not
+        // otherwise need.
+        if let Ok(counter) = ctx.service::<dyn TokenCounter>() {
+            agent = agent.with_token_counter(counter);
+        }
         if let Some(description) = &self.description {
             agent = agent.described(description.clone());
         }

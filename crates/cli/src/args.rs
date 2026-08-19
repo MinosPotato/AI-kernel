@@ -53,6 +53,10 @@ pub struct Options {
     pub no_tools: bool,
     /// Whether to print authorization and context events as they are published.
     pub verbose: bool,
+    /// Where to append a JSONL measurement record of the run, if anywhere.
+    ///
+    /// See [`crate::recorder`] for exactly what is and is not written.
+    pub record: Option<PathBuf>,
 }
 
 impl Options {
@@ -106,6 +110,8 @@ pub const HELP: &str = concat!(
     "        --write          also register the filesystem write tool\n",
     "        --no-tools       register no tools at all\n",
     "    -v, --verbose        print authorization and context events as they happen\n",
+    "    -R, --record <FILE>  append a JSONL measurement record of the run to FILE\n",
+    "                         (counts and timings only — see docs/MEASUREMENTS.md)\n",
     "    -h, --help           print this help\n",
     "    -V, --version        print the version\n",
     "\n",
@@ -165,6 +171,7 @@ where
             "--write" => options.write = true,
             "--no-tools" => options.no_tools = true,
             "-v" | "--verbose" => options.verbose = true,
+            "-R" | "--record" => options.record = Some(PathBuf::from(value(&flag)?)),
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(usage(format!("unknown option `{other}`")));
             }
@@ -292,10 +299,29 @@ mod tests {
             "--write",
             "--no-tools",
             "--verbose",
+            "--record",
             "--help",
             "--version",
         ] {
             assert!(HELP.contains(flag), "`{flag}` is undocumented");
         }
+    }
+
+    #[test]
+    fn a_record_path_is_accepted_in_both_forms() {
+        let separated = options(&["--record", "run.jsonl"]);
+        let inline = options(&["--record=run.jsonl"]);
+        let short = options(&["-R", "run.jsonl"]);
+        assert_eq!(separated, inline);
+        assert_eq!(separated, short);
+        assert_eq!(
+            separated.record.as_deref(),
+            Some(std::path::Path::new("run.jsonl"))
+        );
+    }
+
+    #[test]
+    fn no_record_path_is_configured_by_default() {
+        assert!(options(&[]).record.is_none());
     }
 }

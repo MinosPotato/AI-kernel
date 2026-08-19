@@ -901,3 +901,95 @@ async fn an_approval_sink_that_fails_denies_and_is_audited_as_unavailable() {
 
     kernel.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Latency measurement
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_permitted_invocation_reports_authorization_and_execution_durations() {
+    let kernel = kernel_with(Arc::new(PrefixPolicy::new("/workspace/"))).await;
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+    tools
+        .invoke(
+            &ToolName::new(TOOL),
+            json!({ "text": "hi", "resource": "/workspace/a" }),
+            &agent("a1"),
+        )
+        .await
+        .unwrap();
+
+    let invoked = drain(&mut invocations);
+    assert_eq!(invoked.len(), 1);
+    assert!(invoked[0].authorization_duration_ms.is_some());
+    assert!(invoked[0].execution_duration_ms.is_some());
+    // The total is at least as large as either phase alone, since it covers both.
+    assert!(
+        invoked[0].duration_ms >= invoked[0].authorization_duration_ms.unwrap()
+            && invoked[0].duration_ms >= invoked[0].execution_duration_ms.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_denied_invocation_has_no_execution_duration() {
+    let kernel = kernel_with(Arc::new(PrefixPolicy::new("/workspace/"))).await;
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+    tools
+        .invoke(
+            &ToolName::new(TOOL),
+            json!({ "text": "hi", "resource": "/etc/shadow" }),
+            &agent("a1"),
+        )
+        .await
+        .unwrap_err();
+
+    let invoked = drain(&mut invocations);
+    assert_eq!(invoked.len(), 1);
+    assert!(invoked[0].authorization_duration_ms.is_some());
+    assert!(invoked[0].execution_duration_ms.is_none());
+}
+
+#[tokio::test]
+async fn a_not_found_invocation_has_no_authorization_or_execution_duration() {
+    let kernel = kernel_with(Arc::new(PrefixPolicy::new("/workspace/"))).await;
+    let mut invocations = kernel.context().subscribe::<ToolInvoked>();
+
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+    tools
+        .invoke(&ToolName::new("ghost"), json!({}), &agent("a1"))
+        .await
+        .unwrap_err();
+
+    let invoked = drain(&mut invocations);
+    assert_eq!(invoked.len(), 1);
+    assert!(invoked[0].authorization_duration_ms.is_none());
+    assert!(invoked[0].execution_duration_ms.is_none());
+}
+
+#[tokio::test]
+async fn every_authorization_decision_carries_a_duration() {
+    let kernel = kernel_with(Arc::new(PrefixPolicy::new("/workspace/"))).await;
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+    tools
+        .invoke(
+            &ToolName::new(TOOL),
+            json!({ "text": "hi", "resource": "/workspace/a" }),
+            &agent("a1"),
+        )
+        .await
+        .unwrap();
+
+    let decided = drain(&mut decisions);
+    assert_eq!(decided.len(), 2);
+    for decision in decided {
+        // Not asserting a lower bound beyond "measured at all": on a fast machine a
+        // pure in-memory policy check can legitimately resolve in under a millisecond.
+        let _ = decision.duration_ms;
+    }
+}

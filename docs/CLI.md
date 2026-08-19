@@ -311,32 +311,56 @@ canonicalise `/etc/passwd` from a root it isn't under.
 
 ## Verbose mode
 
-`-v`/`--verbose` prints three kinds of events as they happen, alongside the normal
+`-v`/`--verbose` prints four kinds of events as they happen, alongside the normal
 conversation output:
 
 ```
-  [ctx]  3 records, 86 tokens, 0 elided, 0 dropped
-  [auth] Tool filesystem.write → Allowed
-  [auth] Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted
-  [tool] filesystem.write → Succeeded
+  [ctx]  stored 244 — included 244 (11 records), elided 0 (0 parts), evicted 0 (0 records)
+  [req]  turn 2 — system 0, tools 301 (2 offered), conversation 244, total 545 (estimated)
+  [req]  provider usage: 337 in / 20 out (exact, as reported)
+  [req]  model latency: 401ms
+  [auth] Tool filesystem.write → Allowed (0ms)
+  [auth] Resource filesystem.write on /home/user/project/hello.txt → ApprovalGranted (118ms)
+  [tool] filesystem.write → Succeeded (4ms exec, 118ms auth)
 ```
 
 - `[ctx]` — one per model turn, from the context store's `ContextAssembled` event: how many
-  records were included in the window sent to the model, how many tokens that cost, and how
-  many parts were elided or whole records dropped to fit the budget.
+  tokens are stored in total, how many were included in the window sent to the model, how many
+  were elided (and how many parts that touched), and how many were evicted (and how many whole
+  records that touched) to fit the budget.
+- `[req]` — one per model turn, from the agent loop's own `RequestMeasured` event: a locally
+  *estimated* breakdown of the request (system/instructions, tool definitions, conversation,
+  total — labelled `(estimated)` because none of it is the provider's real tokenizer), the
+  provider's own usage figures when it reports them (labelled `(exact, as reported)`), and how
+  long the model call itself took. This is the one line `[ctx]` cannot provide on its own: tool
+  definitions are attached to the request by the agent loop, not read from the context store, so
+  their cost is invisible to `ContextAssembled` — see
+  [`docs/MEASUREMENTS.md`](MEASUREMENTS.md) for why.
 - `[auth]` — one per authorization question (`Tool`, `Resource`, or `DiscoveredResource` phase —
   see [Filesystem confinement](#filesystem-confinement) for what the third phase is), with the
   outcome (`Allowed`, `Denied`, `ApprovalGranted`, `ApprovalRefused`, `ApprovalUnavailable`,
-  `PolicyUnavailable`).
-- `[tool]` — one per completed (or refused, or not-found) invocation.
+  `PolicyUnavailable`) and how long the decision took, in parentheses. For an approval-related
+  outcome that duration *is* how long the human took to answer — there is no separate event for
+  that wait.
+- `[tool]` — one per completed (or refused, or not-found) invocation, with execution and
+  authorization time in parentheses where they apply.
 
-These are the kernel's own audit events (`AuthorizationDecided`, `ToolInvoked`,
-`ContextAssembled`), the same ones a durable audit sink would subscribe to; `-v` is a debugging
-convenience, not a separate mechanism. Verified directly: every filesystem write, denial and
-elision produced exactly the events this section describes, in the order they happened, with
-correct phase labels (a `filesystem.list` on a directory produces one `Tool`, one `Resource` for
-the directory itself, and one `DiscoveredResource` per entry it found — visible directly in
-`-v` output).
+At the end of each turn, and again at the end of the whole session, a cumulative line is
+printed:
+
+```
+  [2 turns, 1 tool calls, 337 in / 20 out tokens, window 244 tokens]
+  [session] 6 turns, 3 tool calls, 2647 estimated tokens total, provider 2263 in / 152 out (exact)
+  [session] latency — model 3044ms, tools 0ms, authorization 0ms (approval 0ms)
+```
+
+These are the kernel's own events (`AuthorizationDecided`, `ToolInvoked`, `ContextAssembled`,
+`RequestMeasured`), the same ones a durable audit sink or `--record` (below) would subscribe
+to; `-v` is a debugging convenience, not a separate mechanism. Verified directly: every
+filesystem write, denial and elision produced exactly the events this section describes, in
+the order they happened, with correct phase labels (a `filesystem.list` on a directory produces
+one `Tool`, one `Resource` for the directory itself, and one `DiscoveredResource` per entry it
+found — visible directly in `-v` output).
 
 **Known display gap:** the verbose renderer does not print the `principal`/`on_behalf_of`
 fields the underlying `AuthorizationDecided` event actually carries — only the action, resource
@@ -345,6 +369,22 @@ test suite in `crates/cli/tests/security.rs`, and independently by `aik-tools`'s
 just is not surfaced in this particular text rendering. Not a security gap — a display
 limitation, worth knowing if you are trying to eyeball delegated-identity behaviour from `-v`
 output alone rather than from the raw events.
+
+## Structured recording: `--record`/`-R`
+
+```bash
+aik --record run.jsonl ...
+```
+
+Appends one JSON object per measurement event to `run.jsonl` (created if it does not
+exist), for the same events `-v` renders as text. Intended for later analysis rather than
+for reading directly. It never carries prompts, assistant text, tool arguments, tool
+results, file contents, resource paths, or policy-authored reasons — see
+[`docs/MEASUREMENTS.md`](MEASUREMENTS.md#privacy-what-is-and-is-not-recorded) for the exact
+list and the tests that enforce it, and `crates/cli/src/recorder.rs` for the format. A
+destination that cannot be opened is a startup error, named, like a malformed config file; a
+write that fails mid-run disables recording for the rest of the process after printing
+exactly one message, rather than retrying forever or claiming success it did not have.
 
 ## Filesystem confinement
 
@@ -435,6 +475,13 @@ on every access.
   far enough into a conversation, under a tight budget, that this had to happen without error.
 
 ## Token and context cost: a baseline
+
+**Superseded by [`docs/MEASUREMENTS.md`](MEASUREMENTS.md)**, which re-measures all of this
+against the current repository using a dedicated `RequestMeasured` event and a
+machine-readable `--record` JSONL sink added specifically to make the numbers reproducible,
+rather than transcribed from a terminal by hand. The summary below is kept for history; see
+`docs/MEASUREMENTS.md` for the current numbers, the exact-vs-estimated distinction for each
+one, and the commands to reproduce them.
 
 Measured against a real Ollama server (`llama3.1:8b`, `qwen2.5-coder:7b`), for future
 optimisation work — nothing here has been optimised yet, by design, per the scope of this

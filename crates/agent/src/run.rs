@@ -15,16 +15,20 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aik_api::agent::{AgentResponse, AgentUpdate, SessionId};
-use aik_api::context::{ContextEntry, ContextStore};
+use aik_api::context::{ContextEntry, ContextStore, ContextUsage, TokenCounter};
 use aik_api::execution::ExecutionContext;
+use aik_api::measurement::{RequestEstimate, RequestMeasured};
 use aik_api::model::{
     CompletionRequest, ContentPart, FinishReason, Message, ModelProvider, Role, ToolDefinition,
     Usage,
 };
 use aik_api::tool::{ToolCall, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::clock::{SharedClock, Timestamp};
+use aik_core::event::{Envelope, EventBus};
+use aik_core::id::ComponentId;
 use aik_core::{Error, ErrorKind, Result};
 use serde_json::json;
 
@@ -37,6 +41,17 @@ pub(crate) struct Wiring {
     pub(crate) context: Arc<dyn ContextStore>,
     pub(crate) clock: SharedClock,
     pub(crate) settings: AgentLoopSettings,
+    /// Estimates the token cost of what is about to be sent, for [`RequestMeasured`].
+    ///
+    /// Purely observational: nothing about budgeting or eviction reads this counter. It
+    /// exists only so tool-definition and message-breakdown estimates use the same
+    /// [`TokenCounter`] the context store's own accounting does, when one has been
+    /// supplied; see [`crate::AgentLoop::with_token_counter`].
+    pub(crate) counter: Arc<dyn TokenCounter>,
+    /// Where [`RequestMeasured`] is published, and under whose component id — `None` if
+    /// nobody asked for measurement events, in which case none are published and nothing
+    /// else about the run changes.
+    pub(crate) events: Option<(EventBus, ComponentId)>,
     /// The tool names this agent may use, or `None` for every tool the registry lists.
     pub(crate) allowed: Option<Vec<ToolName>>,
 }
@@ -69,6 +84,10 @@ pub(crate) struct Run {
     tool_calls: usize,
     usage: Usage,
     usage_reported: bool,
+    /// The estimated cost of the caller's input, set once by [`Run::prepare`] and consumed
+    /// by the first turn's [`RequestMeasured`] — `None` on every later turn, since a run
+    /// appends fresh user input exactly once.
+    current_input_tokens: Option<u64>,
 }
 
 impl std::fmt::Debug for Run {
@@ -105,6 +124,7 @@ impl Run {
             tool_calls: 0,
             usage: Usage::default(),
             usage_reported: false,
+            current_input_tokens: None,
         }
     }
 
@@ -226,12 +246,16 @@ impl Run {
         }
 
         let input = std::mem::take(&mut self.input);
-        self.append(ContextEntry::new(Message {
+        let user_message = Message {
             role: Role::User,
             content: input,
             name: None,
-        }))
-        .await?;
+        };
+        // Measured before the message is moved into the store, so `RequestMeasured` can
+        // report it against the turn it was actually sent on. This is the only turn of the
+        // run that carries fresh user text — see `current_input_tokens`'s own doc comment.
+        self.current_input_tokens = Some(self.wiring.counter.count_message(&user_message));
+        self.append(ContextEntry::new(user_message)).await?;
 
         Ok(())
     }
@@ -254,25 +278,44 @@ impl Run {
             .context
             .window(&self.session, &self.wiring.settings.budget, &self.cx)
             .await?;
+        let context_usage = window.usage;
+
+        let tool_definitions: Vec<ToolDefinition> =
+            self.available.iter().map(ToolDefinition::from).collect();
+        // Measured against exactly what is about to be sent — the same window messages and
+        // the same tool definitions — before either is moved into the request.
+        let estimate = estimate_request(
+            &window.messages,
+            &tool_definitions,
+            self.wiring.counter.as_ref(),
+            self.current_input_tokens.take(),
+        );
 
         let request = CompletionRequest {
             model: self.wiring.settings.model.clone(),
             messages: window.messages,
-            tools: self.available.iter().map(ToolDefinition::from).collect(),
+            tools: tool_definitions,
             parameters: self.wiring.settings.parameters.clone(),
         };
 
+        let model_started = Instant::now();
         let response = self
             .wiring
             .models
             .complete(request, &self.cx.child())
             .await?;
+        let model_latency = model_started.elapsed();
         self.turns += 1;
         if let Some(usage) = response.usage {
             self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
             self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
             self.usage_reported = true;
         }
+
+        // Purely observational: a missing subscriber changes nothing about the turn that
+        // already happened, and this happens after every value it reports has already been
+        // produced.
+        self.publish_measurement(estimate, context_usage, response.usage, model_latency);
 
         if response.finish_reason == FinishReason::Cancelled {
             return Err(Error::Cancelled);
@@ -393,6 +436,102 @@ impl Run {
             .append(&self.session, entry, &self.cx)
             .await
             .map(|_| ())
+    }
+
+    /// Publishes what one model turn cost, if anyone asked to hear about it.
+    ///
+    /// A no-op with no [`EventBus`] configured — see [`Wiring::events`] — so a run with
+    /// nothing subscribed pays only the cost of computing `estimate`, which it needed to
+    /// compute anyway for nothing to read. Nothing about the run's own control flow depends
+    /// on whether this publishes anything.
+    fn publish_measurement(
+        &self,
+        estimate: RequestEstimate,
+        context: ContextUsage,
+        provider_usage: Option<Usage>,
+        model_latency: Duration,
+    ) {
+        let Some((events, source)) = &self.wiring.events else {
+            return;
+        };
+        let event = RequestMeasured {
+            correlation: self.cx.correlation,
+            timestamp: self.wiring.clock.now(),
+            session: self.session,
+            model: self.wiring.settings.model.clone(),
+            turn: self.turns,
+            cumulative_tool_calls: self.tool_calls,
+            estimate,
+            context,
+            provider_usage,
+            cumulative_provider_usage: self.usage_reported.then_some(self.usage),
+            model_latency_ms: millis(model_latency),
+        };
+        let metadata = events
+            .metadata_for::<RequestMeasured>()
+            .with_source(source.clone())
+            .with_correlation(self.cx.correlation);
+        events.publish_envelope(Envelope::new(metadata, event));
+    }
+}
+
+/// Converts a duration to milliseconds, saturating rather than panicking on an
+/// implausibly long one.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Builds the locally estimated breakdown for one request, from exactly the messages and
+/// tool definitions that request is about to carry.
+///
+/// A free function rather than a method: it touches no run state beyond what is passed in,
+/// which is what makes it straightforward to reason about and to unit test without
+/// constructing a whole [`Run`].
+fn estimate_request(
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    counter: &dyn TokenCounter,
+    user_input_tokens: Option<u64>,
+) -> RequestEstimate {
+    let mut system_tokens = 0u64;
+    let mut conversation_tokens = 0u64;
+    let mut tool_call_tokens = 0u64;
+    let mut tool_result_tokens = 0u64;
+
+    for message in messages {
+        let cost = counter.count_message(message);
+        if message.role == Role::System {
+            system_tokens += cost;
+            continue;
+        }
+        conversation_tokens += cost;
+        for part in &message.content {
+            match part {
+                ContentPart::ToolCall(_) => tool_call_tokens += counter.count_part(part),
+                ContentPart::ToolResult { .. } => tool_result_tokens += counter.count_part(part),
+                _ => {}
+            }
+        }
+    }
+
+    let tool_definition_tokens: u64 = tools
+        .iter()
+        .map(|definition| {
+            counter.count_text(definition.name.as_str())
+                + counter.count_text(&definition.description)
+                + counter.count_json(&definition.input_schema)
+        })
+        .sum();
+
+    RequestEstimate {
+        system_tokens,
+        conversation_tokens,
+        user_input_tokens,
+        tool_call_tokens,
+        tool_result_tokens,
+        tool_definition_tokens,
+        tools_offered: tools.len(),
+        total_tokens: system_tokens + conversation_tokens + tool_definition_tokens,
     }
 }
 

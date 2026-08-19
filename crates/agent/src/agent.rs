@@ -3,17 +3,39 @@
 use std::sync::Arc;
 
 use aik_api::agent::{Agent, AgentDescriptor, AgentId, AgentRequest, AgentResponse, AgentUpdate};
-use aik_api::context::ContextStore;
+use aik_api::context::{ContextStore, TokenCounter};
 use aik_api::execution::ExecutionContext;
 use aik_api::model::ModelProvider;
 use aik_api::tool::{ToolName, ToolRegistry};
 use aik_core::Result;
 use aik_core::clock::{SharedClock, SystemClock};
+use aik_core::event::EventBus;
+use aik_core::id::ComponentId;
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
 
 use crate::run::{Run, Wiring};
 use crate::settings::AgentLoopSettings;
+
+/// A [`TokenCounter`] used only when nobody supplied a real one.
+///
+/// [`AgentLoop`] estimates request cost for [`RequestMeasured`](aik_api::measurement::RequestMeasured)
+/// whether or not a caller cares about token accounting elsewhere, so it needs *some*
+/// counter unconditionally. This mirrors
+/// [`aik_context::HeuristicTokenCounter`](https://docs.rs/aik-context)'s divisor exactly,
+/// but is reimplemented here rather than depended on: `aik-agent` has no other reason to
+/// depend on `aik-context`, and duplicating one four-line heuristic is a smaller cost than
+/// a crate dependency taken for it alone. [`AgentLoop::with_token_counter`] replaces this
+/// with the run's real counter whenever one is available — in practice, always, once wired
+/// through [`AgentComponent`](crate::AgentComponent).
+#[derive(Debug, Clone, Copy)]
+struct FallbackTokenCounter;
+
+impl TokenCounter for FallbackTokenCounter {
+    fn count_text(&self, text: &str) -> u64 {
+        (text.len() as u64).div_ceil(4)
+    }
+}
 
 /// The execution-context attribute naming the agent a run belongs to.
 ///
@@ -112,6 +134,12 @@ pub struct AgentLoop {
     clock: SharedClock,
     settings: AgentLoopSettings,
     allowed: Option<Vec<ToolName>>,
+    /// Used only to estimate request cost for [`RequestMeasured`](aik_api::measurement::RequestMeasured);
+    /// see [`AgentLoop::with_token_counter`].
+    counter: Arc<dyn TokenCounter>,
+    /// Where [`RequestMeasured`](aik_api::measurement::RequestMeasured) is published;
+    /// see [`AgentLoop::with_events`].
+    events: Option<(EventBus, ComponentId)>,
 }
 
 impl std::fmt::Debug for AgentLoop {
@@ -148,6 +176,8 @@ impl AgentLoop {
             clock: Arc::new(SystemClock),
             settings,
             allowed: None,
+            counter: Arc::new(FallbackTokenCounter),
+            events: None,
         }
     }
 
@@ -179,6 +209,34 @@ impl AgentLoop {
         self
     }
 
+    /// Uses a specific [`TokenCounter`] to estimate request cost for
+    /// [`RequestMeasured`](aik_api::measurement::RequestMeasured), instead of the internal
+    /// fallback.
+    ///
+    /// Purely observational: this affects only the numbers reported on
+    /// [`RequestMeasured`](aik_api::measurement::RequestMeasured), never budgeting,
+    /// eviction, or anything a model or a tool sees.
+    /// [`AgentComponent`](crate::AgentComponent) calls this with the same counter the
+    /// [`ContextStore`] itself uses, so the two report consistent numbers for the same
+    /// window.
+    #[must_use]
+    pub fn with_token_counter(mut self, counter: Arc<dyn TokenCounter>) -> Self {
+        self.counter = counter;
+        self
+    }
+
+    /// Publishes [`RequestMeasured`](aik_api::measurement::RequestMeasured) on `events`,
+    /// attributed to `source`, once per model turn.
+    ///
+    /// Without this, the loop still computes every estimate — it costs nothing extra not
+    /// to publish what was already computed — it simply publishes nothing. See
+    /// [`aik_api::measurement`] for exactly what the event carries and why.
+    #[must_use]
+    pub fn with_events(mut self, events: EventBus, source: ComponentId) -> Self {
+        self.events = Some((events, source));
+        self
+    }
+
     /// Starts a run, deriving its execution context from the caller's.
     fn begin(&self, request: AgentRequest, cx: &ExecutionContext) -> Run {
         let session = request.session;
@@ -197,6 +255,8 @@ impl AgentLoop {
                 context: self.context.clone(),
                 clock: self.clock.clone(),
                 settings: self.settings.clone(),
+                counter: self.counter.clone(),
+                events: self.events.clone(),
                 allowed: self.allowed.clone(),
             },
             session,

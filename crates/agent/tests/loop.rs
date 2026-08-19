@@ -161,6 +161,160 @@ async fn usage_is_absent_when_no_provider_reports_it() {
     assert!(response.usage.is_none());
 }
 
+// --- measurement -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_measurement_event_is_published_once_per_turn_with_no_tools_offered() {
+    let harness =
+        Harness::builder(ScriptedModel::new([Reply::answer("done").costing(15, 4)])).build();
+    let mut measurements = harness
+        .events
+        .subscribe::<aik_api::measurement::RequestMeasured>();
+
+    harness
+        .agent
+        .run(request("hi", harness.session), &user("alice"))
+        .await
+        .unwrap();
+
+    let measured = drain(&mut measurements);
+    assert_eq!(measured.len(), 1);
+    let event = &measured[0];
+    assert_eq!(event.turn, 1);
+    assert_eq!(event.estimate.tools_offered, 0);
+    assert_eq!(event.estimate.tool_definition_tokens, 0);
+    assert!(event.estimate.user_input_tokens.is_some());
+    assert_eq!(
+        event.provider_usage,
+        Some(aik_api::model::Usage {
+            input_tokens: 15,
+            output_tokens: 4
+        })
+    );
+}
+
+#[tokio::test]
+async fn tool_definitions_are_counted_even_when_none_are_called() {
+    let harness = Harness::builder(ScriptedModel::new([Reply::answer("done")]))
+        .tool(ProbeTool::new("probe", Behaviour::Echo))
+        .build();
+    let mut measurements = harness
+        .events
+        .subscribe::<aik_api::measurement::RequestMeasured>();
+
+    harness
+        .agent
+        .run(request("hi", harness.session), &user("alice"))
+        .await
+        .unwrap();
+
+    let measured = drain(&mut measurements);
+    assert_eq!(measured.len(), 1);
+    assert_eq!(measured[0].estimate.tools_offered, 1);
+    assert!(
+        measured[0].estimate.tool_definition_tokens > 0,
+        "a tool schema is never free",
+    );
+}
+
+#[tokio::test]
+async fn user_input_tokens_are_only_reported_on_the_first_turn_of_a_run() {
+    let harness = Harness::builder(ScriptedModel::new([
+        Reply::calls([call("c1", "probe", json!({}))]),
+        Reply::answer("done"),
+    ]))
+    .tool(ProbeTool::new("probe", Behaviour::Echo))
+    .build();
+    let mut measurements = harness
+        .events
+        .subscribe::<aik_api::measurement::RequestMeasured>();
+
+    harness
+        .agent
+        .run(request("hi", harness.session), &user("alice"))
+        .await
+        .unwrap();
+
+    let measured = drain(&mut measurements);
+    assert_eq!(measured.len(), 2);
+    assert!(measured[0].estimate.user_input_tokens.is_some());
+    assert!(
+        measured[1].estimate.user_input_tokens.is_none(),
+        "the second turn carries no fresh user text",
+    );
+    // The second turn's conversation includes the tool call and its result.
+    assert!(measured[1].estimate.tool_call_tokens > 0);
+    assert!(measured[1].estimate.tool_result_tokens > 0);
+}
+
+#[tokio::test]
+async fn cumulative_provider_usage_accumulates_across_turns() {
+    let harness = Harness::builder(ScriptedModel::new([
+        Reply::calls([call("c1", "probe", json!({}))]).costing(10, 3),
+        Reply::answer("done").costing(20, 5),
+    ]))
+    .tool(ProbeTool::new("probe", Behaviour::Echo))
+    .build();
+    let mut measurements = harness
+        .events
+        .subscribe::<aik_api::measurement::RequestMeasured>();
+
+    harness
+        .agent
+        .run(request("go", harness.session), &user("alice"))
+        .await
+        .unwrap();
+
+    let measured = drain(&mut measurements);
+    assert_eq!(measured.len(), 2);
+    assert_eq!(
+        measured[0].cumulative_provider_usage,
+        Some(aik_api::model::Usage {
+            input_tokens: 10,
+            output_tokens: 3
+        })
+    );
+    assert_eq!(
+        measured[1].cumulative_provider_usage,
+        Some(aik_api::model::Usage {
+            input_tokens: 30,
+            output_tokens: 8
+        })
+    );
+}
+
+#[tokio::test]
+async fn no_measurement_is_published_without_an_event_bus_configured() {
+    // Wiring an agent loop without `.with_events` must not fail or change turn behaviour —
+    // only stop publishing. Built directly rather than through the harness, which always
+    // wires events, to exercise the actual default.
+    use aik_agent::AgentLoop;
+    use aik_api::agent::Agent as _;
+
+    let model = Arc::new(ScriptedModel::new([Reply::answer("done")]));
+    let store = Arc::new(aik_context::InMemoryContextStore::new());
+    let mut registry = aik_tools::InProcessToolRegistry::new();
+    registry
+        .register(ProbeTool::new("probe", Behaviour::Echo))
+        .unwrap();
+    let agent = AgentLoop::new(
+        "no-events",
+        model as Arc<dyn aik_api::model::ModelProvider>,
+        Arc::new(registry),
+        store,
+        AgentLoopSettings::new("test-model"),
+    );
+
+    let response = agent
+        .run(
+            request("hi", aik_api::agent::SessionId::new()),
+            &user("alice"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.output, vec![ContentPart::text("done")]);
+}
+
 // --- tool calls ----------------------------------------------------------------------
 
 #[tokio::test]

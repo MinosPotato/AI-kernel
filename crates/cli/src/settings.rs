@@ -63,6 +63,8 @@ pub struct Settings {
     pub system_prompt: Option<String>,
     /// Whether to print authorization and context events.
     pub verbose: bool,
+    /// Where to append a JSONL measurement record of the run, if anywhere.
+    pub record: Option<PathBuf>,
     /// The one-shot prompt, or `None` for an interactive session.
     ///
     /// Also decides the run's security posture: a one-shot run attaches no approval
@@ -121,6 +123,7 @@ impl Settings {
             tools: options.tools(),
             system_prompt: file.system_prompt,
             verbose: options.verbose,
+            record: options.record.clone(),
             prompt: options.prompt.clone(),
             config,
             model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
