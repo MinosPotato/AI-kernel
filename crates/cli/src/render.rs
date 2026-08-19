@@ -16,7 +16,7 @@
 use std::fmt::Write as _;
 
 use aik_api::agent::AgentUpdate;
-use aik_api::audit::{AuthorizationDecided, AuthorizationOutcome, ToolInvoked};
+use aik_api::audit::{AuthorizationDecided, ToolInvoked};
 use aik_api::context::ContextAssembled;
 use aik_api::measurement::RequestMeasured;
 use aik_api::model::{ContentPart, Usage};
@@ -159,14 +159,7 @@ impl SessionStats {
     /// Folds in one authorization decision.
     pub fn record_authorization(&mut self, event: &AuthorizationDecided) {
         self.authorization_latency_ms += event.duration_ms;
-        if matches!(
-            event.outcome,
-            AuthorizationOutcome::ApprovalGranted
-                | AuthorizationOutcome::ApprovalRefused
-                | AuthorizationOutcome::ApprovalUnavailable
-        ) {
-            self.approval_latency_ms += event.duration_ms;
-        }
+        self.approval_latency_ms += event.approval_wait_ms.unwrap_or(0);
     }
 }
 
@@ -235,13 +228,19 @@ pub fn authorization(event: &AuthorizationDecided) {
         .as_ref()
         .map(|resource| format!(" on {}", safe(resource.as_str())))
         .unwrap_or_default();
+    let wait = match event.approval_wait_ms {
+        Some(wait) => format!(
+            " ({}ms, {wait}ms of it waiting on approval)",
+            event.duration_ms
+        ),
+        None => format!(" ({}ms)", event.duration_ms),
+    };
     println!(
-        "  [auth] {:?} {}{} → {:?} ({}ms)",
+        "  [auth] {:?} {}{} → {:?}{wait}",
         event.phase,
         safe(event.action.as_str()),
         resource,
         event.outcome,
-        event.duration_ms,
     );
 }
 
@@ -328,7 +327,47 @@ pub fn assembled(event: &ContextAssembled) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aik_api::audit::AuthorizationOutcome;
+    use aik_api::permission::{ActionId, PrincipalId, PrincipalKind};
+    use aik_core::clock::Timestamp;
+    use aik_core::id::CorrelationId;
+    use aik_tools::DEFAULT_NAME as TOOL;
     use serde_json::json;
+
+    fn decision(
+        outcome: AuthorizationOutcome,
+        duration_ms: u64,
+        approval_wait_ms: Option<u64>,
+    ) -> AuthorizationDecided {
+        AuthorizationDecided {
+            correlation: CorrelationId::new(),
+            timestamp: Timestamp::from_millis(0),
+            tool: aik_api::tool::ToolName::new(TOOL),
+            principal: PrincipalId::new("agent"),
+            principal_kind: PrincipalKind::Agent,
+            on_behalf_of: None,
+            action: ActionId::new("demo.act"),
+            resource: None,
+            phase: aik_api::audit::AuthorizationPhase::Tool,
+            duration_ms,
+            approval_wait_ms,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn session_stats_counts_only_the_approval_wait_not_the_whole_decision() {
+        let mut stats = SessionStats::default();
+        stats.record_authorization(&decision(AuthorizationOutcome::Allowed, 3, None));
+        stats.record_authorization(&decision(
+            AuthorizationOutcome::ApprovalGranted,
+            120,
+            Some(115),
+        ));
+
+        assert_eq!(stats.authorization_latency_ms, 123);
+        assert_eq!(stats.approval_latency_ms, 115);
+    }
 
     #[test]
     fn an_escape_sequence_cannot_reach_the_terminal() {

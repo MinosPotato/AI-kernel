@@ -136,6 +136,24 @@ impl ApprovalSink for FixedApproval {
     }
 }
 
+/// An approval sink that takes a while to answer, standing in for a human actually reading
+/// the prompt — used to prove the wait is measured and reported separately from the rest of
+/// the decision.
+struct SlowApproval(Duration);
+
+#[async_trait]
+impl ApprovalSink for SlowApproval {
+    async fn request_approval(
+        &self,
+        _request: &PermissionRequest,
+        _prompt: &str,
+        _cx: &ExecutionContext,
+    ) -> Result<bool> {
+        tokio::time::sleep(self.0).await;
+        Ok(true)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -509,8 +527,62 @@ async fn approval_outcomes_are_audited_distinctly() {
 
         let decided = drain(&mut decisions);
         assert_eq!(decided.last().unwrap().outcome, expected);
+        assert!(
+            decided.last().unwrap().approval_wait_ms.is_some(),
+            "a decision that asked a sink should report how long it waited",
+        );
         kernel.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn approval_wait_is_isolated_from_the_rest_of_the_decision() {
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_tool(EchoTool::new())
+                .with_policy(Arc::new(AskForResources))
+                .with_approvals(Arc::new(SlowApproval(Duration::from_millis(50)))),
+        )
+        .build()
+        .unwrap();
+    kernel.start().await.unwrap();
+    let mut decisions = kernel.context().subscribe::<AuthorizationDecided>();
+
+    let tools = kernel.context().service::<dyn ToolRegistry>().unwrap();
+    tools
+        .invoke(
+            &ToolName::new(TOOL),
+            json!({ "text": "hi", "resource": "/workspace/a" }),
+            &agent("a1"),
+        )
+        .await
+        .unwrap();
+
+    let decided = drain(&mut decisions);
+    let resource_decision = decided
+        .iter()
+        .find(|event| event.phase == AuthorizationPhase::Resource)
+        .unwrap();
+    let wait = resource_decision.approval_wait_ms.unwrap();
+    assert!(wait >= 50, "the sink slept 50ms: {wait}");
+    // The total is at least the wait, since the wait is a subset of it — and this policy
+    // engine's own evaluation is in-memory, so the two should be close rather than the total
+    // dwarfing the wait.
+    assert!(
+        resource_decision.duration_ms >= wait,
+        "total {} should be at least the wait {wait}",
+        resource_decision.duration_ms,
+    );
+
+    // The tool-level decision never asked a sink at all, so it carries no wait.
+    let tool_decision = decided
+        .iter()
+        .find(|event| event.phase == AuthorizationPhase::Tool)
+        .unwrap();
+    assert!(tool_decision.approval_wait_ms.is_none());
+
+    kernel.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -532,6 +604,10 @@ async fn an_unavailable_approval_sink_is_audited_as_such() {
     assert_eq!(
         decided.last().unwrap().outcome,
         AuthorizationOutcome::ApprovalUnavailable
+    );
+    assert!(
+        decided.last().unwrap().approval_wait_ms.is_none(),
+        "no sink was configured to ask, so no wait happened",
     );
 
     kernel.shutdown().await.unwrap();
@@ -897,6 +973,10 @@ async fn an_approval_sink_that_fails_denies_and_is_audited_as_unavailable() {
     assert_eq!(
         decided[1].outcome,
         AuthorizationOutcome::ApprovalUnavailable
+    );
+    assert!(
+        decided[1].approval_wait_ms.is_some(),
+        "a sink was asked and failed, which is still a wait, however short",
     );
 
     kernel.shutdown().await.unwrap();

@@ -137,6 +137,7 @@ impl Recorder {
             "phase": phase_name(event.phase),
             "decision": outcome_name(&event.outcome),
             "duration_ms": event.duration_ms,
+            "approval_wait_ms": event.approval_wait_ms,
         }));
     }
 
@@ -296,6 +297,7 @@ mod tests {
             )),
             phase: AuthorizationPhase::Resource,
             duration_ms: 7,
+            approval_wait_ms: None,
             outcome: AuthorizationOutcome::Denied {
                 reason: "outside the workspace, specifically /home/alice/secret-project".into(),
             },

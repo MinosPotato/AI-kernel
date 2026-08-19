@@ -186,6 +186,7 @@ impl InProcessToolRegistry {
         question: &Question<'_>,
         outcome: AuthorizationOutcome,
         duration: Duration,
+        approval_wait: Option<Duration>,
     ) {
         self.audit(
             question.cx,
@@ -200,6 +201,7 @@ impl InProcessToolRegistry {
                 resource: question.resource.cloned(),
                 phase: question.phase,
                 duration_ms: millis(duration),
+                approval_wait_ms: approval_wait.map(millis),
                 outcome,
             },
         );
@@ -248,6 +250,7 @@ impl InProcessToolRegistry {
                 question,
                 AuthorizationOutcome::PolicyUnavailable,
                 started.elapsed(),
+                None,
             );
             return Err(Error::PermissionDenied(format!(
                 "tool `{tool}`: {subject} is required, but no policy engine is configured"
@@ -272,18 +275,20 @@ impl InProcessToolRegistry {
                     question,
                     AuthorizationOutcome::PolicyUnavailable,
                     started.elapsed(),
+                    None,
                 );
                 return Err(error);
             }
         };
 
-        let (outcome, error) = match decision {
-            Decision::Allow => (AuthorizationOutcome::Allowed, None),
+        let (outcome, error, approval_wait) = match decision {
+            Decision::Allow => (AuthorizationOutcome::Allowed, None, None),
             Decision::Deny { reason } => (
                 AuthorizationOutcome::Denied {
                     reason: reason.clone(),
                 },
                 Some(format!("{subject}: {reason}")),
+                None,
             ),
             Decision::RequireApproval { prompt } => match &self.approvals {
                 None => (
@@ -291,13 +296,20 @@ impl InProcessToolRegistry {
                     Some(format!(
                         "{subject} requires approval, but no approval sink is configured"
                     )),
+                    None,
                 ),
                 Some(sink) => {
+                    let approval_started = Instant::now();
                     match sink.request_approval(&request, &prompt, question.cx).await {
-                        Ok(true) => (AuthorizationOutcome::ApprovalGranted, None),
+                        Ok(true) => (
+                            AuthorizationOutcome::ApprovalGranted,
+                            None,
+                            Some(approval_started.elapsed()),
+                        ),
                         Ok(false) => (
                             AuthorizationOutcome::ApprovalRefused,
                             Some(format!("{subject} was not approved")),
+                            Some(approval_started.elapsed()),
                         ),
                         // Nobody to ask, nobody answered in time, the frontend went away:
                         // not a refusal by a human, and emphatically not an allow. The
@@ -308,6 +320,7 @@ impl InProcessToolRegistry {
                                 question,
                                 AuthorizationOutcome::ApprovalUnavailable,
                                 started.elapsed(),
+                                Some(approval_started.elapsed()),
                             );
                             return Err(error);
                         }
@@ -316,7 +329,7 @@ impl InProcessToolRegistry {
             },
         };
 
-        self.record_decision(question, outcome, started.elapsed());
+        self.record_decision(question, outcome, started.elapsed(), approval_wait);
 
         match error {
             Some(message) => Err(Error::PermissionDenied(format!("tool `{tool}`: {message}"))),
