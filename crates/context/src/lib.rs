@@ -48,9 +48,11 @@
 //!
 //! * [`InMemoryContextStore`] — the reference [`ContextStore`](aik_api::context::ContextStore):
 //!   append-only, per-session, owned, bounded.
+//! * [`RedbContextStore`] — the same contract kept in the kernel's shared database, so a
+//!   restart does not lose the conversation. Both run the same conformance tests.
 //! * [`HeuristicTokenCounter`] — a provider-neutral size estimate, so budgeting works out of
 //!   the box without the kernel acquiring a tokenizer.
-//! * [`ContextComponent`] — the kernel wiring.
+//! * [`ContextComponent`] and [`RedbContextComponent`] — the kernel wiring for each.
 //!
 //! ```no_run
 //! use aik_context::ContextComponent;
@@ -143,20 +145,26 @@
 //!   real saving and a natural next step, but it changes what a model sees in a way that
 //!   depends on assumptions about how models read history, and there is no reason to guess
 //!   at those before there is an agent loop to measure.
-//! * **It does not persist.** Durable transcripts raise retention, encryption and deletion
-//!   questions that deserve a deliberate answer rather than being settled implicitly by
-//!   whichever database got wired in first. The contract is the seam a persistent
-//!   implementation slots into.
+//! * **It does not retain, encrypt or expire on its own.** [`RedbContextStore`] persists
+//!   transcripts, and persistence is where retention questions become real ones. What this
+//!   crate answers is the part it can: the file is the owner's alone (`0600` in a `0700`
+//!   directory, enforced by [`aik_store`]), a session is deleted in full by
+//!   [`ContextStore::clear`](aik_api::context::ContextStore::clear), and nothing is written
+//!   anywhere else. Encryption at rest and time-based expiry are policy, belong above this
+//!   crate, and are deliberately not invented here.
 //! * **It does not compact tool schemas.** Tool descriptions are re-sent every turn too, but
 //!   [`CompletionRequest::tools`](aik_api::model::CompletionRequest::tools) already carries
 //!   names rather than full specifications, so that saving belongs at the provider boundary,
 //!   not here.
 
 mod component;
+mod persistent;
+mod session;
 mod store;
 mod tokens;
 mod window;
 
-pub use component::{ContextComponent, DEFAULT_COMPONENT_ID};
+pub use component::{ContextComponent, DEFAULT_COMPONENT_ID, RedbContextComponent};
+pub use persistent::RedbContextStore;
 pub use store::{DEFAULT_MAX_RECORDS_PER_SESSION, InMemoryContextStore};
 pub use tokens::{DEFAULT_BYTES_PER_TOKEN, HeuristicTokenCounter};
