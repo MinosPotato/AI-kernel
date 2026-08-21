@@ -38,13 +38,14 @@ use crate::error::store_error;
 /// |---|---|
 /// | 1 | The empty schema: the meta table and nothing else. |
 /// | 2 | `context.sessions`, `context.records` and `context.record_ids`, owned by `aik-context`. |
+/// | 3 | `mem.records`, `mem.by_kind` and `mem.by_expiry`, owned by `aik-memory`. |
 ///
 /// A subsystem that adds tables raises this even though redb needs no migration to create
 /// one (see [the module documentation](self#what-a-migration-is-and-is-not)). The version
 /// is what stops an older build from opening the file afterwards, and an older build is
 /// exactly the one that does not know those tables exist — so it would not preserve them
 /// through a compaction, a repair or a `clear` that walks the schema.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The table holding the store's own bookkeeping, keyed by a short ASCII name.
 ///

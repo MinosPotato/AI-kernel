@@ -143,6 +143,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-memory"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-store",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aik-ollama"
 version = "0.1.0"
 dependencies = [

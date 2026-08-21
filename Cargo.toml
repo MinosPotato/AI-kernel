@@ -11,6 +11,7 @@ members = [
     "crates/approval",
     "crates/context",
     "crates/store",
+    "crates/memory",
     "crates/agent",
     "crates/cli",
 ]
@@ -32,6 +33,7 @@ aik-fs = { version = "0.1.0", path = "crates/fs" }
 aik-approval = { version = "0.1.0", path = "crates/approval" }
 aik-context = { version = "0.1.0", path = "crates/context" }
 aik-store = { version = "0.1.0", path = "crates/store" }
+aik-memory = { version = "0.1.0", path = "crates/memory" }
 aik-agent = { version = "0.1.0", path = "crates/agent" }
 aik-ollama = { version = "0.1.0", path = "crates/ollama" }
 
