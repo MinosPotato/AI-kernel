@@ -10,6 +10,8 @@ members = [
     "crates/fs",
     "crates/approval",
     "crates/context",
+    "crates/store",
+    "crates/memory",
     "crates/agent",
     "crates/cli",
 ]
@@ -17,7 +19,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pjw/AI-kernel"
 authors = ["AI-kernel contributors"]
@@ -30,6 +32,8 @@ aik-policy = { version = "0.1.0", path = "crates/policy" }
 aik-fs = { version = "0.1.0", path = "crates/fs" }
 aik-approval = { version = "0.1.0", path = "crates/approval" }
 aik-context = { version = "0.1.0", path = "crates/context" }
+aik-store = { version = "0.1.0", path = "crates/store" }
+aik-memory = { version = "0.1.0", path = "crates/memory" }
 aik-agent = { version = "0.1.0", path = "crates/agent" }
 aik-ollama = { version = "0.1.0", path = "crates/ollama" }
 
@@ -43,6 +47,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
+redb = "4.2"
 
 futures = "0.3"
 

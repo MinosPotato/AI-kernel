@@ -5,17 +5,18 @@ use std::sync::{Arc, RwLock};
 
 use aik_api::agent::SessionId;
 use aik_api::context::{
-    ContextAssembled, ContextBudget, ContextEntry, ContextId, ContextRecord, ContextStats,
-    ContextStore, ContextWindow, TokenCounter,
+    ContextBudget, ContextEntry, ContextId, ContextRecord, ContextStats, ContextStore,
+    ContextWindow, TokenCounter,
 };
 use aik_api::execution::ExecutionContext;
-use aik_api::permission::{Principal, PrincipalId};
+use aik_api::permission::PrincipalId;
 use aik_core::clock::{SharedClock, SystemClock, Timestamp};
-use aik_core::event::{Envelope, EventBus};
+use aik_core::event::EventBus;
 use aik_core::id::ComponentId;
 use aik_core::{Error, Result};
 use async_trait::async_trait;
 
+use crate::session::{AssemblyReporter, authorize, principal_of};
 use crate::tokens::HeuristicTokenCounter;
 use crate::window::assemble;
 
@@ -66,8 +67,7 @@ pub struct InMemoryContextStore {
     sessions: RwLock<HashMap<SessionId, SessionState>>,
     counter: Arc<dyn TokenCounter>,
     clock: SharedClock,
-    events: Option<EventBus>,
-    source: ComponentId,
+    reporter: AssemblyReporter,
     max_records: usize,
 }
 
@@ -84,7 +84,7 @@ impl std::fmt::Debug for InMemoryContextStore {
                     .sum::<usize>(),
             )
             .field("max_records_per_session", &self.max_records)
-            .field("events_configured", &self.events.is_some())
+            .field("events_configured", &self.reporter.is_configured())
             .finish()
     }
 }
@@ -102,8 +102,7 @@ impl InMemoryContextStore {
             sessions: RwLock::new(HashMap::new()),
             counter: Arc::new(HeuristicTokenCounter::new()),
             clock: Arc::new(SystemClock),
-            events: None,
-            source: ComponentId::new(crate::DEFAULT_COMPONENT_ID),
+            reporter: AssemblyReporter::silent(ComponentId::new(crate::DEFAULT_COMPONENT_ID)),
             max_records: DEFAULT_MAX_RECORDS_PER_SESSION,
         }
     }
@@ -125,14 +124,13 @@ impl InMemoryContextStore {
         self
     }
 
-    /// Publishes [`ContextAssembled`] events to the kernel event bus, attributed to
-    /// `source`.
+    /// Publishes [`ContextAssembled`](aik_api::context::ContextAssembled) events to the
+    /// kernel event bus, attributed to `source`.
     ///
     /// Without a bus, windows are assembled identically and simply are not observable.
     #[must_use]
     pub fn with_events(mut self, events: EventBus, source: ComponentId) -> Self {
-        self.events = Some(events);
-        self.source = source;
+        self.reporter = AssemblyReporter::new(events, source);
         self
     }
 
@@ -147,48 +145,6 @@ impl InMemoryContextStore {
     pub fn token_counter(&self) -> &Arc<dyn TokenCounter> {
         &self.counter
     }
-
-    /// The principal a context is acting as.
-    ///
-    /// A context with no principal is the system acting for itself — its own identity, not a
-    /// wildcard — exactly as it is in
-    /// [`ToolRegistry`](aik_api::tool::ToolRegistry).
-    fn principal_of(cx: &ExecutionContext) -> Principal {
-        cx.principal.clone().unwrap_or_else(Principal::system)
-    }
-
-    /// Decides whether `principal` may touch a session owned by `owner`.
-    ///
-    /// Delegation is one-directional and explicit: an agent carrying
-    /// [`on_behalf_of`](Principal::on_behalf_of) the owner may act in the owner's session,
-    /// because that is what delegated authority means; the owner does not thereby gain
-    /// access to the agent's own sessions.
-    fn may_access(principal: &Principal, owner: &PrincipalId) -> bool {
-        &principal.id == owner || principal.on_behalf_of.as_ref() == Some(owner)
-    }
-
-    /// Fails closed unless `cx`'s principal owns `session`.
-    fn authorize(session: &SessionId, state: &SessionState, cx: &ExecutionContext) -> Result<()> {
-        let principal = Self::principal_of(cx);
-        if Self::may_access(&principal, &state.owner) {
-            return Ok(());
-        }
-        Err(Error::PermissionDenied(format!(
-            "context session `{session}` belongs to `{}`, not to `{}`",
-            state.owner, principal.id
-        )))
-    }
-
-    fn publish(&self, cx: &ExecutionContext, event: ContextAssembled) {
-        let Some(bus) = &self.events else {
-            return;
-        };
-        let metadata = bus
-            .metadata_for::<ContextAssembled>()
-            .with_source(self.source.clone())
-            .with_correlation(cx.correlation);
-        bus.publish_envelope(Envelope::new(metadata, event));
-    }
 }
 
 #[async_trait]
@@ -199,7 +155,7 @@ impl ContextStore for InMemoryContextStore {
         entry: ContextEntry,
         cx: &ExecutionContext,
     ) -> Result<ContextRecord> {
-        let principal = Self::principal_of(cx);
+        let principal = principal_of(cx);
         let now = self.clock.now();
         // Counted outside the lock: an arbitrarily large message must not hold up every
         // other session while it is measured.
@@ -215,7 +171,7 @@ impl ContextStore for InMemoryContextStore {
             records: Vec::new(),
             index: HashMap::new(),
         });
-        Self::authorize(session, state, cx)?;
+        authorize(session, &state.owner, &principal)?;
 
         if state.records.len() >= self.max_records {
             return Err(Error::other(format!(
@@ -254,7 +210,7 @@ impl ContextStore for InMemoryContextStore {
         let Some(state) = sessions.get(session) else {
             return Ok(None);
         };
-        Self::authorize(session, state, cx)?;
+        authorize(session, &state.owner, &principal_of(cx))?;
 
         Ok(state
             .index
@@ -274,19 +230,12 @@ impl ContextStore for InMemoryContextStore {
             let Some(state) = sessions.get(session) else {
                 return Ok(ContextWindow::empty());
             };
-            Self::authorize(session, state, cx)?;
+            authorize(session, &state.owner, &principal_of(cx))?;
             assemble(&state.records, budget, self.counter.as_ref())
         };
 
-        self.publish(
-            cx,
-            ContextAssembled {
-                correlation: cx.correlation,
-                timestamp: self.clock.now(),
-                session: *session,
-                usage: window.usage,
-            },
-        );
+        self.reporter
+            .report(cx, *session, self.clock.now(), window.usage);
 
         Ok(window)
     }
@@ -300,7 +249,7 @@ impl ContextStore for InMemoryContextStore {
         let Some(state) = sessions.get(session) else {
             return Ok(None);
         };
-        Self::authorize(session, state, cx)?;
+        authorize(session, &state.owner, &principal_of(cx))?;
 
         Ok(Some(ContextStats {
             session: *session,
@@ -317,7 +266,7 @@ impl ContextStore for InMemoryContextStore {
         let Some(state) = sessions.get(session) else {
             return Ok(0);
         };
-        Self::authorize(session, state, cx)?;
+        authorize(session, &state.owner, &principal_of(cx))?;
 
         let removed = state.records.len();
         sessions.remove(session);
@@ -329,7 +278,7 @@ impl ContextStore for InMemoryContextStore {
 mod tests {
     use super::*;
     use aik_api::model::{Message, Role};
-    use aik_api::permission::PrincipalKind;
+    use aik_api::permission::{Principal, PrincipalKind};
     use aik_core::ErrorKind;
     use aik_core::clock::ManualClock;
 

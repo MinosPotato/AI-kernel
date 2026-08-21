@@ -104,13 +104,13 @@ impl PolicyRule {
                 "principal id pattern must not be empty",
             ));
         }
-        if let Some(resource) = &self.resource {
-            if resource.is_vacuous() {
-                return Err(Error::config(
-                    "resource",
-                    "resource pattern must not be empty",
-                ));
-            }
+        if let Some(resource) = &self.resource
+            && resource.is_vacuous()
+        {
+            return Err(Error::config(
+                "resource",
+                "resource pattern must not be empty",
+            ));
         }
         match &self.effect {
             Decision::Deny { reason } if reason.trim().is_empty() => {

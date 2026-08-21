@@ -72,11 +72,11 @@ pub(crate) fn ndjson_chunks(
                             // to report and the stream simply ends without an explicit
                             // `done`, matching what a client that lost the connection would
                             // see for any HTTP stream.
-                            if !buffer.iter().all(u8::is_ascii_whitespace) {
-                                if let Ok(parsed) = parse_line(&buffer) {
-                                    for chunk in parsed {
-                                        yield Ok(chunk);
-                                    }
+                            if !buffer.iter().all(u8::is_ascii_whitespace)
+                                && let Ok(parsed) = parse_line(&buffer)
+                            {
+                                for chunk in parsed {
+                                    yield Ok(chunk);
                                 }
                             }
                             break 'outer;

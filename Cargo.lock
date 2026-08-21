@@ -101,8 +101,11 @@ version = "0.1.0"
 dependencies = [
  "aik-api",
  "aik-core",
+ "aik-store",
  "async-trait",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -140,6 +143,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-memory"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-store",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aik-ollama"
 version = "0.1.0"
 dependencies = [
@@ -169,6 +188,18 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "aik-store"
+version = "0.1.0"
+dependencies = [
+ "aik-core",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1095,6 +1126,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

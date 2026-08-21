@@ -2,3 +2,4 @@
 Cargo.lock.bak
 *.profraw
 .claude/
+.serena/

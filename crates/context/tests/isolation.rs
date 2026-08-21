@@ -6,37 +6,37 @@
 //! serving several users, or several principals, that mixes their transcripts. One user's
 //! conversation leaking into another's prompt is a data breach that produces no error, no
 //! audit event and no denied permission, so it has to be prevented structurally.
-
-use std::sync::Arc;
+//!
+//! Every assertion here runs against both implementations. A durable store that enforced
+//! ownership slightly differently from the in-memory one would be a security regression
+//! delivered as a performance improvement, so the two are held to one specification.
 
 use aik_api::agent::SessionId;
-use aik_api::context::{ContextBudget, ContextEntry, ContextStore};
+use aik_api::context::{ContextBudget, ContextEntry};
 use aik_api::execution::ExecutionContext;
 use aik_api::model::{Message, Role};
-use aik_api::permission::{Principal, PrincipalKind};
-use aik_context::InMemoryContextStore;
 use aik_core::ErrorKind;
 
-fn user(id: &str) -> ExecutionContext {
-    ExecutionContext::new().with_principal(Principal::new(id, PrincipalKind::User))
-}
+mod support;
 
-fn agent_for(id: &str, owner: &str) -> ExecutionContext {
-    ExecutionContext::new()
-        .with_principal(Principal::new(id, PrincipalKind::Agent).on_behalf_of(owner))
-}
+use support::{Backend, agent_for, say, user};
 
-fn say(body: &str) -> ContextEntry {
-    ContextEntry::new(Message::text(Role::User, body))
-}
+crate::both_backends!(
+    sessions_do_not_see_each_others_records,
+    a_record_id_from_another_session_is_not_found,
+    another_principal_cannot_read_a_session,
+    another_principal_cannot_write_to_or_destroy_a_session,
+    the_system_principal_is_an_identity_not_a_wildcard,
+    an_agent_acting_on_behalf_of_the_owner_may_use_the_session,
+    delegation_does_not_run_the_other_way,
+    attribution_comes_from_the_context_not_the_payload,
+    a_transcript_cannot_be_rewritten_only_extended,
+    concurrent_appends_to_one_session_produce_a_consistent_sequence,
+);
 
-fn store() -> Arc<dyn ContextStore> {
-    Arc::new(InMemoryContextStore::new())
-}
-
-#[tokio::test]
-async fn sessions_do_not_see_each_others_records() {
-    let store = store();
+async fn sessions_do_not_see_each_others_records(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let cx = user("alice");
     let (first, second) = (SessionId::new(), SessionId::new());
 
@@ -60,9 +60,9 @@ async fn sessions_do_not_see_each_others_records() {
     assert_eq!(window.usage.included_records, 1);
 }
 
-#[tokio::test]
-async fn a_record_id_from_another_session_is_not_found() {
-    let store = store();
+async fn a_record_id_from_another_session_is_not_found(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let cx = user("alice");
     let (first, second) = (SessionId::new(), SessionId::new());
 
@@ -75,9 +75,9 @@ async fn a_record_id_from_another_session_is_not_found() {
     assert!(store.get(&first, &record.id, &cx).await.unwrap().is_some());
 }
 
-#[tokio::test]
-async fn another_principal_cannot_read_a_session() {
-    let store = store();
+async fn another_principal_cannot_read_a_session(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
 
     let record = store
@@ -104,9 +104,9 @@ async fn another_principal_cannot_read_a_session() {
     }
 }
 
-#[tokio::test]
-async fn another_principal_cannot_write_to_or_destroy_a_session() {
-    let store = store();
+async fn another_principal_cannot_write_to_or_destroy_a_session(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
     store
         .append(&session, say("alice's business"), &user("alice"))
@@ -139,9 +139,9 @@ async fn another_principal_cannot_write_to_or_destroy_a_session() {
     assert_eq!(stats.records, 1);
 }
 
-#[tokio::test]
-async fn the_system_principal_is_an_identity_not_a_wildcard() {
-    let store = store();
+async fn the_system_principal_is_an_identity_not_a_wildcard(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
     store
         .append(&session, say("alice's business"), &user("alice"))
@@ -161,9 +161,9 @@ async fn the_system_principal_is_an_identity_not_a_wildcard() {
     assert_eq!(error.kind(), ErrorKind::Permission, "{error}");
 }
 
-#[tokio::test]
-async fn an_agent_acting_on_behalf_of_the_owner_may_use_the_session() {
-    let store = store();
+async fn an_agent_acting_on_behalf_of_the_owner_may_use_the_session(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
     store
         .append(&session, say("hello"), &user("alice"))
@@ -175,7 +175,6 @@ async fn an_agent_acting_on_behalf_of_the_owner_may_use_the_session() {
         .append(&session, say("working on it"), &agent)
         .await
         .unwrap();
-
     let window = store
         .window(&session, &ContextBudget::UNLIMITED, &agent)
         .await
@@ -183,9 +182,9 @@ async fn an_agent_acting_on_behalf_of_the_owner_may_use_the_session() {
     assert_eq!(window.usage.included_records, 2);
 }
 
-#[tokio::test]
-async fn delegation_does_not_run_the_other_way() {
-    let store = store();
+async fn delegation_does_not_run_the_other_way(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
 
     // The agent creates a session of its own; acting for Alice does not make it Alice's.
@@ -205,9 +204,9 @@ async fn delegation_does_not_run_the_other_way() {
     assert_eq!(error.kind(), ErrorKind::Permission, "{error}");
 }
 
-#[tokio::test]
-async fn attribution_comes_from_the_context_not_the_payload() {
-    let store = store();
+async fn attribution_comes_from_the_context_not_the_payload(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
 
     // A message whose *content* claims to be someone else. Content is data; attribution is
@@ -234,9 +233,9 @@ async fn attribution_comes_from_the_context_not_the_payload() {
     );
 }
 
-#[tokio::test]
-async fn a_transcript_cannot_be_rewritten_only_extended() {
-    let store = store();
+async fn a_transcript_cannot_be_rewritten_only_extended(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
     let cx = user("alice");
 
@@ -252,9 +251,9 @@ async fn a_transcript_cannot_be_rewritten_only_extended() {
     assert_eq!(stored.message, Message::text(Role::User, "one"));
 }
 
-#[tokio::test]
-async fn concurrent_appends_to_one_session_produce_a_consistent_sequence() {
-    let store = store();
+async fn concurrent_appends_to_one_session_produce_a_consistent_sequence(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
     let session = SessionId::new();
     let cx = user("alice");
 

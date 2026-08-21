@@ -1,6 +1,6 @@
 [package]
-name = "aik-context"
-description = "An agent context store for the AI kernel: a durable transcript, and budgeted model windows derived from it."
+name = "aik-memory"
+description = "A persistent memory store for the AI kernel: records, queries and retention."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,8 +18,10 @@ aik-store.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile.workspace = true

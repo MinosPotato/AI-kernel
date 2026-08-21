@@ -38,6 +38,8 @@ AI-kernel/
 │  ├─ fs/       → aik-fs       : filesystem Tools, confined to a configured root
 │  ├─ approval/ → aik-approval : a human-in-the-loop ApprovalSink
 │  ├─ context/  → aik-context  : a durable transcript and budgeted model windows
+│  ├─ store/    → aik-store    : the shared redb database backing context and memory
+│  ├─ memory/   → aik-memory   : a persistent record store, retrieved by kind and metadata
 │  ├─ agent/    → aik-agent    : the agent loop tying every capability above together
 │  └─ cli/      → aik-cli      : a terminal frontend (the `aik` binary)
 ```
@@ -161,7 +163,7 @@ every "Implemented by" column below is a separate crate.
 | `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (`ModelProvider`; no `Embedder` yet) |
 | `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` (`Tool`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
-| `memory`     | `MemoryStore`: records, queries, optional embeddings                   | not yet implemented |
+| `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query is `Unsupported`) |
 | `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               | `aik-policy` (`PolicyEngine`), `aik-approval` (`ApprovalSink`) |
 | `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) | not yet implemented |
 | `agent`      | `Agent`, sessions, streaming updates                                   | `aik-agent` (`AgentLoop`) |
@@ -170,8 +172,8 @@ every "Implemented by" column below is a separate crate.
 These types are provisional by design and evolve as the subsystems built against them reveal
 what the shape should actually be — `aik-tools`, `aik-fs`, `aik-agent` and the rest exist
 in part to validate that this contract layer holds up against a real implementation, not
-just a plan for one. `memory`, `scheduler` and `platform` remain exactly that: a shape with
-no implementation yet, deliberately not built ahead of the evidence that would justify one.
+just a plan for one. `scheduler` and `platform` remain exactly that: a shape with no
+implementation yet, deliberately not built ahead of the evidence that would justify one.
 
 ## What deliberately is not in the kernel
 
@@ -183,5 +185,5 @@ client (`aik-ollama`), tool implementations (`aik-fs`), an agent loop (`aik-agen
 (`aik-cli`) — but every one of them reaches `aik-core` only through the registry, the event
 bus and the component lifecycle, exactly as any other downstream consumer would; none of
 them is compiled into, or required by, `aik-core` itself. What genuinely is not here yet:
-Quickshell, Hyprland/Wayland or any other platform integration, a memory backend, a
-scheduler, and any UI beyond the terminal.
+Quickshell, Hyprland/Wayland or any other platform integration, a scheduler, and any UI
+beyond the terminal.
