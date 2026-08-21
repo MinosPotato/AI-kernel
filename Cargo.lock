@@ -147,6 +147,7 @@ name = "aik-memory"
 version = "0.1.0"
 dependencies = [
  "aik-api",
+ "aik-context",
  "aik-core",
  "aik-store",
  "async-trait",

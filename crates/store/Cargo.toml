@@ -15,6 +15,7 @@ workspace = true
 aik-core.workspace = true
 redb.workspace = true
 serde.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 serde_json.workspace = true

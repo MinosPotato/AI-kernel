@@ -104,6 +104,49 @@ impl Principal {
         self.on_behalf_of = Some(principal.into());
         self
     }
+
+    /// Whether this principal may act on resources owned by `owner`.
+    ///
+    /// True when it *is* the owner, or when it is explicitly acting
+    /// [`on_behalf_of`](Principal::on_behalf_of) the owner. Nothing else: the system
+    /// principal is an identity like any other here, not a wildcard, and a principal that
+    /// merely shares a `kind` with the owner gets nothing.
+    ///
+    /// # Why this lives on `Principal`
+    ///
+    /// Every subsystem that owns resources per principal — a context session, a memory
+    /// record, and whatever the scheduler ends up storing — has to answer exactly this
+    /// question, and it is security-relevant enough that two implementations of it would be
+    /// two things to keep in step with a divergence nobody would notice until it let one
+    /// user read another's data. So there is one, here, next to the delegation it reads.
+    ///
+    /// Note the limit, the same one stated for
+    /// [context sessions](crate::context#what-the-model-can-and-cannot-touch): in-process
+    /// code can construct a `Principal` naming anyone, so this is a boundary against a model
+    /// — which can never construct one — and defence in depth against a confused caller. It
+    /// is not a boundary against hostile code already inside the process.
+    ///
+    /// ```
+    /// use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
+    ///
+    /// let alice = Principal::new("alice", PrincipalKind::User);
+    /// let her_agent = Principal::new("agent", PrincipalKind::Agent).on_behalf_of("alice");
+    /// let mallory = Principal::new("mallory", PrincipalKind::User);
+    ///
+    /// assert!(alice.may_act_for(&PrincipalId::new("alice")));
+    /// assert!(her_agent.may_act_for(&PrincipalId::new("alice")));
+    ///
+    /// // Delegation runs one way only: acting for Alice does not make Alice's resources
+    /// // the agent's, nor the agent's resources Alice's.
+    /// assert!(!alice.may_act_for(&PrincipalId::new("agent")));
+    /// assert!(!mallory.may_act_for(&PrincipalId::new("alice")));
+    ///
+    /// // The system is an identity, not a master key.
+    /// assert!(!Principal::system().may_act_for(&PrincipalId::new("alice")));
+    /// ```
+    pub fn may_act_for(&self, owner: &PrincipalId) -> bool {
+        &self.id == owner || self.on_behalf_of.as_ref() == Some(owner)
+    }
 }
 
 /// A question for the policy layer.

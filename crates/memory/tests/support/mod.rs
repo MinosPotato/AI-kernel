@@ -93,12 +93,16 @@ impl Fixture {
     /// Runs an expiry sweep at the clock's current time and returns how many records it
     /// removed.
     pub(crate) async fn sweep(&self) -> usize {
-        self.sweeper
-            .clone()
-            .expect("the fixture holds a sweeper")
+        self.sweeper()
             .sweep_expired(self.clock.now())
             .await
             .expect("sweeping should not fail against a healthy database")
+    }
+
+    /// The sweeper itself, for a test that needs to see a sweep *fail* rather than assume it
+    /// succeeds.
+    pub(crate) fn sweeper(&self) -> Arc<dyn ExpirySweeper> {
+        self.sweeper.clone().expect("the fixture holds a sweeper")
     }
 
     /// Where the database lives, for a persistent fixture.
@@ -112,7 +116,10 @@ impl Fixture {
     /// holds an exclusive lock on the file, so a reopen that succeeds is also proof that the
     /// previous one released everything it held.
     pub(crate) fn reopen(&mut self) {
-        let path = self.path.clone().expect("only a persistent fixture can be reopened");
+        let path = self
+            .path
+            .clone()
+            .expect("only a persistent fixture can be reopened");
         self.store = None;
         self.sweeper = None;
         let (store, sweeper) = open_redb(&path, self.clock.clone());
@@ -128,7 +135,10 @@ impl Fixture {
 }
 
 /// Opens a persistent store over the database at `path`, as both of its capabilities.
-pub(crate) fn open_redb(path: &Path, clock: Arc<ManualClock>) -> (Arc<dyn MemoryStore>, Arc<dyn ExpirySweeper>) {
+pub(crate) fn open_redb(
+    path: &Path,
+    clock: Arc<ManualClock>,
+) -> (Arc<dyn MemoryStore>, Arc<dyn ExpirySweeper>) {
     let db = Arc::new(Db::open(path).expect("the database opens"));
     let concrete = Arc::new(
         RedbMemoryStore::new(db)
@@ -138,10 +148,20 @@ pub(crate) fn open_redb(path: &Path, clock: Arc<ManualClock>) -> (Arc<dyn Memory
     (concrete.clone(), concrete)
 }
 
-/// A context acting as a named user. Memory carries no ownership, but every trait method
-/// still takes a context, so the suites use one throughout rather than the anonymous default.
+/// A context acting as a named user.
 pub(crate) fn user(id: &str) -> ExecutionContext {
     ExecutionContext::new().with_principal(Principal::new(id, PrincipalKind::User))
+}
+
+/// A context acting as an agent working for `owner`.
+pub(crate) fn agent_for(id: &str, owner: &str) -> ExecutionContext {
+    ExecutionContext::new()
+        .with_principal(Principal::new(id, PrincipalKind::Agent).on_behalf_of(owner))
+}
+
+/// A context naming no principal at all, which is the system acting for itself.
+pub(crate) fn anonymous() -> ExecutionContext {
+    ExecutionContext::new()
 }
 
 /// Runs one suite function against both implementations.

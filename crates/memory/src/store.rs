@@ -10,6 +10,7 @@ use aik_core::clock::{SharedClock, SystemClock, Timestamp};
 use async_trait::async_trait;
 
 use crate::expiry::{ExpirySweeper, is_live};
+use crate::owner::{authorize, principal_of};
 use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
 
 /// A [`MemoryStore`] that keeps records in memory, in this process.
@@ -18,6 +19,9 @@ use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
 ///
 /// * **Upsert by id.** [`MemoryStore::put`] inserts or replaces whole-record, atomically
 ///   with respect to any concurrent reader: a query never observes half of a replacement.
+/// * **Owned records.** The principal that stores a record is the only one that may read,
+///   replace or delete it, apart from principals acting explicitly on its behalf — see
+///   [`crate::owner`].
 /// * **Exact retrieval.** [`MemoryStore::get`] and [`MemoryStore::delete`] address a record
 ///   by id and do not apply the expiry filter below — see [`crate::expiry`] for why.
 /// * **Live-only queries.** [`MemoryStore::query`] never returns a record whose `expires_at`
@@ -68,30 +72,54 @@ impl InMemoryMemoryStore {
 
 #[async_trait]
 impl MemoryStore for InMemoryMemoryStore {
-    async fn put(&self, record: MemoryRecord, _cx: &ExecutionContext) -> Result<()> {
+    async fn put(&self, mut record: MemoryRecord, cx: &ExecutionContext) -> Result<()> {
+        let principal = principal_of(cx);
         let mut records = self.records.write().expect("memory store lock poisoned");
+
+        // A record keeps the owner it was created with. Re-stamping from the caller would
+        // mean an agent acting on behalf of Alice became the owner the moment it revised one
+        // of her memories — a silent transfer, granted by the very delegation that was
+        // supposed to let it act *for* her.
+        record.owner = match records.get(&record.id) {
+            Some(existing) => {
+                authorize(&record.id, &existing.owner, &principal)?;
+                existing.owner.clone()
+            }
+            None => principal.id,
+        };
         records.insert(record.id, record);
         Ok(())
     }
 
-    async fn get(&self, id: &MemoryId, _cx: &ExecutionContext) -> Result<Option<MemoryRecord>> {
+    async fn get(&self, id: &MemoryId, cx: &ExecutionContext) -> Result<Option<MemoryRecord>> {
         let records = self.records.read().expect("memory store lock poisoned");
-        Ok(records.get(id).cloned())
+        let Some(record) = records.get(id) else {
+            return Ok(None);
+        };
+        authorize(id, &record.owner, &principal_of(cx))?;
+        Ok(Some(record.clone()))
     }
 
-    async fn delete(&self, id: &MemoryId, _cx: &ExecutionContext) -> Result<bool> {
+    async fn delete(&self, id: &MemoryId, cx: &ExecutionContext) -> Result<bool> {
         let mut records = self.records.write().expect("memory store lock poisoned");
-        Ok(records.remove(id).is_some())
+        let Some(record) = records.get(id) else {
+            return Ok(false);
+        };
+        authorize(id, &record.owner, &principal_of(cx))?;
+        records.remove(id);
+        Ok(true)
     }
 
-    async fn query(&self, query: &MemoryQuery, _cx: &ExecutionContext) -> Result<Vec<MemoryMatch>> {
+    async fn query(&self, query: &MemoryQuery, cx: &ExecutionContext) -> Result<Vec<MemoryMatch>> {
         reject_unsupported(query)?;
         let kinds = requested_kinds(query);
         let now = self.clock.now();
+        let principal = principal_of(cx);
 
         let records = self.records.read().expect("memory store lock poisoned");
         let candidates: Vec<MemoryRecord> = records
             .values()
+            .filter(|record| principal.may_act_for(&record.owner))
             .filter(|record| kinds.is_empty() || kinds.contains(&record.kind))
             .filter(|record| is_live(record.expires_at, now))
             .filter(|record| matches_metadata(record, &query.metadata))
@@ -115,7 +143,7 @@ impl ExpirySweeper for InMemoryMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aik_api::permission::{Principal, PrincipalKind};
+    use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
     use aik_core::ErrorKind;
     use aik_core::clock::ManualClock;
     use serde_json::json;
@@ -139,7 +167,11 @@ mod tests {
         let store = InMemoryMemoryStore::new();
         let record = record("fact");
         store.put(record.clone(), &cx()).await.unwrap();
-        assert_eq!(store.get(&record.id, &cx()).await.unwrap(), Some(record));
+        let expected = MemoryRecord {
+            owner: PrincipalId::new("alice"),
+            ..record.clone()
+        };
+        assert_eq!(store.get(&record.id, &cx()).await.unwrap(), Some(expected));
     }
 
     #[tokio::test]
@@ -205,8 +237,20 @@ mod tests {
         record.expires_at = Some(Timestamp::from_millis(1_500));
         store.put(record.clone(), &cx()).await.unwrap();
 
-        assert!(store.query(&MemoryQuery::default(), &cx()).await.unwrap().is_empty());
-        assert_eq!(store.get(&record.id, &cx()).await.unwrap(), Some(record));
+        assert!(
+            store
+                .query(&MemoryQuery::default(), &cx())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.get(&record.id, &cx()).await.unwrap(),
+            Some(MemoryRecord {
+                owner: PrincipalId::new("alice"),
+                ..record
+            })
+        );
     }
 
     #[tokio::test]
@@ -222,7 +266,10 @@ mod tests {
         store.put(alive.clone(), &cx()).await.unwrap();
         store.put(forever.clone(), &cx()).await.unwrap();
 
-        let removed = store.sweep_expired(Timestamp::from_millis(1_000)).await.unwrap();
+        let removed = store
+            .sweep_expired(Timestamp::from_millis(1_000))
+            .await
+            .unwrap();
         assert_eq!(removed, 1);
         assert!(store.get(&expired.id, &cx()).await.unwrap().is_none());
         assert!(store.get(&alive.id, &cx()).await.unwrap().is_some());

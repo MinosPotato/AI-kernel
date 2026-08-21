@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use aik_api::memory::{MemoryId, MemoryQuery, MemoryRecord};
+use aik_api::permission::PrincipalId;
 use aik_core::ErrorKind;
 use aik_core::clock::Timestamp;
 use serde_json::json;
@@ -33,18 +34,36 @@ crate::both_backends!(
     get_and_delete_ignore_expiry,
     a_record_without_expiry_is_never_swept,
     sweeping_reclaims_an_expired_record,
+    changing_an_expiry_retires_the_old_one,
+    clearing_an_expiry_makes_a_record_permanent,
+    adding_an_expiry_to_a_permanent_record_takes_effect,
     concurrent_puts_are_all_visible,
 );
 
 fn record(kind: &str, created_at_ms: u64) -> MemoryRecord {
-    MemoryRecord::new(kind, json!({"n": created_at_ms}), Timestamp::from_millis(created_at_ms))
+    MemoryRecord::new(
+        kind,
+        json!({"n": created_at_ms}),
+        Timestamp::from_millis(created_at_ms),
+    )
 }
 
 async fn a_missing_id_is_none(backend: Backend) {
     let fixture = backend.open();
     let store = fixture.store();
-    assert!(store.get(&MemoryId::new(), &user("alice")).await.unwrap().is_none());
-    assert!(!store.delete(&MemoryId::new(), &user("alice")).await.unwrap());
+    assert!(
+        store
+            .get(&MemoryId::new(), &user("alice"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !store
+            .delete(&MemoryId::new(), &user("alice"))
+            .await
+            .unwrap()
+    );
 }
 
 async fn put_then_get_round_trips(backend: Backend) {
@@ -54,7 +73,19 @@ async fn put_then_get_round_trips(backend: Backend) {
     let record = record("fact", 1);
 
     store.put(record.clone(), &cx).await.unwrap();
-    assert_eq!(store.get(&record.id, &cx).await.unwrap(), Some(record));
+
+    // Everything round-trips unchanged except the owner, which the store assigns from the
+    // context rather than accepting from the record it was handed.
+    assert_ne!(
+        record.owner,
+        PrincipalId::new("alice"),
+        "the fixture starts unowned, so the assertion below means something"
+    );
+    let expected = MemoryRecord {
+        owner: PrincipalId::new("alice"),
+        ..record.clone()
+    };
+    assert_eq!(store.get(&record.id, &cx).await.unwrap(), Some(expected));
 }
 
 async fn put_upserts_by_id(backend: Backend) {
@@ -73,7 +104,11 @@ async fn put_upserts_by_id(backend: Backend) {
     assert_eq!(fetched.metadata.get("revised"), Some(&json!(true)));
 
     let matches = store.query(&MemoryQuery::default(), &cx).await.unwrap();
-    assert_eq!(matches.len(), 1, "an upsert must not leave a second row behind");
+    assert_eq!(
+        matches.len(),
+        1,
+        "an upsert must not leave a second row behind"
+    );
 }
 
 async fn replacing_a_record_moves_it_between_kinds(backend: Backend) {
@@ -125,7 +160,13 @@ async fn delete_removes_it_from_every_kind_filter(backend: Backend) {
 
     store.delete(&record.id, &cx).await.unwrap();
 
-    assert!(store.query(&MemoryQuery::default(), &cx).await.unwrap().is_empty());
+    assert!(
+        store
+            .query(&MemoryQuery::default(), &cx)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let by_kind = MemoryQuery {
         kinds: vec![record.kind.clone()],
         ..Default::default()
@@ -254,7 +295,13 @@ async fn an_expired_record_is_not_query_visible(backend: Backend) {
     record.expires_at = Some(Timestamp::from_millis(1_500));
     store.put(record.clone(), &cx).await.unwrap();
 
-    assert!(store.query(&MemoryQuery::default(), &cx).await.unwrap().is_empty());
+    assert!(
+        store
+            .query(&MemoryQuery::default(), &cx)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 async fn get_and_delete_ignore_expiry(backend: Backend) {
@@ -267,7 +314,13 @@ async fn get_and_delete_ignore_expiry(backend: Backend) {
 
     // Not query-visible, but still addressable by id: the sweep has not reached it yet, and
     // an exact lookup is not the visibility rule `query` enforces.
-    assert_eq!(store.get(&record.id, &cx).await.unwrap(), Some(record.clone()));
+    assert_eq!(
+        store.get(&record.id, &cx).await.unwrap(),
+        Some(MemoryRecord {
+            owner: PrincipalId::new("alice"),
+            ..record.clone()
+        })
+    );
     assert!(store.delete(&record.id, &cx).await.unwrap());
     assert!(store.get(&record.id, &cx).await.unwrap().is_none());
 }
@@ -281,7 +334,13 @@ async fn a_record_without_expiry_is_never_swept(backend: Backend) {
     fixture.clock().advance(Duration::from_secs(3600));
     let removed = fixture.sweep().await;
     assert_eq!(removed, 0);
-    assert!(store.get(&record.id, &user("alice")).await.unwrap().is_some());
+    assert!(
+        store
+            .get(&record.id, &user("alice"))
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 async fn sweeping_reclaims_an_expired_record(backend: Backend) {
@@ -305,6 +364,94 @@ async fn sweeping_reclaims_an_expired_record(backend: Backend) {
     assert_eq!(fixture.sweep().await, 0);
 }
 
+/// The case that loses data if a store keeps an expiry index and forgets to retire the old
+/// entry: the record is still live, but something else in the database still claims it is due
+/// at the earlier time, and the next sweep believes it.
+async fn changing_an_expiry_retires_the_old_one(backend: Backend) {
+    let fixture = backend.at(Timestamp::from_millis(1_000));
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let mut record = record("fact", 1);
+    record.expires_at = Some(Timestamp::from_millis(1_500));
+    store.put(record.clone(), &cx).await.unwrap();
+
+    record.expires_at = Some(Timestamp::from_millis(3_000));
+    store.put(record.clone(), &cx).await.unwrap();
+
+    // Past the expiry the record was *first* given, and well short of the one it has now.
+    fixture.clock().set(Timestamp::from_millis(2_000));
+    assert_eq!(
+        fixture.sweep().await,
+        0,
+        "the retracted expiry must not still be able to reclaim the record"
+    );
+    assert!(store.get(&record.id, &cx).await.unwrap().is_some());
+    assert_eq!(
+        store
+            .query(&MemoryQuery::default(), &cx)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the record is live until its current expiry, not its previous one"
+    );
+
+    // The replacement expiry is the one that counts, and it does count.
+    fixture.clock().set(Timestamp::from_millis(3_000));
+    assert_eq!(fixture.sweep().await, 1);
+    assert!(store.get(&record.id, &cx).await.unwrap().is_none());
+}
+
+async fn clearing_an_expiry_makes_a_record_permanent(backend: Backend) {
+    let fixture = backend.at(Timestamp::from_millis(1_000));
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let mut record = record("fact", 1);
+    record.expires_at = Some(Timestamp::from_millis(1_500));
+    store.put(record.clone(), &cx).await.unwrap();
+
+    record.expires_at = None;
+    store.put(record.clone(), &cx).await.unwrap();
+
+    fixture.clock().advance(Duration::from_secs(3600));
+    assert_eq!(
+        fixture.sweep().await,
+        0,
+        "a record whose expiry was withdrawn must outlive it"
+    );
+    assert_eq!(
+        store
+            .get(&record.id, &cx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at,
+        None
+    );
+}
+
+async fn adding_an_expiry_to_a_permanent_record_takes_effect(backend: Backend) {
+    let fixture = backend.at(Timestamp::from_millis(1_000));
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let mut record = record("fact", 1);
+    store.put(record.clone(), &cx).await.unwrap();
+
+    record.expires_at = Some(Timestamp::from_millis(2_000));
+    store.put(record.clone(), &cx).await.unwrap();
+
+    fixture.clock().set(Timestamp::from_millis(2_000));
+    assert_eq!(
+        fixture.sweep().await,
+        1,
+        "an expiry added by a replacement must be reclaimable"
+    );
+    assert!(store.get(&record.id, &cx).await.unwrap().is_none());
+}
+
 async fn concurrent_puts_are_all_visible(backend: Backend) {
     let fixture = backend.open();
     let store = fixture.store();
@@ -323,5 +470,9 @@ async fn concurrent_puts_are_all_visible(backend: Backend) {
     }
 
     let matches = store.query(&MemoryQuery::default(), &cx).await.unwrap();
-    assert_eq!(matches.len(), 32, "a concurrent put must not be lost or duplicated");
+    assert_eq!(
+        matches.len(),
+        32,
+        "a concurrent put must not be lost or duplicated"
+    );
 }

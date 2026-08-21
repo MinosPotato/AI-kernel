@@ -26,16 +26,6 @@ pub(crate) fn principal_of(cx: &ExecutionContext) -> Principal {
     cx.principal.clone().unwrap_or_else(Principal::system)
 }
 
-/// Decides whether `principal` may touch a session owned by `owner`.
-///
-/// Delegation is one-directional and explicit: an agent carrying
-/// [`on_behalf_of`](Principal::on_behalf_of) the owner may act in the owner's session,
-/// because that is what delegated authority means; the owner does not thereby gain access
-/// to the agent's own sessions.
-pub(crate) fn may_access(principal: &Principal, owner: &PrincipalId) -> bool {
-    &principal.id == owner || principal.on_behalf_of.as_ref() == Some(owner)
-}
-
 /// Fails closed unless `principal` owns `session`.
 ///
 /// The principal is passed in rather than the [`ExecutionContext`] because a persistent
@@ -46,7 +36,7 @@ pub(crate) fn authorize(
     owner: &PrincipalId,
     principal: &Principal,
 ) -> Result<()> {
-    if may_access(principal, owner) {
+    if principal.may_act_for(owner) {
         return Ok(());
     }
     Err(Error::PermissionDenied(format!(

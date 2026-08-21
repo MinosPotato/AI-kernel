@@ -25,3 +25,6 @@ uuid.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile.workspace = true
+# Dev-only, and only for the test that proves two durable subsystems can share one database
+# file. Nothing in `aik-memory` itself knows the transcript store exists.
+aik-context.workspace = true

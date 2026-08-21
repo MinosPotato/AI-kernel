@@ -39,6 +39,19 @@ pub(crate) fn is_live(expires_at: Option<Timestamp>, now: Timestamp) -> bool {
     }
 }
 
+/// The most records a durable sweep reclaims in one write transaction.
+///
+/// A sweep is unattended housekeeping that competes for the database's single write slot
+/// with work someone is waiting for, so it is deliberately not one transaction however much
+/// has expired. Batching bounds three things at once: the memory one sweep allocates, how
+/// long it holds the write slot, and how much work is still in flight when the kernel is
+/// asked to stop — see [`spawn_expiry_task`].
+///
+/// Large enough that a routine sweep is a single batch; small enough that a backlog of
+/// millions does not become one transaction, one allocation, or one shutdown that misses its
+/// deadline.
+pub const DEFAULT_SWEEP_BATCH: usize = 1_024;
+
 /// Something that can reclaim its own expired records.
 ///
 /// Implemented by both stores, not folded into
@@ -48,6 +61,17 @@ pub(crate) fn is_live(expires_at: Option<Timestamp>, now: Timestamp) -> bool {
 /// backend it is. It is public so tests — and anything else that wants reclamation on its
 /// own schedule rather than [`DEFAULT_EXPIRY_SWEEP_INTERVAL`](crate::DEFAULT_EXPIRY_SWEEP_INTERVAL) —
 /// can call it directly instead of waiting for the background task.
+///
+/// # Obligations
+///
+/// * **Complete.** When it returns `Ok`, every record due at `now` has been removed, along
+///   with every index entry naming it. An implementation that reclaims in batches loops until
+///   there is nothing left rather than returning after the first one.
+/// * **Interruptible between batches.** The returned future may be dropped, and dropping it
+///   must leave the store consistent — which a per-batch transaction gives for free and a
+///   single transaction over everything does not.
+/// * **Restartable.** A sweep that was interrupted is completed by the next one; nothing
+///   depends on any single call finishing.
 #[async_trait]
 pub trait ExpirySweeper: Send + Sync + 'static {
     /// Removes every record whose expiry is at or before `now`, along with its indexes.
@@ -59,8 +83,22 @@ pub trait ExpirySweeper: Send + Sync + 'static {
 ///
 /// A failed sweep is logged and retried at the next tick rather than propagated: one bad
 /// tick — a transient I/O error, say — should not stop every future one from reclaiming
-/// space, and there is nothing here for a caller to react to. Cancellation is checked
-/// between ticks, so shutdown does not wait out a full sleep before the task actually stops.
+/// space, and there is nothing here for a caller to react to.
+///
+/// # Why cancellation is raced against the sweep and not only the sleep
+///
+/// Shutdown gives every background task one shared deadline
+/// ([`Kernel::shutdown`](aik_core::Kernel::shutdown)). A task that observes cancellation only
+/// between ticks stops promptly when it is asleep — which is almost always — and not at all
+/// when it is mid-sweep, which is exactly the case where it has the most left to do. So both
+/// halves of the loop are racing the token, and a sweep in progress is abandoned rather than
+/// waited out.
+///
+/// Abandoning it is safe because [`ExpirySweeper`] reclaims in batches: dropping the future
+/// leaves every completed batch committed and at most one in flight, and whatever was missed
+/// is simply due again at the next start-up. The alternative — one transaction covering an
+/// arbitrary backlog — could not be abandoned at all, and would put an unbounded operation
+/// inside a bounded shutdown.
 pub(crate) fn spawn_expiry_task(
     tasks: &Tasks,
     clock: SharedClock,
@@ -71,8 +109,13 @@ pub(crate) fn spawn_expiry_task(
         loop {
             tokio::select! {
                 () = token.cancelled() => break,
-                () = tokio::time::sleep(period) => {
-                    if let Err(error) = sweeper.sweep_expired(clock.now()).await {
+                () = tokio::time::sleep(period) => {}
+            }
+
+            tokio::select! {
+                () = token.cancelled() => break,
+                result = sweeper.sweep_expired(clock.now()) => {
+                    if let Err(error) = result {
                         tracing::error!(%error, "memory expiry sweep failed; will retry next tick");
                     }
                 }
@@ -101,5 +144,47 @@ mod tests {
         let expires_at = Timestamp::from_millis(1_000);
         assert!(!is_live(Some(expires_at), Timestamp::from_millis(1_000)));
         assert!(!is_live(Some(expires_at), Timestamp::from_millis(1_001)));
+    }
+
+    /// A sweeper whose `sweep_expired` never returns on its own, so the only way the task
+    /// spawned around it can ever finish is by observing cancellation *during* the sweep —
+    /// not merely between ticks. `shutdown_stops_the_sweep_rather_than_waiting_out_its_interval`
+    /// in `aik-memory`'s `end_to_end.rs` proves the sleep half of the race; this proves the
+    /// other half, which that test's long interval never actually exercises (it cancels while
+    /// the loop is asleep, not while a sweep is in progress).
+    struct NeverFinishes;
+
+    #[async_trait]
+    impl ExpirySweeper for NeverFinishes {
+        async fn sweep_expired(&self, _now: Timestamp) -> Result<usize> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_raced_against_an_in_progress_sweep_not_only_the_sleep() {
+        use aik_core::clock::SystemClock;
+
+        let tasks = Tasks::new();
+        let clock: SharedClock = Arc::new(SystemClock);
+        spawn_expiry_task(
+            &tasks,
+            clock,
+            Arc::new(NeverFinishes),
+            Duration::from_millis(1),
+        );
+
+        // Long enough that the task has woken from its first (1ms) sleep and is inside the
+        // sweep, which then hangs for ever.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // If cancellation were checked only between ticks, this would time out: the fake
+        // sweep never returns on its own, so the task would still be awaiting it.
+        let result = tasks.shutdown(Duration::from_millis(500)).await;
+        assert!(
+            result.is_ok(),
+            "shutdown timed out waiting for a sweep that should have been abandoned, not \
+             awaited: {result:?}"
+        );
     }
 }
