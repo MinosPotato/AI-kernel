@@ -6,7 +6,6 @@
 //! [`ExecutionContext`] counts as, what the refusal says, and — the part no other subsystem
 //! needs — what principal a firing runs as once the caller who scheduled it is long gone.
 
-use aik_api::execution::ExecutionContext;
 use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
 use aik_api::scheduler::JobId;
 use aik_core::{Error, Result};
@@ -19,15 +18,6 @@ use aik_core::{Error, Result};
 /// without also constraining startup work and everything else the system does on its own
 /// behalf.
 pub const RUN_PRINCIPAL: &str = "scheduler";
-
-/// The principal a context is acting as.
-///
-/// A context with no principal is the system acting for itself — its own identity, not a
-/// wildcard — exactly as it is in the memory store and in
-/// [`ToolRegistry`](aik_api::tool::ToolRegistry).
-pub(crate) fn principal_of(cx: &ExecutionContext) -> Principal {
-    cx.principal.clone().unwrap_or_else(Principal::system)
-}
 
 /// Fails closed unless `principal` may act for the job's `owner`.
 ///
@@ -70,10 +60,14 @@ pub(crate) fn run_principal(owner: &PrincipalId) -> Principal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aik_api::execution::ExecutionContext;
 
     #[test]
     fn a_context_without_a_principal_is_the_system() {
-        assert_eq!(principal_of(&ExecutionContext::new()), Principal::system());
+        assert_eq!(
+            ExecutionContext::new().principal_or_system(),
+            Principal::system()
+        );
     }
 
     #[test]

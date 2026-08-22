@@ -10,7 +10,7 @@ use aik_core::clock::{SharedClock, SystemClock, Timestamp};
 use async_trait::async_trait;
 
 use crate::expiry::{ExpirySweeper, is_live};
-use crate::owner::{authorize, principal_of};
+use crate::owner::authorize;
 use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
 
 /// A [`MemoryStore`] that keeps records in memory, in this process.
@@ -73,7 +73,7 @@ impl InMemoryMemoryStore {
 #[async_trait]
 impl MemoryStore for InMemoryMemoryStore {
     async fn put(&self, mut record: MemoryRecord, cx: &ExecutionContext) -> Result<()> {
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let mut records = self.records.write().expect("memory store lock poisoned");
 
         // A record keeps the owner it was created with. Re-stamping from the caller would
@@ -96,7 +96,7 @@ impl MemoryStore for InMemoryMemoryStore {
         let Some(record) = records.get(id) else {
             return Ok(None);
         };
-        authorize(id, &record.owner, &principal_of(cx))?;
+        authorize(id, &record.owner, &cx.principal_or_system())?;
         Ok(Some(record.clone()))
     }
 
@@ -105,7 +105,7 @@ impl MemoryStore for InMemoryMemoryStore {
         let Some(record) = records.get(id) else {
             return Ok(false);
         };
-        authorize(id, &record.owner, &principal_of(cx))?;
+        authorize(id, &record.owner, &cx.principal_or_system())?;
         records.remove(id);
         Ok(true)
     }
@@ -114,7 +114,7 @@ impl MemoryStore for InMemoryMemoryStore {
         reject_unsupported(query)?;
         let kinds = requested_kinds(query);
         let now = self.clock.now();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
 
         let records = self.records.read().expect("memory store lock poisoned");
         let candidates: Vec<MemoryRecord> = records

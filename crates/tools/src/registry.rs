@@ -22,9 +22,10 @@ use serde_json::json;
 
 /// The principal attributed to a call whose [`ExecutionContext`] names none.
 ///
-/// A context with no principal is the system acting on its own behalf — a scheduled job,
-/// startup work — not an unauthenticated caller. Policy engines should treat it as its own
-/// identity rather than as a wildcard.
+/// The defaulting itself is
+/// [`ExecutionContext::principal_or_system`](aik_api::execution::ExecutionContext::principal_or_system),
+/// which every subsystem that owns resources shares; this is only the name, re-exported by
+/// [`system_principal_id`] for policy engines that want to match on it.
 const SYSTEM_PRINCIPAL: &str = Principal::SYSTEM;
 
 /// A [`ToolRegistry`] that holds its tools in memory and runs them in the same process.
@@ -163,10 +164,6 @@ impl InProcessToolRegistry {
         }
         self.tools.insert(name, tool);
         Ok(())
-    }
-
-    fn principal_of(cx: &ExecutionContext) -> Principal {
-        cx.principal.clone().unwrap_or_else(Principal::system)
     }
 
     /// Publishes an audit event, correlated and attributed, if a bus is configured.
@@ -458,7 +455,7 @@ impl ToolRegistry for InProcessToolRegistry {
         cx: &ExecutionContext,
     ) -> Result<ToolOutcome> {
         let started = Instant::now();
-        let principal = Self::principal_of(cx);
+        let principal = cx.principal_or_system();
 
         let Some(tool) = self.tools.get(name).cloned() else {
             self.record_invocation(

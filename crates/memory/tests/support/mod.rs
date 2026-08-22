@@ -186,3 +186,198 @@ macro_rules! both_backends {
         )+
     };
 }
+
+// --- the memory tools -----------------------------------------------------------------
+
+/// A running kernel with a memory store, a bound set of memory tools, and — for the durable
+/// backend — a database file that survives a restart.
+///
+/// The tools are bound the way a real deployment binds them: by
+/// [`MemoryToolsComponent`](aik_memory::MemoryToolsComponent) during kernel `init`, against
+/// whichever [`MemoryStore`] the kernel published. That is the whole reason this fixture
+/// builds a kernel rather than handing a store to a tool directly — wiring that only ever
+/// happened in a test would prove nothing about the wiring that ships.
+pub(crate) struct ToolKernel {
+    kernel: Option<aik_core::Kernel>,
+    tools: Option<Tools>,
+    clock: Arc<ManualClock>,
+    backend: Backend,
+    directory: Option<TempDir>,
+    path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for ToolKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolKernel")
+            .field("backend", &self.backend)
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+/// The four tools one [`MemoryToolsComponent`](aik_memory::MemoryToolsComponent) handed out.
+#[derive(Debug)]
+pub(crate) struct Tools {
+    pub(crate) put: aik_memory::MemoryPutTool,
+    pub(crate) get: aik_memory::MemoryGetTool,
+    pub(crate) query: aik_memory::MemoryQueryTool,
+    pub(crate) delete: aik_memory::MemoryDeleteTool,
+}
+
+impl Backend {
+    /// Starts a kernel with this backend and a manual clock stopped at the epoch.
+    pub(crate) async fn open_tools(self) -> ToolKernel {
+        let clock = Arc::new(ManualClock::new(Timestamp::EPOCH));
+        let (directory, path) = match self {
+            Self::Memory => (None, None),
+            Self::Redb => {
+                let directory = tempfile::tempdir().expect("a temporary directory");
+                let path = directory.path().join("aik.redb");
+                (Some(directory), Some(path))
+            }
+        };
+        let (kernel, tools) = start_tool_kernel(self, clock.clone(), path.as_deref()).await;
+        ToolKernel {
+            kernel: Some(kernel),
+            tools: Some(tools),
+            clock,
+            backend: self,
+            directory,
+            path,
+        }
+    }
+}
+
+impl ToolKernel {
+    /// The tools under test.
+    pub(crate) fn tools(&self) -> &Tools {
+        self.tools.as_ref().expect("the kernel is running")
+    }
+
+    /// The clock the kernel stamps records with.
+    pub(crate) fn clock(&self) -> &Arc<ManualClock> {
+        &self.clock
+    }
+
+    /// The store the tools are bound to, for asserting on what they actually wrote.
+    pub(crate) fn store(&self) -> Arc<dyn MemoryStore> {
+        self.kernel
+            .as_ref()
+            .expect("the kernel is running")
+            .context()
+            .service::<dyn MemoryStore>()
+            .expect("the memory store is published")
+    }
+
+    /// Shuts the kernel down and starts a new one over the same database.
+    ///
+    /// The old kernel is stopped first and deliberately: redb holds an exclusive lock on the
+    /// file, so a restart that succeeds is also proof the previous one released everything.
+    /// The tools are rebuilt too, because a restart hands out a new binding — a tool that
+    /// kept working across a restart would be a tool holding a store the kernel no longer
+    /// owns.
+    pub(crate) async fn restart(&mut self) {
+        let kernel = self.kernel.take().expect("the kernel is running");
+        kernel.shutdown().await.expect("the kernel stops cleanly");
+        // Dropping both is part of stopping here, and in this order. The database is held by
+        // the registry the kernel owns *and* by the binding behind every tool it handed out;
+        // redb refuses to open one file twice, so a restart that kept either alive would fail
+        // to open the very file it is restarting on.
+        drop(kernel);
+        drop(self.tools.take());
+        let (kernel, tools) =
+            start_tool_kernel(self.backend, self.clock.clone(), self.path.as_deref()).await;
+        self.kernel = Some(kernel);
+        self.tools = Some(tools);
+    }
+
+    /// Stops the kernel, failing the test if it does not stop cleanly.
+    pub(crate) async fn shutdown(mut self) {
+        if let Some(kernel) = self.kernel.take() {
+            kernel.shutdown().await.expect("the kernel stops cleanly");
+        }
+        drop(self.tools.take());
+        drop(self.directory.take());
+    }
+}
+
+/// Builds and starts one kernel wired for `backend`, returning it with its memory tools.
+async fn start_tool_kernel(
+    backend: Backend,
+    clock: Arc<ManualClock>,
+    path: Option<&Path>,
+) -> (aik_core::Kernel, Tools) {
+    use aik_core::prelude::*;
+
+    let component = aik_memory::MemoryToolsComponent::new();
+    let tools = Tools {
+        put: component.put(),
+        get: component.get(),
+        query: component.query(),
+        delete: component.delete(),
+    };
+
+    let builder = Kernel::builder().clock(clock);
+    let builder = match backend {
+        Backend::Memory => builder.component(aik_memory::MemoryComponent::new()),
+        Backend::Redb => builder
+            .config(store_config(path.expect("a persistent backend has a path")))
+            .component(aik_store::StoreComponent::new())
+            .component(aik_memory::RedbMemoryComponent::new()),
+    };
+    let kernel = builder
+        .component(component)
+        .build()
+        .expect("a valid kernel");
+    kernel.start().await.expect("the kernel starts");
+    (kernel, tools)
+}
+
+/// Configuration pointing the shared database at `path`.
+pub(crate) fn store_config(path: &Path) -> aik_core::Config {
+    aik_core::Config::builder()
+        .layer(serde_json::json!({ "components": { "store": { "db": { "path": path } } } }))
+        .build()
+}
+
+/// Stands in for the authorizer a [`ToolRegistry`](aik_api::tool::ToolRegistry) supplies.
+///
+/// These suites call [`Tool::invoke`](aik_api::tool::Tool::invoke) directly, because what
+/// they are about is what the tools do with a store. That the registry is the only door to
+/// them, and that policy is consulted at it, is asserted against a real registry in the
+/// cross-subsystem suite — this crate deliberately does not depend on `aik-tools`.
+#[derive(Debug)]
+pub(crate) struct NoDiscoveredResources;
+
+#[async_trait::async_trait]
+impl aik_api::permission::ResourceAuthorizer for NoDiscoveredResources {
+    async fn authorize(
+        &self,
+        _action: &aik_api::permission::ActionId,
+        _resource: &aik_api::permission::ResourceId,
+    ) -> aik_core::Result<()> {
+        unreachable!("the memory tools declare every resource they touch in advance")
+    }
+}
+
+/// Invokes a tool the way a registry would, minus the authorization it would have done.
+pub(crate) async fn invoke(
+    tool: &impl aik_api::tool::Tool,
+    arguments: serde_json::Value,
+    cx: &ExecutionContext,
+) -> aik_core::Result<aik_api::tool::ToolOutcome> {
+    tool.invoke(arguments, &NoDiscoveredResources, cx).await
+}
+
+/// Invokes a tool and unwraps a successful, non-error outcome's output.
+pub(crate) async fn output(
+    tool: &impl aik_api::tool::Tool,
+    arguments: serde_json::Value,
+    cx: &ExecutionContext,
+) -> serde_json::Value {
+    let outcome = invoke(tool, arguments, cx)
+        .await
+        .expect("the tool call should succeed");
+    assert!(!outcome.is_error, "unexpected error outcome: {outcome:?}");
+    outcome.output
+}
