@@ -20,6 +20,7 @@ crate::both_backends!(
     an_elided_tool_result_stays_retrievable_in_full,
     a_window_is_derived_not_stored,
     a_full_session_refuses_further_appends,
+    a_refused_first_append_does_not_create_the_session,
     clearing_removes_the_session,
     a_cleared_session_can_be_reclaimed_by_a_different_principal,
     an_unknown_session_has_no_stats_and_an_empty_window,
@@ -212,6 +213,33 @@ async fn a_full_session_refuses_further_appends(backend: Backend) {
     // has to leave the session exactly as it was.
     let stats = store.stats(&session, &cx).await.unwrap().unwrap();
     assert_eq!(stats.records, 2);
+}
+
+async fn a_refused_first_append_does_not_create_the_session(backend: Backend) {
+    let fixture = backend.bounded(0);
+    let store = fixture.store();
+    let session = SessionId::new();
+    let cx = user("alice");
+
+    let error = store.append(&session, say("one"), &cx).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
+    assert!(error.to_string().contains("full"), "{error}");
+
+    // The persistent store aborts its transaction and leaves nothing; the in-memory one must
+    // not leave an empty session behind either. A refused append that quietly claimed the
+    // session would hand its ownership to whoever was refused first.
+    assert!(
+        store.stats(&session, &cx).await.unwrap().is_none(),
+        "a session nothing was ever appended to must not exist"
+    );
+    assert_eq!(store.clear(&session, &cx).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .window(&session, &ContextBudget::UNLIMITED, &cx)
+            .await
+            .unwrap(),
+        ContextWindow::empty()
+    );
 }
 
 async fn clearing_removes_the_session(backend: Backend) {

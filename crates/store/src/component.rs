@@ -33,6 +33,20 @@ pub const DEFAULT_COMPONENT_ID: &str = "store.db";
 /// # }
 /// ```
 ///
+/// # Shutdown does not close the database
+///
+/// This component has no `stop`, and it does not need one: the `Arc<Db>` it registered is
+/// owned by the kernel registry, which outlives
+/// [`Kernel::shutdown`](aik_core::Kernel::shutdown). So a kernel that has shut down cleanly
+/// is still holding redb's exclusive lock on the file, and reopening the same database — in
+/// a test, or after an in-process restart — requires dropping the `Kernel` and every
+/// `Arc<Db>` resolved from it first.
+///
+/// Closing it in `stop` would be worse than this: the handle is shared, and a subsystem
+/// stopped after the store would find its database gone rather than merely idle. Releasing
+/// the file is therefore tied to dropping the kernel, which is the only moment at which
+/// nothing can still be using it.
+///
 /// A subsystem that needs the database declares a dependency on it, so the kernel orders
 /// the two and refuses to start if the store is absent:
 ///

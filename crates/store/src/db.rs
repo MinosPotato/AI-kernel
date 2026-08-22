@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use aik_core::{Error, Result};
 use redb::{Database, ReadableDatabase};
+use tokio::sync::Mutex;
 
 use crate::error::{io_error, open_error, store_error};
 use crate::schema::{META, MIGRATIONS, SCHEMA_VERSION, SCHEMA_VERSION_KEY, migrate};
@@ -41,9 +42,12 @@ pub const DATABASE_DIRECTORY_MODE: u32 = 0o700;
 /// from an async context are responsible for moving it onto a blocking thread — this type
 /// deliberately does not wrap every operation in `tokio::task::spawn_blocking`, because the
 /// useful unit to move is a whole transaction, which only the caller can delimit.
+///
+/// What it does provide is [`Db::writes`], the queue those callers should wait in first.
 pub struct Db {
     database: Database,
     path: PathBuf,
+    writes: Mutex<()>,
 }
 
 impl std::fmt::Debug for Db {
@@ -75,7 +79,11 @@ impl Db {
             .map_err(|error| open_error(&path, error))?;
         migrate(&database, SCHEMA_VERSION, MIGRATIONS)?;
 
-        Ok(Self { database, path })
+        Ok(Self {
+            database,
+            path,
+            writes: Mutex::new(()),
+        })
     }
 
     /// Where this database lives.
@@ -91,6 +99,42 @@ impl Db {
     /// every caller reaching past it the moment it fell short.
     pub fn database(&self) -> &Database {
         &self.database
+    }
+
+    /// The queue every writer waits in before moving a write transaction onto a blocking
+    /// thread.
+    ///
+    /// # Why this is on the database rather than on each subsystem
+    ///
+    /// redb already permits only one write transaction at a time and blocks the rest — but it
+    /// blocks them *inside* `begin_write`, on whichever thread got there, which for an async
+    /// caller means a thread from tokio's blocking pool parked doing nothing. Waiting here
+    /// instead means a burst of concurrent writers occupies one pool thread rather than one
+    /// per caller, leaving the pool for work that can actually proceed: filesystem tools,
+    /// mostly, which share it.
+    ///
+    /// The lock has to be per *file* for that to hold. A queue owned by one subsystem only
+    /// orders that subsystem's writers, so two subsystems sharing a database — which is the
+    /// arrangement this crate exists to support — would each admit one writer into
+    /// `begin_write`, and the guarantee would quietly degrade with every subsystem added.
+    /// There is exactly one `Db` per file, so there is exactly one queue.
+    ///
+    /// It costs no throughput: the writes were going to be serialised by redb anyway. It is
+    /// not a correctness mechanism and must not be relied on as one — redb's own exclusion is
+    /// what makes concurrent writes safe, including from a caller that never comes here.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use aik_store::Db;
+    /// # async fn append(db: Arc<Db>) {
+    /// let _queued = db.writes().lock().await;
+    /// // ... and only now move the whole transaction onto a blocking thread and await it,
+    /// // so that the thread is occupied by a write that can proceed rather than by one
+    /// // waiting its turn inside `begin_write`.
+    /// # }
+    /// ```
+    pub fn writes(&self) -> &Mutex<()> {
+        &self.writes
     }
 
     /// The schema version recorded in the database.

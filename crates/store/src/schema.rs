@@ -34,18 +34,34 @@ use crate::error::store_error;
 
 /// The schema version this build writes and understands.
 ///
-/// | Version | What it introduced |
+/// # What a version means here
+///
+/// It records **which build wrote the file**, not what the file contains. Tables are created
+/// lazily by whichever subsystem defines them (see
+/// [the module documentation](self#what-a-migration-is-and-is-not)), so a kernel assembled
+/// without `aik-memory` still stamps a file with the version below and simply never creates
+/// `mem.*`. Reading a version as an inventory of tables would therefore be wrong; reading it
+/// as a lower bound on the build that last had the file is exactly right, and is the only
+/// thing this value is used for.
+///
+/// | Version | Refuses builds that predate |
 /// |---|---|
-/// | 1 | The empty schema: the meta table and nothing else. |
-/// | 2 | `context.sessions`, `context.records` and `context.record_ids`, owned by `aik-context`. |
-/// | 3 | `mem.records`, `mem.by_kind` and `mem.by_expiry`, owned by `aik-memory`. |
+/// | 1 | — (never released; the store's first published version was 2) |
+/// | 2 | `context.sessions`, `context.records`, `context.record_ids`, owned by `aik-context` |
+/// | 3 | `mem.records`, `mem.by_kind`, `mem.by_expiry`, owned by `aik-memory` |
+/// | 4 | `mem.by_owner`, and the `owner` field every `mem.records` row now carries |
+/// | 5 | `sched.jobs`, owned by `aik-scheduler` |
 ///
 /// A subsystem that adds tables raises this even though redb needs no migration to create
-/// one (see [the module documentation](self#what-a-migration-is-and-is-not)). The version
-/// is what stops an older build from opening the file afterwards, and an older build is
-/// exactly the one that does not know those tables exist — so it would not preserve them
-/// through a compaction, a repair or a `clear` that walks the schema.
-pub const SCHEMA_VERSION: u32 = 3;
+/// one. The version is what stops an older build from opening the file afterwards, and an
+/// older build is exactly the one that does not know those tables exist — so it would not
+/// preserve them through a compaction, a repair or a `clear` that walks the schema. That is
+/// the whole of what a bump buys, and it is worth a bump on its own.
+///
+/// For the scheduler the argument is sharper than "space is not reclaimed": an older build
+/// silently dropping `sched.jobs` would leave a system that looks healthy while the work it
+/// was told to do at 3am simply never happens again.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The table holding the store's own bookkeeping, keyed by a short ASCII name.
 ///
@@ -72,9 +88,31 @@ impl std::fmt::Debug for Migration {
 
 /// Every migration this build knows, in ascending order of [`Migration::to`].
 ///
-/// Empty at version 1: there is no earlier released version to migrate from. Adding one
-/// means appending an entry here *and* raising [`SCHEMA_VERSION`] to match its `to`; the
-/// invariant between the two is checked by [`migrate`] on every open.
+/// Still empty, which is a claim about released versions rather than about luck:
+///
+/// * **1** was never released; the store's first published version was 2.
+/// * **2 → 3** added tables. redb creates a table on first `open_table`, so there was
+///   nothing to transform (see [the module documentation](self#what-a-migration-is-and-is-not)).
+/// * **3 → 4** added the `owner` field to `mem.records` and the `mem.by_owner` index, which
+///   *is* a change of shape — but version 3 was never released either, so no database
+///   outside a working tree can hold a `mem.records` row in the old shape. One that somehow
+///   does fails loudly when the row will not decode, rather than being silently read as
+///   though the field had a sensible default; there is no defensible default for "whose
+///   memory is this".
+/// * **4 → 5** added `sched.jobs`. A table, so again nothing to transform.
+///
+/// Adding a real migration means appending an entry here *and* raising [`SCHEMA_VERSION`] to
+/// match its `to`; the invariant between the two is checked by [`migrate`] on every open.
+///
+/// # An open question, deliberately not answered yet
+///
+/// A migration that transforms a subsystem's rows has to know that subsystem's encoding,
+/// which this crate deliberately does not — it owns `aik.meta` and nothing else. Every
+/// migration so far has been a no-op, so the question of where such code lives (here, with
+/// rows treated as opaque JSON; or registered by the subsystem that owns the table) has not
+/// had to be answered. It should be answered the first time a *released* version needs its
+/// data transformed, and not before, because the shape of that first real migration is what
+/// should decide it.
 pub(crate) const MIGRATIONS: &[Migration] = &[];
 
 /// Brings a database up to `target`, or fails without modifying it.

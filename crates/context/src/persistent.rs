@@ -40,6 +40,11 @@
 //! await — which would pin redb's single write slot for as long as the async task took to
 //! be polled again.
 //!
+//! Writers queue on [`Db::writes`] first, so that a burst waits on one lock rather than
+//! occupying a blocking-pool thread each to wait inside `begin_write`. That queue belongs to
+//! the database rather than to this store precisely because the memory store shares the file:
+//! see [`Db::writes`] for why a per-subsystem queue would not hold.
+//!
 //! # Reading a whole session to build a window
 //!
 //! [`ContextStore::window`] loads every record of the session and hands them to the same
@@ -69,7 +74,6 @@ use aik_store::redb::{
 use aik_store::{Db, store_error};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use crate::session::{AssemblyReporter, authorize, principal_of};
 use crate::store::DEFAULT_MAX_RECORDS_PER_SESSION;
@@ -152,14 +156,6 @@ pub struct RedbContextStore {
     clock: SharedClock,
     reporter: AssemblyReporter,
     max_records: usize,
-    /// Serialises writers before they reach a blocking thread.
-    ///
-    /// redb already allows only one write transaction at a time and blocks the rest, but it
-    /// blocks them *inside* `begin_write`, on a thread from tokio's blocking pool. Queueing
-    /// here instead means a burst of concurrent appends occupies one pool thread rather than
-    /// one per caller, leaving the pool for the work that can actually proceed — filesystem
-    /// tools, mostly. It costs no throughput: the writes were going to be serialised anyway.
-    writes: Mutex<()>,
 }
 
 impl std::fmt::Debug for RedbContextStore {
@@ -186,7 +182,6 @@ impl RedbContextStore {
             clock: Arc::new(SystemClock),
             reporter: AssemblyReporter::silent(ComponentId::new(crate::DEFAULT_COMPONENT_ID)),
             max_records: DEFAULT_MAX_RECORDS_PER_SESSION,
-            writes: Mutex::new(()),
         })
     }
 
@@ -250,7 +245,7 @@ impl ContextStore for RedbContextStore {
         let now = self.clock.now();
         let max_records = self.max_records;
 
-        let _queued = self.writes.lock().await;
+        let _queued = self.db.writes().lock().await;
         let joined = tokio::task::spawn_blocking(move || {
             append_blocking(
                 db.database(),
@@ -334,7 +329,7 @@ impl ContextStore for RedbContextStore {
         let principal = principal_of(cx);
         let session = *session;
 
-        let _queued = self.writes.lock().await;
+        let _queued = self.db.writes().lock().await;
         let joined =
             tokio::task::spawn_blocking(move || clear_blocking(db.database(), session, &principal))
                 .await;

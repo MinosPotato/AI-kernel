@@ -36,6 +36,25 @@
 //! # }
 //! ```
 //!
+//! # Security
+//!
+//! A record belongs to the principal that stored it. [`crate::owner`] holds the reasoning;
+//! the short version is that the owner is taken from the
+//! [`ExecutionContext`](aik_api::execution::ExecutionContext) and never from the record, so
+//! content a model produced cannot choose whose memory it becomes, and a replacement keeps
+//! the owner it already had, so an agent revising a memory on its principal's behalf does not
+//! thereby acquire it.
+//!
+//! Naming another principal's record is
+//! [`Error::PermissionDenied`](aik_core::Error::PermissionDenied); enumerating simply does
+//! not return it, because an error would confirm it exists. The rule itself is
+//! [`Principal::may_act_for`](aik_api::permission::Principal::may_act_for), shared with the
+//! context store so the two subsystems cannot answer the same question differently.
+//!
+//! The sweep is the one operation that is not principal-scoped, deliberately: retention is a
+//! property of the record, and housekeeping that could only reclaim the records of whoever
+//! happened to trigger it would leave everyone else's expired data on disk indefinitely.
+//!
 //! # What this deliberately does not do
 //!
 //! * **It does not rank by meaning.** [`MemoryQuery`](aik_api::memory::MemoryQuery) can
@@ -50,21 +69,20 @@
 //! * **It does not decide what is worth remembering.** That policy — what to write, when to
 //!   forget it early, how to reconcile two records about the same fact — belongs to whatever
 //!   calls [`MemoryStore::put`](aik_api::memory::MemoryStore::put), not to the store.
-//! * **It does not scope records to a principal.** Unlike a context session, a
-//!   [`MemoryRecord`](aik_api::memory::MemoryRecord) carries no owner, and the trait carries
-//!   no session to check one against. Anything that must not leak between users has to
-//!   enforce that above this crate, e.g. by namespacing kinds or ids per principal. The
-//!   `cx` parameter every method takes is therefore unused today; it exists so this trait
-//!   can grow attribution or audit reporting later — as [`ContextStore`](aik_api::context)
-//!   did — without changing every implementation's signature again.
+//! * **It does not decide retention policy.** Records expire if something set
+//!   `expires_at`; nothing here decides what that should be for a given kind, because that
+//!   is a judgement about the value of a memory rather than about storing one.
 
 mod component;
 mod expiry;
+mod owner;
 mod persistent;
 mod query;
 mod store;
 
-pub use component::{DEFAULT_COMPONENT_ID, DEFAULT_EXPIRY_SWEEP_INTERVAL, MemoryComponent, RedbMemoryComponent};
-pub use expiry::ExpirySweeper;
+pub use component::{
+    DEFAULT_COMPONENT_ID, DEFAULT_EXPIRY_SWEEP_INTERVAL, MemoryComponent, RedbMemoryComponent,
+};
+pub use expiry::{DEFAULT_SWEEP_BATCH, ExpirySweeper};
 pub use persistent::RedbMemoryStore;
 pub use store::InMemoryMemoryStore;

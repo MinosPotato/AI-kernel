@@ -100,7 +100,8 @@ impl MemoryComponent {
 #[async_trait]
 impl Component for MemoryComponent {
     fn descriptor(&self) -> ComponentDescriptor {
-        ComponentDescriptor::new(self.id.clone()).described("in-memory record store with a periodic expiry sweep")
+        ComponentDescriptor::new(self.id.clone())
+            .described("in-memory record store with a periodic expiry sweep")
     }
 
     async fn init(&self, ctx: &ComponentContext) -> Result<()> {
@@ -122,7 +123,12 @@ impl Component for MemoryComponent {
     async fn start(&self, ctx: &ComponentContext) -> Result<()> {
         let store = self.store.get().expect("init runs before start").clone();
         let sweeper: Arc<dyn ExpirySweeper> = store;
-        spawn_expiry_task(ctx.tasks(), ctx.clock().clone(), sweeper, self.expiry_interval);
+        spawn_expiry_task(
+            ctx.tasks(),
+            ctx.clock().clone(),
+            sweeper,
+            self.expiry_interval,
+        );
         Ok(())
     }
 }
@@ -238,7 +244,12 @@ impl Component for RedbMemoryComponent {
     async fn start(&self, ctx: &ComponentContext) -> Result<()> {
         let store = self.store.get().expect("init runs before start").clone();
         let sweeper: Arc<dyn ExpirySweeper> = store;
-        spawn_expiry_task(ctx.tasks(), ctx.clock().clone(), sweeper, self.expiry_interval);
+        spawn_expiry_task(
+            ctx.tasks(),
+            ctx.clock().clone(),
+            sweeper,
+            self.expiry_interval,
+        );
         Ok(())
     }
 }
@@ -285,8 +296,14 @@ mod tests {
 
     #[test]
     fn a_named_database_is_what_the_dependency_points_at() {
-        let descriptor = RedbMemoryComponent::new().with_database("store.db.memories").descriptor();
-        let named: Vec<&ComponentId> = descriptor.dependencies.iter().map(|dependency| &dependency.id).collect();
+        let descriptor = RedbMemoryComponent::new()
+            .with_database("store.db.memories")
+            .descriptor();
+        let named: Vec<&ComponentId> = descriptor
+            .dependencies
+            .iter()
+            .map(|dependency| &dependency.id)
+            .collect();
         assert_eq!(named, vec![&ComponentId::new("store.db.memories")]);
     }
 

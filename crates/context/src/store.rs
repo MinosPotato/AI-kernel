@@ -162,6 +162,26 @@ impl ContextStore for InMemoryContextStore {
         let tokens = self.counter.count_message(&entry.message);
 
         let mut sessions = self.sessions.write().expect("context store lock poisoned");
+
+        // Both checks happen before the session is created, so that a refused append leaves
+        // no trace of the session it was refused from. The persistent store gets that for
+        // free — its transaction aborts — and the two must not differ: a store where a
+        // rejected first append conjures an empty owned session, and one where it does not,
+        // are two different contracts however narrow the case that separates them.
+        if let Some(state) = sessions.get(session) {
+            authorize(session, &state.owner, &principal)?;
+            if state.records.len() >= self.max_records {
+                return Err(Error::other(format!(
+                    "context session `{session}` is full at {} records; compact or clear it",
+                    self.max_records
+                )));
+            }
+        } else if self.max_records == 0 {
+            return Err(Error::other(format!(
+                "context session `{session}` is full at 0 records; compact or clear it"
+            )));
+        }
+
         let state = sessions.entry(*session).or_insert_with(|| SessionState {
             owner: principal.id.clone(),
             created_at: now,
@@ -171,14 +191,6 @@ impl ContextStore for InMemoryContextStore {
             records: Vec::new(),
             index: HashMap::new(),
         });
-        authorize(session, &state.owner, &principal)?;
-
-        if state.records.len() >= self.max_records {
-            return Err(Error::other(format!(
-                "context session `{session}` is full at {} records; compact or clear it",
-                self.max_records
-            )));
-        }
 
         let record = ContextRecord {
             id: ContextId::new(),

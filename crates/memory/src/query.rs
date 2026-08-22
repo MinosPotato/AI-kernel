@@ -34,7 +34,10 @@ pub(crate) fn requested_kinds(query: &MemoryQuery) -> Vec<MemoryKind> {
 
 /// Whether every key the query names is present in the record's metadata with an equal
 /// value. An empty filter matches everything.
-pub(crate) fn matches_metadata(record: &MemoryRecord, filter: &serde_json::Map<String, serde_json::Value>) -> bool {
+pub(crate) fn matches_metadata(
+    record: &MemoryRecord,
+    filter: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
     filter
         .iter()
         .all(|(key, value)| record.metadata.get(key) == Some(value))
@@ -46,13 +49,20 @@ pub(crate) fn matches_metadata(record: &MemoryRecord, filter: &serde_json::Map<S
 /// why — so "best" falls back to the most recently created record, tie-broken by id so the
 /// order is deterministic even for records created in the same millisecond.
 pub(crate) fn rank(mut candidates: Vec<MemoryRecord>, limit: Option<usize>) -> Vec<MemoryMatch> {
-    candidates.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+    candidates.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
     if let Some(limit) = limit {
         candidates.truncate(limit);
     }
     candidates
         .into_iter()
-        .map(|record| MemoryMatch { record, score: None })
+        .map(|record| MemoryMatch {
+            record,
+            score: None,
+        })
         .collect()
 }
 
@@ -95,7 +105,11 @@ mod tests {
     #[test]
     fn requested_kinds_are_deduplicated_and_sorted() {
         let query = MemoryQuery {
-            kinds: vec![MemoryKind::new("b"), MemoryKind::new("a"), MemoryKind::new("b")],
+            kinds: vec![
+                MemoryKind::new("b"),
+                MemoryKind::new("a"),
+                MemoryKind::new("b"),
+            ],
             ..Default::default()
         };
         assert_eq!(
@@ -120,7 +134,10 @@ mod tests {
 
     #[test]
     fn an_empty_filter_matches_everything() {
-        assert!(matches_metadata(&record("fact", 1), &serde_json::Map::new()));
+        assert!(matches_metadata(
+            &record("fact", 1),
+            &serde_json::Map::new()
+        ));
     }
 
     #[test]
