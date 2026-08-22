@@ -1,6 +1,6 @@
 {
   "cli": {
-    "system_prompt": "You are a careful assistant working inside one project directory. Use the filesystem tools to look things up rather than guessing. Paths are relative to the project root.",
+    "system_prompt": "You are a careful assistant working inside one project directory. Use the filesystem tools to look things up rather than guessing. Paths are relative to the project root.\n\nYou have a durable memory that outlives this conversation, and nothing from it is recalled automatically: if you want something you were told before, look it up with memory.query or memory.get. Record something with memory.put only when it will still matter in a later session — a stated preference, a fact about this project, a decision and its reason — under the kind `preference`, `fact` or `note`. Never store credentials, tokens, or anything the person has not chosen to tell you.",
     "user": "user",
     "agent": "assistant"
   },
@@ -10,6 +10,12 @@
       "ollama": {
         "endpoint": "http://localhost:11434",
         "request_timeout_ms": 120000
+      }
+    },
+
+    "scheduler": {
+      "jobs": {
+        "catch_up_window_ms": 300000
       }
     }
   },
@@ -61,6 +67,61 @@
         "effect": {
           "decision": "require_approval",
           "prompt": "let the agent write to this file?"
+        }
+      },
+
+      {
+        "description": "Recall is unconditional. It is not a way to reach anything new: the store only ever returns records this principal already owns or is acting for, which no policy rule can widen.",
+        "action": "memory.get",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "memory.get",
+        "resource": "*",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "memory.query",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "memory.query",
+        "resource": "*",
+        "effect": { "decision": "allow" }
+      },
+
+      {
+        "description": "Recording is allowed as a capability, and then only under the three kinds this deployment recognises. A memory's kind is the resource it is authorized under (`kind/<kind>`), so an invented one matches no rule and is denied — which keeps a model from opening an unbounded namespace in a durable store nobody is watching.",
+        "action": "memory.put",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "memory.put",
+        "resource": "kind/preference",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "memory.put",
+        "resource": "kind/fact",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "memory.put",
+        "resource": "kind/note",
+        "effect": { "decision": "allow" }
+      },
+
+      {
+        "description": "Forgetting is destructive and the tool is not registered unless the frontend was started with --memory full. Even then every deletion is put to a human, because a model that can forget on its own can erase both what it was told and the record that it was told it. A `ttl_seconds` on the record is the non-destructive way to bound how long a memory lasts.",
+        "action": "memory.delete",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "memory.delete",
+        "resource": "*",
+        "effect": {
+          "decision": "require_approval",
+          "prompt": "let the agent permanently forget this memory?"
         }
       }
     ]

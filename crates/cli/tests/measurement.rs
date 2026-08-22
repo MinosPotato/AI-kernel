@@ -53,8 +53,8 @@ async fn a_request_measured_event_is_published_for_a_plain_turn() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].turn, 1);
     assert_eq!(
-        events[0].estimate.tools_offered, 2,
-        "read + list by default"
+        events[0].estimate.tools_offered, 5,
+        "the default tool set: filesystem read and list, memory get, query and put",
     );
     // The scripted provider in this harness never reports usage — see `Reply::into_response`
     // — so provider usage must be absent rather than fabricated.

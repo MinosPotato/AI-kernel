@@ -38,8 +38,11 @@ cargo run -p aik-cli -- --config crates/cli/aik.example.json --root .
 
 [`crates/cli/aik.example.json`](../crates/cli/aik.example.json) is a real, working policy:
 reads and directory listings are allowed outright, `.env` and `.ssh` are denied regardless of
-anything else, and writes are allowed as a capability but every individual file requires a
-human's approval.
+anything else, writes are allowed as a capability but every individual file requires a human's
+approval, recall is unconditional, memories may be recorded only under the three kinds it
+names, and every deletion is put to a human. It is exercised by the test suite
+(`durable.rs`, `the_shipped_example_configuration_describes_the_system_that_exists`), so it
+cannot drift away from the system it describes without a test failing.
 
 ## Selecting a model
 
@@ -74,7 +77,8 @@ the run one-shot. This is not just a convenience distinction — see
 In interactive mode:
 
 - `/new` starts a fresh conversation (new session id; the old one is untouched and still in
-  memory for the life of the process, just not attached to the prompt anymore).
+  the store, just not attached to the prompt anymore — and, on a durable run, still there
+  after the process exits).
 - `/session` prints the current session id and who is acting.
 - `/tools` prints the agent's declared tool set, or explains that it is unrestricted (offered
   whatever the tool registry lists).
@@ -112,6 +116,9 @@ it and cannot widen it either.
 `--no-tools` and `--write` together are a usage error (`aik: --no-tools and --write contradict
 each other`), rejected before anything starts, rather than silently picking one.
 
+`--no-tools` means *no tools*, memory included; see [Memory](#memory-what-the-agent-may-keep)
+below.
+
 This is the **outer** limit on what an agent can do: a tool that was never registered cannot be
 reached however permissive the policy is. Policy is the **inner** limit, applied to whatever
 was registered. Both apply; neither substitutes for the other. Concretely: without `--write`,
@@ -119,6 +126,118 @@ a model asking to write a file never reaches the tool registry at all — the ag
 "no tool named `filesystem.write` is available to this agent" itself, because the tool name is
 outside the fixed set the run was given, and the model just sees that as a normal tool-error
 result it can react to.
+
+## Memory: what the agent may keep
+
+```bash
+aik --memory recall ...    # get + query
+aik --memory remember ...  # the default: get + query + put
+aik --memory full ...      # also delete
+aik --memory off ...       # no memory tools at all
+```
+
+| `--memory` | Tools registered |
+|---|---|
+| `off` | none |
+| `recall` | `memory.get`, `memory.query` |
+| `remember` (default) | `memory.get`, `memory.query`, `memory.put` |
+| `full` | all four, including `memory.delete` |
+
+This is the same **outer** limit `--write`/`--no-tools` is for the filesystem, applied to the
+record store: a memory tool that was never registered cannot be reached however permissive the
+policy is. Policy is the inner limit and applies to whatever was registered.
+
+`--memory` combined with `--no-tools` is a usage error, for the same reason `--write` is.
+
+### Why `delete` is not on by default
+
+Deletion is the one memory operation that destroys evidence. A model that can forget on its
+own can erase both what it was told to do and the record that it was told, so it is withheld
+twice over: the tool is not registered unless `--memory full` asks for it, and the shipped
+policy still routes every deletion through `require_approval`. Bounding how long a memory
+lasts without destroying anything is what `ttl_seconds` on the record is for, and it needs no
+tool.
+
+### Nothing is recalled automatically
+
+No memory is read into a prompt on the agent's behalf and nothing watches a conversation for
+facts worth keeping. Every memory in the store is one a model asked for and a policy allowed,
+which is what makes the audit trail complete. The consequence is that the model has to be told
+its memory exists and when to use it — the shipped `cli.system_prompt` in
+[`crates/cli/aik.example.json`](../crates/cli/aik.example.json) does exactly that, and is
+where to change the deployment's own judgement about what is worth remembering.
+
+### Ownership
+
+A memory belongs to the principal that stored it, which for this frontend is the **agent**
+identity (`-a`/`--agent`), not the user. Naming another principal's record is
+`PermissionDenied`; enumerating simply does not return it, because an error would confirm it
+exists. Delegation runs one way: a run started as `--agent helper --user assistant` is
+`Principal::new("helper", Agent).on_behalf_of("assistant")` and can therefore reach
+`assistant`'s memories, while `assistant` cannot reach `helper`'s.
+
+## Persistence: the shared database
+
+```bash
+aik ...                        # durable, at the XDG default
+aik --db /srv/aik/state.redb   # durable, somewhere specific
+aik --ephemeral                # nothing reaches the disk
+```
+
+One [redb](https://github.com/cberner/redb) database holds three subsystems' state: the
+conversation transcript (`aik-context`), the agent's memories (`aik-memory`), and any
+scheduled job marked persistent (`aik-scheduler`). One file rather than three because redb
+takes an exclusive lock per file and because one schema version cannot disagree with itself.
+
+The path is resolved with this precedence, highest first:
+
+1. `--db <FILE>`
+2. `components.store.db.path` in the configuration
+3. `$XDG_DATA_HOME/aik/aik.redb`, falling back to `$HOME/.local/share/aik/aik.redb`
+
+**Watch the nesting.** The component's id is `store.db`, and each dot in a component id is
+another level of object, so the key is:
+
+```json
+{ "components": { "store": { "db": { "path": "/srv/aik/state.redb" } } } }
+```
+
+Writing `{"components": {"store.db": {...}}}` parses, starts, and silently opens the XDG
+default instead.
+
+With neither `XDG_DATA_HOME` nor `HOME` set and no path configured, `aik` refuses to start:
+
+```
+aik: components.store.db.path: neither XDG_DATA_HOME nor HOME is set, so there is no
+default location for the database; set the path explicitly
+```
+
+That is deliberate. The working directory would drop a file holding every transcript wherever
+the process happened to launch from, somewhere a backup or a repository could pick it up; a
+temporary directory would lose it at the next reboot. Both are worse than not starting.
+
+The file is created `0600` inside a directory created `0700`, and an existing file other
+accounts can read is refused rather than used. A database written by a *newer* build of `aik`
+is also refused, because an older binary writing to it would silently drop fields it does not
+know about.
+
+### `--ephemeral`
+
+Opens no database. The context store, the memory store and the scheduler are all wired to
+their in-memory implementations, publishing the same capabilities under the same component
+ids, so nothing downstream can tell the difference except by outliving a restart. A job asked
+to be persistent is refused with `Unsupported` rather than accepted and forgotten — the one
+outcome that would let a deployment believe its nightly job exists.
+
+`--ephemeral` and `--db` together are a usage error.
+
+### Releasing the file
+
+redb's lock is held by the `Arc<Db>` the kernel registry owns, and the registry outlives
+`Kernel::shutdown`. So a cleanly shut-down kernel is still holding the file; releasing it
+means dropping the `Kernel`. In the binary that is process exit, so it never comes up; in a
+test or an in-process restart it does, and the suite asserts it (`durable.rs`,
+`shutdown_releases_the_database_so_the_next_run_can_open_it`).
 
 ## Configuration and policy files
 
@@ -226,6 +345,40 @@ Read-write, writes require a human:
       "effect": { "decision": "require_approval", "prompt": "let the agent write this file?" } }
 ] }
 ```
+
+Memory: recall freely, record only under kinds this deployment recognises. The kind a memory
+is stored under *is* the resource it is authorized as (`kind/<kind>`), so an invented kind
+matches no rule and is denied — which is how a model is kept from opening an unbounded
+namespace in a durable store nobody is watching:
+
+```json
+{ "rules": [
+    { "action": "memory.get", "effect": { "decision": "allow" } },
+    { "action": "memory.get", "resource": "*", "effect": { "decision": "allow" } },
+    { "action": "memory.query", "effect": { "decision": "allow" } },
+    { "action": "memory.query", "resource": "*", "effect": { "decision": "allow" } },
+    { "action": "memory.put", "effect": { "decision": "allow" } },
+    { "action": "memory.put", "resource": "kind/preference", "effect": { "decision": "allow" } },
+    { "action": "memory.put", "resource": "kind/fact", "effect": { "decision": "allow" } },
+    { "action": "memory.put", "resource": "kind/note", "effect": { "decision": "allow" } }
+] }
+```
+
+A `memory.query` call that names *no* kind is asking for every kind, so it cannot honestly be
+authorized as any single one: it claims the literal resource `kind/*` instead. The `"*"` rule
+above matches that, so the unrestricted query is allowed here. Scope `memory.query` to named
+kinds instead —
+
+```json
+{ "action": "memory.query", "resource": "kind/note", "effect": { "decision": "allow" } }
+```
+
+— and the unrestricted query is denied, because `kind/note` does not match `kind/*`. The query
+then has to say what it is looking for.
+
+Ownership is applied *after* the policy has spoken, and independently of it: a query returns
+only records the calling principal owns or is acting for, so no rule here widens what anyone
+can see.
 
 Resource-specific carve-out (see the two-phase note above for why the first rule is required):
 
@@ -476,9 +629,10 @@ on every access.
 ## Context and session behaviour
 
 - Each turn appends the user's input, then the model's response (including any tool calls), to
-  the session's transcript — an append-only, full-fidelity record kept for the life of the
-  process (there is no persistence across restarts; see
-  [Known limitations](#other-known-limitations-not-bugs)).
+  the session's transcript — an append-only, full-fidelity record, kept in the shared database
+  and therefore still there after a restart (see
+  [Persistence](#persistence-the-shared-database); `--ephemeral` keeps it for the life of the
+  process instead).
 - What is actually *sent* to the model each turn is recomputed from that transcript under a
   budget (default 8192 tokens, 1024 tokens per part) — not the raw history. Oversized tool
   results are elided (the bulk replaced by a marker naming the record, the full value still
@@ -585,11 +739,22 @@ after each.
 
 These are documented, deliberate properties of the current implementation, not defects:
 
-- **No persistence.** The context store and the approval broker are both in-memory; a restart
-  loses every session and refuses every approval that was mid-flight. `aik-context`'s own docs
-  call this out as intentional for the first implementation.
+- **The approval broker is in-memory.** A restart refuses every approval that was mid-flight.
+  This is correct rather than a gap: an approval is a question put to a person who is no
+  longer there, and reviving one across a restart would mean acting on consent nobody gave in
+  this process.
+- **Sessions persist, but the frontend does not resume one.** The transcript survives a
+  restart in the shared database, and `/new` still starts a fresh session id every run; there
+  is no `--session <ID>` to reattach to a previous conversation. What survives is readable and
+  owned, not automatically reopened.
 - **No summarisation or semantic memory.** Context management is purely mechanical (elision and
-  eviction under a byte-heuristic token count); nothing invents or compresses text.
+  eviction under a byte-heuristic token count); nothing invents or compresses text. Memory
+  retrieval is exact — by id, by kind, by metadata equality — and a query asking for semantic
+  ranking gets `Unsupported` rather than a result that quietly ignored the request.
+- **Nothing schedules anything by default.** The scheduler is wired and its persistent jobs
+  survive a restart, but the frontend registers no job handlers and offers no tool for
+  scheduling, so a stock `aik` has an empty schedule. Handlers are contributed by components,
+  which is what `crates/cli/tests/durable.rs` does.
 - **The heuristic token counter is an estimate**, not the model's real tokenizer — Ollama's
   reported `prompt_eval_count` and the CLI's own `window tokens` figure routinely differ by an
   order of magnitude once tool schemas are counted (see
