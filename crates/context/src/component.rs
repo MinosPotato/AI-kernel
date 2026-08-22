@@ -5,13 +5,15 @@
 //! context store, and choosing the durable one is meant to be a one-line change that leaves
 //! every dependant, and any `components.context.store` configuration, exactly as it was.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use aik_api::context::{ContextStore, TokenCounter};
 use aik_core::prelude::*;
 use aik_store::Db;
 
 use crate::persistent::RedbContextStore;
+use crate::retention::{DEFAULT_RETENTION_SWEEP_INTERVAL, RetentionSweeper, spawn_retention_task};
 use crate::store::{DEFAULT_MAX_RECORDS_PER_SESSION, InMemoryContextStore};
 use crate::tokens::HeuristicTokenCounter;
 
@@ -43,6 +45,9 @@ pub struct ContextComponent {
     default: bool,
     counter: Option<Arc<dyn TokenCounter>>,
     max_records: usize,
+    retention: Option<Duration>,
+    retention_interval: Duration,
+    store: OnceLock<Arc<InMemoryContextStore>>,
 }
 
 impl std::fmt::Debug for ContextComponent {
@@ -52,6 +57,8 @@ impl std::fmt::Debug for ContextComponent {
             .field("default", &self.default)
             .field("token_counter_configured", &self.counter.is_some())
             .field("max_records_per_session", &self.max_records)
+            .field("retention", &self.retention)
+            .field("retention_interval", &self.retention_interval)
             .finish()
     }
 }
@@ -71,6 +78,9 @@ impl ContextComponent {
             default: true,
             counter: None,
             max_records: DEFAULT_MAX_RECORDS_PER_SESSION,
+            retention: None,
+            retention_interval: DEFAULT_RETENTION_SWEEP_INTERVAL,
+            store: OnceLock::new(),
         }
     }
 
@@ -102,6 +112,33 @@ impl ContextComponent {
         self.max_records = max_records;
         self
     }
+
+    /// Removes sessions nothing has appended to for `retention`, on a timer.
+    ///
+    /// Off unless called, deliberately: this is the only switch in the crate that destroys
+    /// data the owner still has, and a transcript store that quietly deleted last month's
+    /// conversations because nobody configured it otherwise would be a data-loss bug
+    /// shipped as a default. See [`crate::RetentionSweeper`] for the rule and
+    /// [`DEFAULT_RETENTION_SWEEP_INTERVAL`] for how often it is applied.
+    ///
+    /// The clock is [`ContextStats::updated_at`](aik_api::context::ContextStats::updated_at),
+    /// which only an append moves — so a session somebody is still using never expires, and
+    /// compacting one does not buy it more time.
+    #[must_use]
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+
+    /// Overrides how often the retention sweep runs.
+    ///
+    /// Does nothing on its own: with no [`with_retention`](Self::with_retention) there is no
+    /// sweep to schedule.
+    #[must_use]
+    pub fn with_retention_interval(mut self, interval: Duration) -> Self {
+        self.retention_interval = interval;
+        self
+    }
 }
 
 #[async_trait]
@@ -125,14 +162,37 @@ impl Component for ContextComponent {
             .with_events(ctx.events().clone(), self.id.clone())
             .with_max_records(self.max_records);
 
-        let store: Arc<dyn ContextStore> = Arc::new(store);
+        let store = Arc::new(store);
+        // Set before publishing: `start` looks the concrete store up here to drive the
+        // sweep, and must never find the slot empty for a component that finished `init`.
+        self.store
+            .set(store.clone())
+            .expect("init runs at most once per component");
+
+        let published: Arc<dyn ContextStore> = store;
         if self.default {
-            ctx.provide_default::<dyn ContextStore>(store)?;
+            ctx.provide_default::<dyn ContextStore>(published)?;
             ctx.provide_default::<dyn TokenCounter>(counter)
         } else {
-            ctx.provide::<dyn ContextStore>(store)?;
+            ctx.provide::<dyn ContextStore>(published)?;
             ctx.provide::<dyn TokenCounter>(counter)
         }
+    }
+
+    async fn start(&self, ctx: &ComponentContext) -> Result<()> {
+        let Some(retention) = self.retention else {
+            return Ok(());
+        };
+        let sweeper: Arc<dyn RetentionSweeper> =
+            self.store.get().expect("init runs before start").clone();
+        spawn_retention_task(
+            ctx.tasks(),
+            ctx.clock().clone(),
+            sweeper,
+            self.retention_interval,
+            retention,
+        );
+        Ok(())
     }
 }
 
@@ -164,6 +224,9 @@ pub struct RedbContextComponent {
     default: bool,
     counter: Option<Arc<dyn TokenCounter>>,
     max_records: usize,
+    retention: Option<Duration>,
+    retention_interval: Duration,
+    store: OnceLock<Arc<RedbContextStore>>,
 }
 
 impl std::fmt::Debug for RedbContextComponent {
@@ -174,6 +237,8 @@ impl std::fmt::Debug for RedbContextComponent {
             .field("default", &self.default)
             .field("token_counter_configured", &self.counter.is_some())
             .field("max_records_per_session", &self.max_records)
+            .field("retention", &self.retention)
+            .field("retention_interval", &self.retention_interval)
             .finish()
     }
 }
@@ -194,6 +259,9 @@ impl RedbContextComponent {
             default: true,
             counter: None,
             max_records: DEFAULT_MAX_RECORDS_PER_SESSION,
+            retention: None,
+            retention_interval: DEFAULT_RETENTION_SWEEP_INTERVAL,
+            store: OnceLock::new(),
         }
     }
 
@@ -235,6 +303,33 @@ impl RedbContextComponent {
         self.max_records = max_records;
         self
     }
+
+    /// Removes sessions nothing has appended to for `retention`, on a timer.
+    ///
+    /// Off unless called, deliberately: this is the only switch in the crate that destroys
+    /// data the owner still has, and a transcript store that quietly deleted last month's
+    /// conversations because nobody configured it otherwise would be a data-loss bug
+    /// shipped as a default. See [`crate::RetentionSweeper`] for the rule and
+    /// [`DEFAULT_RETENTION_SWEEP_INTERVAL`] for how often it is applied.
+    ///
+    /// The clock is [`ContextStats::updated_at`](aik_api::context::ContextStats::updated_at),
+    /// which only an append moves — so a session somebody is still using never expires, and
+    /// compacting one does not buy it more time.
+    #[must_use]
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+
+    /// Overrides how often the retention sweep runs.
+    ///
+    /// Does nothing on its own: with no [`with_retention`](Self::with_retention) there is no
+    /// sweep to schedule.
+    #[must_use]
+    pub fn with_retention_interval(mut self, interval: Duration) -> Self {
+        self.retention_interval = interval;
+        self
+    }
 }
 
 #[async_trait]
@@ -260,14 +355,35 @@ impl Component for RedbContextComponent {
             .with_events(ctx.events().clone(), self.id.clone())
             .with_max_records(self.max_records);
 
-        let store: Arc<dyn ContextStore> = Arc::new(store);
+        let store = Arc::new(store);
+        self.store
+            .set(store.clone())
+            .expect("init runs at most once per component");
+
+        let published: Arc<dyn ContextStore> = store;
         if self.default {
-            ctx.provide_default::<dyn ContextStore>(store)?;
+            ctx.provide_default::<dyn ContextStore>(published)?;
             ctx.provide_default::<dyn TokenCounter>(counter)
         } else {
-            ctx.provide::<dyn ContextStore>(store)?;
+            ctx.provide::<dyn ContextStore>(published)?;
             ctx.provide::<dyn TokenCounter>(counter)
         }
+    }
+
+    async fn start(&self, ctx: &ComponentContext) -> Result<()> {
+        let Some(retention) = self.retention else {
+            return Ok(());
+        };
+        let sweeper: Arc<dyn RetentionSweeper> =
+            self.store.get().expect("init runs before start").clone();
+        spawn_retention_task(
+            ctx.tasks(),
+            ctx.clock().clone(),
+            sweeper,
+            self.retention_interval,
+            retention,
+        );
+        Ok(())
     }
 }
 

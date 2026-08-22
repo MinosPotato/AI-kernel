@@ -52,7 +52,32 @@
 //!   restart does not lose the conversation. Both run the same conformance tests.
 //! * [`HeuristicTokenCounter`] — a provider-neutral size estimate, so budgeting works out of
 //!   the box without the kernel acquiring a tokenizer.
+//! * [`RetentionSweeper`] — the housekeeping half: removing sessions nobody came back to,
+//!   off unless a component is told a retention period.
 //! * [`ContextComponent`] and [`RedbContextComponent`] — the kernel wiring for each.
+//!
+//! # The lifecycle
+//!
+//! A durable transcript that could only be created and appended to was a store with no way
+//! out of itself: sessions accumulated, none could be listed, none could be resumed by
+//! anything that had lost the id, and one that reached
+//! [`DEFAULT_MAX_RECORDS_PER_SESSION`] was permanently unusable. The contract now covers the
+//! whole of it, and each step is deterministic and owner-scoped:
+//!
+//! ```text
+//! create ──▶ append ──▶ enumerate ──▶ resume ──▶ compact ──▶ clear
+//!  first      append()   sessions()    the id     compact()   clear()
+//!  append                (filtered)    again      (bounded)   (whole)
+//!                                                     │
+//!                                         expire ◀────┘
+//!                                      RetentionSweeper, on a timer
+//! ```
+//!
+//! `sessions()` is the one step that filters rather than refusing — enumerating for a
+//! principal must not become a way to learn that another principal's session exists. Every
+//! step that *names* a session still fails closed with `PermissionDenied`. `compact()` is
+//! what makes the record bound recoverable rather than terminal: it removes the oldest
+//! unpinned records, never a pinned one, and appending resumes immediately afterwards.
 //!
 //! ```no_run
 //! use aik_context::ContextComponent;
@@ -145,13 +170,14 @@
 //!   real saving and a natural next step, but it changes what a model sees in a way that
 //!   depends on assumptions about how models read history, and there is no reason to guess
 //!   at those before there is an agent loop to measure.
-//! * **It does not retain, encrypt or expire on its own.** [`RedbContextStore`] persists
-//!   transcripts, and persistence is where retention questions become real ones. What this
-//!   crate answers is the part it can: the file is the owner's alone (`0600` in a `0700`
-//!   directory, enforced by [`aik_store`]), a session is deleted in full by
-//!   [`ContextStore::clear`](aik_api::context::ContextStore::clear), and nothing is written
-//!   anywhere else. Encryption at rest and time-based expiry are policy, belong above this
-//!   crate, and are deliberately not invented here.
+//! * **It does not encrypt.** The file is the owner's alone (`0600` in a `0700` directory,
+//!   enforced by [`aik_store`]) and nothing is written anywhere else, which is the part this
+//!   crate can answer. Encryption at rest is a different threat model — one where the file
+//!   itself is readable — and belongs above this crate rather than being invented here.
+//! * **It does not expire anything unless asked.** [`RetentionSweeper`] exists and both
+//!   stores implement it, but there is no default retention period: see
+//!   [`retention`](crate::RetentionSweeper) for why the one switch in this crate that
+//!   destroys data a user still has is the one switch that has to be turned on deliberately.
 //! * **It does not compact tool schemas.** Tool descriptions are re-sent every turn too, but
 //!   [`CompletionRequest::tools`](aik_api::model::CompletionRequest::tools) already carries
 //!   names rather than full specifications, so that saving belongs at the provider boundary,
@@ -159,6 +185,7 @@
 
 mod component;
 mod persistent;
+mod retention;
 mod session;
 mod store;
 mod tokens;
@@ -166,5 +193,6 @@ mod window;
 
 pub use component::{ContextComponent, DEFAULT_COMPONENT_ID, RedbContextComponent};
 pub use persistent::RedbContextStore;
+pub use retention::{DEFAULT_RETENTION_BATCH, DEFAULT_RETENTION_SWEEP_INTERVAL, RetentionSweeper};
 pub use store::{DEFAULT_MAX_RECORDS_PER_SESSION, InMemoryContextStore};
 pub use tokens::{DEFAULT_BYTES_PER_TOKEN, HeuristicTokenCounter};

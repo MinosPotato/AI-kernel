@@ -1,11 +1,12 @@
 //! Command-line parsing.
 //!
-//! Hand-written rather than derived from a dependency: there are eleven options, they are
-//! all strings, paths or flags, and the whole grammar fits on a screen. What a parser
-//! generator would add here is a dependency, not a capability.
+//! Hand-written rather than derived from a dependency: every option is a string, a path or a
+//! flag, and the whole grammar fits on a screen. What a parser generator would add here is a
+//! dependency, not a capability.
 
 use std::path::PathBuf;
 
+use aik_api::agent::SessionId;
 use aik_core::{Error, Result};
 
 /// The program name used in help and error messages.
@@ -85,6 +86,13 @@ impl MemorySet {
 pub struct Options {
     /// The one-shot prompt, or `None` for an interactive session.
     pub prompt: Option<String>,
+    /// A durable session to resume, or `None` to start a new one.
+    ///
+    /// Parsed as a [`SessionId`] here so a typo is a usage error
+    /// before a kernel is built, rather than a lookup that finds nothing much later. Whether
+    /// the session *exists*, and whether this run may touch it, are the store's questions and
+    /// are deliberately not asked here — see [`crate::session`].
+    pub session: Option<SessionId>,
     /// The model to send every turn to, overriding configuration.
     pub model: Option<String>,
     /// The agent's identity, overriding configuration.
@@ -189,6 +197,8 @@ pub const HELP: &str = concat!(
     "                         $XDG_DATA_HOME/aik/aik.redb]\n",
     "        --ephemeral      open no database: context, memory and scheduled jobs live\n",
     "                         only for this process and are gone when it exits\n",
+    "        --session <ID>   resume this durable session instead of starting a new one;\n",
+    "                         list the ones you own with /sessions in an interactive run\n",
     "    -v, --verbose        print authorization and context events as they happen\n",
     "    -R, --record <FILE>  append a JSONL measurement record of the run to FILE\n",
     "                         (counts and timings only — see docs/MEASUREMENTS.md)\n",
@@ -258,6 +268,7 @@ where
             "--memory" => options.memory = Some(MemorySet::parse(&value(&flag)?)?),
             "--db" => options.database = Some(PathBuf::from(value(&flag)?)),
             "--ephemeral" => options.ephemeral = true,
+            "--session" => options.session = Some(parse_session(&value(&flag)?)?),
             "-v" | "--verbose" => options.verbose = true,
             "-R" | "--record" => options.record = Some(PathBuf::from(value(&flag)?)),
             other if other.starts_with('-') && other.len() > 1 => {
@@ -285,11 +296,34 @@ where
         ));
     }
 
+    // Resuming needs somewhere for the session to have been kept. `--ephemeral` guarantees
+    // there is nowhere, so the combination cannot be satisfied — and silently starting a new
+    // session instead would be the one behaviour `--session` exists to rule out.
+    if options.ephemeral && options.session.is_some() {
+        return Err(usage(
+            "`--ephemeral` and `--session` contradict each other: an ephemeral run keeps no \
+             session to resume"
+                .to_owned(),
+        ));
+    }
+
     if !words.is_empty() {
         options.prompt = Some(words.join(" "));
     }
 
     Ok(Invocation::Run(Box::new(options)))
+}
+
+/// Parses a session id, refusing anything that is not one.
+///
+/// A malformed id is a usage error rather than a session that turns out not to exist: the
+/// two would be reported identically otherwise, and only one of them is worth retyping.
+fn parse_session(raw: &str) -> Result<SessionId> {
+    raw.parse().map_err(|_| {
+        usage(format!(
+            "`--session` takes the id of an existing session; `{raw}` is not one"
+        ))
+    })
 }
 
 fn usage(message: String) -> Error {
@@ -467,6 +501,7 @@ mod tests {
             "--memory",
             "--db",
             "--ephemeral",
+            "--session",
             "--verbose",
             "--record",
             "--help",
@@ -474,6 +509,35 @@ mod tests {
         ] {
             assert!(HELP.contains(flag), "`{flag}` is undocumented");
         }
+    }
+
+    #[test]
+    fn a_session_to_resume_is_accepted_in_both_forms() {
+        let id = SessionId::new();
+        let separated = options(&["--session", &id.to_string()]);
+        let inline = options(&[&format!("--session={id}")]);
+        assert_eq!(separated, inline);
+        assert_eq!(separated.session, Some(id));
+    }
+
+    #[test]
+    fn no_session_is_resumed_by_default() {
+        assert!(options(&[]).session.is_none());
+    }
+
+    #[test]
+    fn a_malformed_session_id_is_a_usage_error_not_a_missing_session() {
+        let error = parse(["--session", "not-a-uuid"]).unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+        assert!(error.to_string().contains("not-a-uuid"), "{error}");
+    }
+
+    #[test]
+    fn asking_to_resume_a_session_without_a_database_is_an_error() {
+        // Rather than starting a fresh one: a person who asked to resume a specific
+        // conversation has not agreed to talk to an empty one instead.
+        let error = parse(["--ephemeral", "--session", &SessionId::new().to_string()]).unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use aik_agent::AgentLoopSettings;
-use aik_api::agent::AgentId;
+use aik_api::agent::{AgentId, SessionId};
 use aik_api::model::ModelId;
 use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
 use aik_core::ComponentId;
@@ -110,6 +110,12 @@ pub struct Settings {
     /// responder, so anything a policy defers to a human is refused. See
     /// [`Settings::is_one_shot`].
     pub prompt: Option<String>,
+    /// The durable session to resume, or `None` to start a new one.
+    ///
+    /// Carried through from `--session` unchanged. Nothing here decides whether it may be
+    /// resumed: the frontend hands the id to the store and reports what the store says, which
+    /// is what keeps the one authorization rule in the one place that has the owner.
+    pub session: Option<SessionId>,
     /// The whole configuration tree, handed to the kernel.
     pub config: Config,
     /// The component expected to publish `dyn ModelProvider`.
@@ -179,6 +185,7 @@ impl Settings {
             verbose: options.verbose,
             record: options.record.clone(),
             prompt: options.prompt.clone(),
+            session: options.session,
             config,
             model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
         })

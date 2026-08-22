@@ -17,7 +17,10 @@ use aik_api::execution::ExecutionContext;
 use aik_api::model::{ContentPart, Message, Role};
 use aik_api::permission::{Principal, PrincipalKind};
 use aik_api::tool::{ToolCall, ToolName};
-use aik_context::{DEFAULT_MAX_RECORDS_PER_SESSION, InMemoryContextStore, RedbContextStore};
+use aik_context::{
+    DEFAULT_MAX_RECORDS_PER_SESSION, InMemoryContextStore, RedbContextStore, RetentionSweeper,
+};
+use aik_core::clock::{Clock, ManualClock, SharedClock, SystemClock, Timestamp};
 use aik_store::Db;
 use serde_json::json;
 use tempfile::TempDir;
@@ -39,35 +42,69 @@ impl Backend {
 
     /// Opens a store that refuses more than `max_records` records in one session.
     pub(crate) fn bounded(self, max_records: usize) -> Fixture {
-        match self {
-            Self::Memory => Fixture {
-                store: Some(Arc::new(
-                    InMemoryContextStore::new().with_max_records(max_records),
-                )),
-                directory: None,
-                path: None,
-                max_records,
-            },
+        self.build(max_records, Arc::new(SystemClock), None)
+    }
+
+    /// Opens a store whose records are stamped by a clock the test drives.
+    ///
+    /// Retention is the only thing here that depends on *when* something was appended rather
+    /// than merely on the order, so it is the only suite that cannot use the wall clock and
+    /// still assert anything in finite time.
+    pub(crate) fn on_clock(self, clock: Arc<ManualClock>) -> Fixture {
+        self.build(DEFAULT_MAX_RECORDS_PER_SESSION, clock.clone(), Some(clock))
+    }
+
+    /// Opens a persistent store whose retention sweep removes at most `batch` sessions per
+    /// transaction, so a test can prove a sweep is more than one batch.
+    pub(crate) fn batched(self, clock: Arc<ManualClock>, batch: usize) -> Fixture {
+        assert_eq!(self, Self::Redb, "only the persistent store batches");
+        let mut fixture = self.build(DEFAULT_MAX_RECORDS_PER_SESSION, clock.clone(), Some(clock));
+        fixture.batch = Some(batch);
+        fixture.reopen();
+        fixture
+    }
+
+    fn build(
+        self,
+        max_records: usize,
+        clock: SharedClock,
+        manual: Option<Arc<ManualClock>>,
+    ) -> Fixture {
+        let (directory, path) = match self {
+            Self::Memory => (None, None),
             Self::Redb => {
                 let directory = tempfile::tempdir().expect("a temporary directory");
                 let path = directory.path().join("aik.redb");
-                Fixture {
-                    store: Some(open_redb(&path, max_records)),
-                    directory: Some(directory),
-                    path: Some(path),
-                    max_records,
-                }
+                (Some(directory), Some(path))
             }
-        }
+        };
+        let mut fixture = Fixture {
+            backend: self,
+            store: None,
+            sweeper: None,
+            directory,
+            path,
+            max_records,
+            clock,
+            manual,
+            batch: None,
+        };
+        fixture.open_backend();
+        fixture
     }
 }
 
 /// A store, plus whatever has to stay alive for it to keep working.
 pub(crate) struct Fixture {
+    backend: Backend,
     store: Option<Arc<dyn ContextStore>>,
+    sweeper: Option<Arc<dyn RetentionSweeper>>,
     directory: Option<TempDir>,
     path: Option<PathBuf>,
     max_records: usize,
+    clock: SharedClock,
+    manual: Option<Arc<ManualClock>>,
+    batch: Option<usize>,
 }
 
 impl std::fmt::Debug for Fixture {
@@ -82,6 +119,22 @@ impl Fixture {
         self.store.clone().expect("the fixture holds a store")
     }
 
+    /// The same store, seen through the housekeeping trait.
+    pub(crate) fn sweeper(&self) -> Arc<dyn RetentionSweeper> {
+        self.sweeper.clone().expect("the fixture holds a store")
+    }
+
+    /// Moves the manual clock forward, for a fixture opened with one.
+    pub(crate) fn advance(&self, millis: u64) {
+        let clock = self.manual.as_ref().expect("a fixture on a manual clock");
+        clock.set(Timestamp::from_millis(clock.now().as_millis() + millis));
+    }
+
+    /// What the manual clock currently reads.
+    pub(crate) fn now(&self) -> Timestamp {
+        self.clock.now()
+    }
+
     /// Where the database lives, for a persistent fixture.
     pub(crate) fn path(&self) -> &Path {
         self.path.as_deref().expect("a persistent fixture")
@@ -93,12 +146,42 @@ impl Fixture {
     /// holds an exclusive lock on the file, so a reopen that succeeds is also proof that the
     /// previous one released everything it held.
     pub(crate) fn reopen(&mut self) {
-        let path = self
-            .path
-            .clone()
-            .expect("only a persistent fixture can be reopened");
-        self.store = None;
-        self.store = Some(open_redb(&path, self.max_records));
+        assert_eq!(
+            self.backend,
+            Backend::Redb,
+            "only a persistent fixture can be reopened"
+        );
+        self.close();
+        self.open_backend();
+    }
+
+    /// Opens whichever backend this fixture is for, into both of its slots.
+    fn open_backend(&mut self) {
+        match self.backend {
+            Backend::Memory => {
+                let store = Arc::new(
+                    InMemoryContextStore::new()
+                        .with_max_records(self.max_records)
+                        .with_clock(self.clock.clone()),
+                );
+                self.sweeper = Some(store.clone());
+                self.store = Some(store);
+            }
+            Backend::Redb => {
+                let path = self.path.clone().expect("a persistent fixture has a path");
+                let db = Arc::new(Db::open(&path).expect("the database opens"));
+                let mut store = RedbContextStore::new(db)
+                    .expect("the context tables are created")
+                    .with_max_records(self.max_records)
+                    .with_clock(self.clock.clone());
+                if let Some(batch) = self.batch {
+                    store = store.with_retention_batch(batch);
+                }
+                let store = Arc::new(store);
+                self.sweeper = Some(store.clone());
+                self.store = Some(store);
+            }
+        }
     }
 
     /// Drops the store, releasing redb's exclusive lock on the file.
@@ -107,6 +190,7 @@ impl Fixture {
     /// stays alive, so the file is still there.
     pub(crate) fn close(&mut self) {
         self.store = None;
+        self.sweeper = None;
     }
 }
 
