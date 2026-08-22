@@ -50,13 +50,18 @@ use crate::error::store_error;
 /// | 2 | `context.sessions`, `context.records`, `context.record_ids`, owned by `aik-context` |
 /// | 3 | `mem.records`, `mem.by_kind`, `mem.by_expiry`, owned by `aik-memory` |
 /// | 4 | `mem.by_owner`, and the `owner` field every `mem.records` row now carries |
+/// | 5 | `sched.jobs`, owned by `aik-scheduler` |
 ///
 /// A subsystem that adds tables raises this even though redb needs no migration to create
 /// one. The version is what stops an older build from opening the file afterwards, and an
 /// older build is exactly the one that does not know those tables exist — so it would not
 /// preserve them through a compaction, a repair or a `clear` that walks the schema. That is
 /// the whole of what a bump buys, and it is worth a bump on its own.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// For the scheduler the argument is sharper than "space is not reclaimed": an older build
+/// silently dropping `sched.jobs` would leave a system that looks healthy while the work it
+/// was told to do at 3am simply never happens again.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The table holding the store's own bookkeeping, keyed by a short ASCII name.
 ///
@@ -94,6 +99,7 @@ impl std::fmt::Debug for Migration {
 ///   does fails loudly when the row will not decode, rather than being silently read as
 ///   though the field had a sensible default; there is no defensible default for "whose
 ///   memory is this".
+/// * **4 → 5** added `sched.jobs`. A table, so again nothing to transform.
 ///
 /// Adding a real migration means appending an entry here *and* raising [`SCHEMA_VERSION`] to
 /// match its `to`; the invariant between the two is checked by [`migrate`] on every open.

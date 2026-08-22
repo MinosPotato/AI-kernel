@@ -193,6 +193,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-scheduler"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-memory",
+ "aik-store",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "aik-store"
 version = "0.1.0"
 dependencies = [

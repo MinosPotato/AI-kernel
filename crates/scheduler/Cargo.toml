@@ -1,0 +1,30 @@
+[package]
+name = "aik-scheduler"
+description = "A scheduler for the AI kernel: time- and event-triggered jobs, optionally durable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aik-core.workspace = true
+aik-api.workspace = true
+aik-store.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
+tempfile.workspace = true
+# Dev-only, and only for the test that proves two durable subsystems can share one database
+# file. Nothing in `aik-scheduler` itself knows the memory store exists.
+aik-memory.workspace = true
