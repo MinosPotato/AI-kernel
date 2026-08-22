@@ -50,6 +50,7 @@
 
 pub mod approval;
 pub mod args;
+pub mod audit;
 pub mod console;
 pub mod recorder;
 pub mod render;
@@ -59,7 +60,7 @@ pub mod wiring;
 
 use aik_core::{Error, Result};
 
-use crate::args::{HELP, Invocation, Options};
+use crate::args::{AUDIT_HELP, HELP, Invocation, Options};
 use crate::settings::Settings;
 
 /// The version reported by `--version`.
@@ -75,10 +76,21 @@ pub async fn main(args: impl IntoIterator<Item = String>) -> i32 {
             print!("{HELP}");
             0
         }
+        Ok(Invocation::AuditHelp) => {
+            print!("{AUDIT_HELP}");
+            0
+        }
         Ok(Invocation::Version) => {
             println!("{} {VERSION}", args::PROGRAM);
             0
         }
+        Ok(Invocation::Audit(options)) => match audit::run(&options).await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{}: {}", args::PROGRAM, report(&error));
+                1
+            }
+        },
         Ok(Invocation::Run(options)) => match run(&options).await {
             Ok(()) => 0,
             Err(error) => {

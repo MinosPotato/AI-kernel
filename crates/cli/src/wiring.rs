@@ -9,12 +9,20 @@
 //!
 //! # The durable stack
 //!
-//! The transcript, the agent's memories and the schedule are three subsystems over one
-//! database, and each publishes the same capability under the same component id whichever
-//! backend is chosen. So the choice is one `match` on [`Storage`] and nothing downstream
-//! changes: the agent resolves `dyn ContextStore`, the memory tools bind to
+//! The transcript, the agent's memories, the schedule and the audit trail are four subsystems
+//! over one database, and each publishes the same capability under the same component id
+//! whichever backend is chosen. So the choice is one `match` on [`Storage`] and nothing
+//! downstream changes: the agent resolves `dyn ContextStore`, the memory tools bind to
 //! `dyn MemoryStore`, and neither can tell — nor should be able to tell — whether what it
 //! got survives a restart.
+//!
+//! The audit trail is registered unconditionally, in both arms, and there is no switch that
+//! turns it off. Every other capability here can be narrowed — a tool left unregistered, a
+//! memory mode reduced — because narrowing is what a frontend is allowed to do. Declining to
+//! record what the system was allowed to do is not narrowing: it is removing the account of
+//! everything that *was* allowed, which is the opposite of a safe default. An `--ephemeral`
+//! run gets the in-memory trail, so the run is still auditable while it happens without
+//! anything reaching a disk that run promised not to touch.
 //!
 //! The database itself is opened by [`StoreComponent`], which reads its path from the
 //! configuration tree. The frontend resolves that path in
@@ -28,6 +36,7 @@ use aik_agent::AgentComponent;
 use aik_api::model::{ModelId, ModelProvider};
 use aik_api::permission::ApprovalSink;
 use aik_approval::{ApprovalBroker, ApprovalComponent};
+use aik_audit::{AuditComponent, RedbAuditComponent};
 use aik_context::{ContextComponent, RedbContextComponent};
 use aik_core::prelude::*;
 use aik_fs::{FsListTool, FsReadTool, FsWriteTool};
@@ -132,19 +141,21 @@ pub fn builder(
         .component(ApprovalComponent::new(broker.clone()))
         .component(tools);
 
-    // One decision, applied to all three: see [`Storage`]. Both arms publish the same
+    // One decision, applied to all four: see [`Storage`]. Both arms publish the same
     // capabilities under the same component ids, so nothing downstream — the agent, the
     // memory tools, the registry — can tell which one it got except by outliving a restart.
     let builder = match &settings.storage {
         Storage::Ephemeral => builder
             .component(ContextComponent::new())
             .component(MemoryComponent::new())
-            .component(SchedulerComponent::new()),
+            .component(SchedulerComponent::new())
+            .component(AuditComponent::new()),
         Storage::Persistent(_) => builder
             .component(StoreComponent::new())
             .component(RedbContextComponent::new())
             .component(RedbMemoryComponent::new())
-            .component(RedbSchedulerComponent::new()),
+            .component(RedbSchedulerComponent::new())
+            .component(RedbAuditComponent::new()),
     };
 
     // Registered only when it has something to bind. With no memory tools exposed, the
