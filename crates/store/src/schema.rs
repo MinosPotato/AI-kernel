@@ -52,6 +52,7 @@ use crate::error::store_error;
 /// | 4 | `mem.by_owner`, and the `owner` field every `mem.records` row now carries |
 /// | 5 | `sched.jobs`, owned by `aik-scheduler` |
 /// | 6 | `context.by_owner`, `context.by_updated`, owned by `aik-context` |
+/// | 7 | `audit.records`, `audit.by_time`, `audit.by_principal`, `audit.by_correlation`, `audit.meta`, owned by `aik-audit` |
 ///
 /// A subsystem that adds tables raises this even though redb needs no migration to create
 /// one. The version is what stops an older build from opening the file afterwards, and an
@@ -61,8 +62,11 @@ use crate::error::store_error;
 ///
 /// For the scheduler the argument is sharper than "space is not reclaimed": an older build
 /// silently dropping `sched.jobs` would leave a system that looks healthy while the work it
-/// was told to do at 3am simply never happens again.
-pub const SCHEMA_VERSION: u32 = 6;
+/// was told to do at 3am simply never happens again. For the audit trail it is sharper still:
+/// an older build that does not know `audit.*` exists is one that would carry a compaction or
+/// a repair over the record of what this system was allowed to do — the one collection whose
+/// value is precisely that nobody could quietly shorten it.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// The table holding the store's own bookkeeping, keyed by a short ASCII name.
 ///
@@ -108,6 +112,10 @@ impl std::fmt::Debug for Migration {
 ///   So the subsystem that owns the encoding does the backfill, in its own code, on a path
 ///   that also repairs drift — rather than this crate learning to decode a session header in
 ///   order to run the same loop once.
+/// * **6 → 7** added the five `audit.*` tables. Tables again, so nothing to transform, and
+///   nothing to backfill either: a trail records what happened while it was running, and
+///   inventing records for the period before it existed would be the one thing an audit trail
+///   must never do.
 ///
 /// Adding a real migration means appending an entry here *and* raising [`SCHEMA_VERSION`] to
 /// match its `to`; the invariant between the two is checked by [`migrate`] on every open.

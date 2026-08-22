@@ -73,12 +73,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-audit"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-store",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aik-cli"
 version = "0.1.0"
 dependencies = [
  "aik-agent",
  "aik-api",
  "aik-approval",
+ "aik-audit",
  "aik-context",
  "aik-core",
  "aik-fs",

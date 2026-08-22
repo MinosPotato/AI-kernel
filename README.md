@@ -25,6 +25,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
 | [`aik-context`](crates/context) | An agent's transcript, and the budgeted model window derived from it |
+| [`aik-store`](crates/store) | The one embedded database the durable subsystems share |
+| [`aik-memory`](crates/memory) | Records an agent keeps between conversations, and the tools onto them |
+| [`aik-scheduler`](crates/scheduler) | Time- and event-triggered jobs, persistent across restarts |
+| [`aik-audit`](crates/audit) | The durable, append-only trail of authorization decisions and tool calls |
 | [`aik-agent`](crates/agent) | The agent loop: model turns, bounded context, authorization-gated tool calls |
 | [`aik-cli`](crates/cli) | The terminal frontend: a conversation, streamed updates, interactive approvals |
 
@@ -467,18 +471,20 @@ authorization for resources discovered mid-run, and audit events on the existing
 each confined to a configured root; `aik-approval` closes the last gap in that path, so a
 policy that defers to a human reaches one instead of failing closed by default; and
 `aik-context` makes the agent loop affordable, by making the transcript a piece of kernel
-state rather than something reassembled into every request; and `aik-agent` is the loop
-itself, the first thing that uses all of the above together. Each proves the
+state rather than something reassembled into every request; `aik-agent` is the loop
+itself, the first thing that uses all of the above together; and `aik-audit` makes the whole
+of that accountable after the fact rather than only observable while it happens. Each proves the
 registry/component architecture hosts a real capability cleanly, without changing `aik-core`
 itself.
 
 The system works end to end: `aik-cli` starts a kernel, `aik-ollama` carries tool calls in
 both directions, and a model can ask for a tool, have the request authorized, have a human
 approve it, and answer from the result — with every step of that visible in the audit
-events. What comes next builds *on* the kernel rather than *into* it: measurement of what
-real workloads actually cost, durable audit and transcript storage, and process execution
-behind an OS-level sandbox — each as a component in its own crate, following the same
-pattern.
+events, and now kept: `aik-audit` writes those events into the shared database as an
+append-only trail, and `aik audit` is how an operator reads it back afterwards. What comes
+next builds *on* the kernel rather than *into* it: process execution behind an OS-level
+sandbox, and a daemon that hosts the kernel for more than one frontend — each as a component
+in its own crate, following the same pattern.
 
 The full pipeline — filesystem confinement, policy evaluation, human approval, tool exposure
 narrowing, verbose auditing, and the CLI's own error and session handling — has been manually

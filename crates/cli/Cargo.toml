@@ -21,6 +21,7 @@ workspace = true
 aik-agent.workspace = true
 aik-api.workspace = true
 aik-approval.workspace = true
+aik-audit.workspace = true
 aik-context.workspace = true
 aik-core.workspace = true
 aik-fs.workspace = true

@@ -11,7 +11,7 @@
 //! | [`model`] | Inference providers and embedders |
 //! | [`tool`] | Callable, schema-described capabilities, and the invocation gate |
 //! | [`permission`] | Principals, policy, human approval and resource authorization |
-//! | [`audit`] | Structured authorization and invocation events |
+//! | [`audit`] | Structured authorization and invocation events, and the durable trail they form |
 //! | [`context`] | An agent's transcript, and the bounded view of it a model is sent |
 //! | [`measurement`] | What one request to a model provider cost, estimated and reported |
 //! | [`memory`] | Persistent records and retrieval |
@@ -85,7 +85,10 @@ pub mod tool;
 
 /// The contracts most implementations need.
 pub mod prelude {
-    pub use crate::audit::{AuthorizationDecided, AuthorizationPhase, ToolInvoked};
+    pub use crate::audit::{
+        AuditEntry, AuditQuery, AuditRecord, AuditStore, AuthorizationDecided, AuthorizationPhase,
+        ToolInvoked,
+    };
     pub use crate::context::{
         ContextBudget, ContextEntry, ContextRecord, ContextStore, ContextWindow, TokenCounter,
     };

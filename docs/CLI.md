@@ -8,6 +8,9 @@ validated against a real Ollama server.
 If you only need the option table, see the [README](../README.md#actually-using-it). This
 document is for building a mental model of the whole system and for troubleshooting.
 
+`aik` has one subcommand, `aik audit`, which reviews the durable record of what the system was
+allowed to do — see [The audit trail](#the-audit-trail-aik-audit).
+
 ## Prerequisites
 
 - Rust 1.85 or newer (edition 2024) — `rustc --version`
@@ -184,10 +187,11 @@ aik --db /srv/aik/state.redb   # durable, somewhere specific
 aik --ephemeral                # nothing reaches the disk
 ```
 
-One [redb](https://github.com/cberner/redb) database holds three subsystems' state: the
-conversation transcript (`aik-context`), the agent's memories (`aik-memory`), and any
-scheduled job marked persistent (`aik-scheduler`). One file rather than three because redb
-takes an exclusive lock per file and because one schema version cannot disagree with itself.
+One [redb](https://github.com/cberner/redb) database holds four subsystems' state: the
+conversation transcript (`aik-context`), the agent's memories (`aik-memory`), any scheduled
+job marked persistent (`aik-scheduler`), and the audit trail (`aik-audit`). One file rather
+than four because redb takes an exclusive lock per file and because one schema version cannot
+disagree with itself.
 
 The path is resolved with this precedence, highest first:
 
@@ -223,9 +227,11 @@ know about.
 
 ### `--ephemeral`
 
-Opens no database. The context store, the memory store and the scheduler are all wired to
-their in-memory implementations, publishing the same capabilities under the same component
-ids, so nothing downstream can tell the difference except by outliving a restart. A job asked
+Opens no database. The context store, the memory store, the scheduler and the audit trail are
+all wired to their in-memory implementations, publishing the same capabilities under the same
+component ids, so nothing downstream can tell the difference except by outliving a restart.
+The run is still audited — an unaudited run is not a thing `aik` offers — the trail simply
+lives as long as the process does. A job asked
 to be persistent is refused with `Unsupported` rather than accepted and forgotten — the one
 outcome that would let a deployment believe its nightly job exists.
 
@@ -544,6 +550,111 @@ list and the tests that enforce it, and `crates/cli/src/recorder.rs` for the for
 destination that cannot be opened is a startup error, named, like a malformed config file; a
 write that fails mid-run disables recording for the rest of the process after printing
 exactly one message, rather than retrying forever or claiming success it did not have.
+
+## The audit trail: `aik audit`
+
+Every authorization decision and every tool call is written to the shared database as it
+happens, and `aik audit` is how you read it back afterwards.
+
+```bash
+aik audit                                # the 50 most recent records
+aik audit --refused                       # only what was not allowed
+aik audit --tool filesystem.write         # only one tool
+aik audit --since 12h --limit 200         # a window, widened
+aik audit --correlation <ID>              # one operation, decisions and call together
+aik audit --json                          # one JSON object per line, for piping
+aik audit --help                          # every option
+```
+
+A record looks like this:
+
+```
+#412    2025-08-22T17:19:04Z  authorization  assistant for alice  filesystem.read  allowed  /srv/notes.txt
+#413    2025-08-22T17:19:04Z  invocation     assistant for alice  filesystem.read  ok  7ms
+
+2 record(s) shown as `alice`; 413 issued in total.
+```
+
+`#412` is the sequence number: it starts at 1, increases by one per record, and is never
+reused — including across restarts, and including after a prune. A break in the numbering is
+something to look into.
+
+There is **no audit tool**. Every other durable subsystem is reachable by the agent through
+the tool registry so that policy is consulted; the audit trail is the record of those
+consultations, and a model able to read it would be reading a map of where the boundaries are
+and where somebody has already been refused. The only path to it is this command, run by a
+person, against a file mode `0600` in a directory mode `0700`. The test that pins this is
+`no_tool_exposes_the_audit_trail_to_a_model` in `crates/cli/tests/audit.rs`.
+
+### What you can see
+
+The trail shows what the reading identity did **and what was done on its behalf**. `aik audit`
+reads as the user (`--user`, default `user`), and a run is the agent acting for that user, so
+by default you see the whole of what your agents did for you. Another principal's records are
+not shown, and naming them in `--principal` narrows what you may already see rather than
+widening it.
+
+Two kinds of record are shown to every reader, and no `--principal` filter hides them:
+
+| Line | What it means |
+|---|---|
+| `gap` | The event bus dropped events before the audit sink could read them. That many records are missing and cannot be recovered. |
+| `retention` | A prune or a background sweep removed records at or before a cutoff. |
+
+Both exist because a trail that is quietly incomplete is worse than no trail: it reads as a
+complete account of a period it cannot account for. Neither is ever removed by a sweep, and
+neither can be filtered away by asking about a principal. Asking for one `--kind` or one
+`--correlation` does exclude them, because that is what you asked for — `aik audit --kind gap`
+lists them on their own.
+
+### Retention, and pruning
+
+Nothing is ever removed unless somebody asks. There is no default retention period, which is
+the opposite of the choice made for, say, a cache — retention here destroys the record of what
+the system was allowed to do, and a default that discarded last month's decisions would be a
+compliance bug shipped as a convenience.
+
+Two ways to ask. A background sweep, configured per deployment:
+
+```json
+{ "components": { "audit": { "store": { "retention_days": 90 } } } }
+```
+
+(Note the nesting, for the same reason `store.db` needs it: the component's id is
+`audit.store`.) `sweep_interval_seconds` overrides how often it runs; the default is hourly,
+and nothing observable depends on it because a record stays readable until it is removed. A
+`retention_days` of `0` is refused at startup rather than taken literally.
+
+Or explicitly, once:
+
+```bash
+aik audit prune --older-than 90d --dry-run   # how many would go
+aik audit prune --older-than 90d             # remove them
+```
+
+`--older-than` has no default and no short form. Periods take a unit — `90s`, `30m`, `12h`,
+`7d`, `4w` — and a bare number is refused rather than guessed at, because this is a flag that
+destroys evidence and "30" could plausibly mean three different things.
+
+Either way the sweep leaves a `retention` record saying what it removed and from when, and
+never removes a `gap` or a previous `retention` record.
+
+### What is not recorded
+
+The trail stores the published events verbatim, and those carry the shape of what happened,
+never its contents: **no tool arguments, no tool output, no file contents, no prompts, no
+model text**. A resource identifier — the path a tool was authorized to touch — *is* recorded,
+because an audit trail that omits what was touched is not one. Policy-authored denial reasons
+are recorded too, since they are written by the policy engine rather than by a model.
+
+### The honest limitation
+
+The audit write happens on a subscriber, after the decision, not inside it. So an audit store
+that cannot be written to — a full disk, a database that will not open — does **not** refuse
+the tool call; it logs at `error` level and the trail is short by that record. Making the
+write synchronous would mean putting a disk inside `ToolRegistry::invoke`, which is a change
+to the enforcement point rather than to the trail, and is deliberately not what this does.
+Events the *bus* drops are a different matter and are recorded as a `gap`.
 
 ## Filesystem confinement
 
