@@ -322,6 +322,8 @@ cargo run -p aik-cli -- --config crates/cli/aik.example.json --root /path/to/pro
 aik 0.1.0
   agent:  assistant acting for user
   root:   /path/to/project
+  store:  /home/you/.local/share/aik/aik.redb
+  memory: remember
 
 › what is the codename in notes.txt?
   → filesystem.read {"path":"notes.txt"}
@@ -346,12 +348,30 @@ cargo run -p aik-cli -- -c crates/cli/aik.example.json "what is in src?"
 | `-c, --config <FILE>` | JSON configuration, including the policy |
 | `-p, --policy <FILE>` | a policy document on its own, overriding the one in `--config` |
 | `--write` | also register the write tool |
-| `--no-tools` | register none |
+| `--no-tools` | register none, memory included |
+| `--memory <MODE>` | which memory tools to register: `off`, `recall`, `remember`, `full` (default `remember`) |
+| `--db <FILE>` | the shared database (default: `components.store.db.path`, else `$XDG_DATA_HOME/aik/aik.redb`) |
+| `--ephemeral` | open no database; the transcript, memories and schedule live only for this process |
 | `-v, --verbose` | print authorization and context events as they happen |
 | `-R, --record <FILE>` | append a JSONL measurement record of the run (counts and timings only) |
 
 In a session, `/new` starts a fresh conversation, `/session` says who is acting,
 `/tools` lists what the agent has, `/quit` leaves. Ctrl-C cancels the turn in progress.
+
+### What persists, and where
+
+One [redb](https://github.com/cberner/redb) database holds three things: the conversation
+transcript, the agent's memories, and any scheduled job marked persistent. It is created
+`0600` inside a `0700` directory, defaults to `$XDG_DATA_HOME/aik/aik.redb`, and refuses to
+start rather than guessing a location when neither `XDG_DATA_HOME` nor `HOME` is set — the
+working directory would put a file holding every transcript somewhere a backup or a
+repository could pick it up. `--ephemeral` opens nothing at all, and a persistent job asked
+of an ephemeral run is refused rather than accepted and forgotten.
+
+Memory is reached the same way everything else is: four tools behind the registry, so a
+policy decides each call and an audit event records it. Nothing is recalled automatically —
+the agent asks for what it wants. `memory.delete` is not registered unless you ask for it
+with `--memory full`, and the shipped policy still puts every deletion to a human.
 
 ### The agent is not you
 
@@ -467,5 +487,5 @@ exercised end to end against a real Ollama server, not only through the automate
 covered, the two bugs it found and fixed, and the token/context cost baseline it produced.
 `docs/CLI.md`'s [limitations sections](docs/CLI.md#other-known-limitations-not-bugs) separate
 what is a genuine defect from what is a documented, deliberate property of the current
-implementation (no persistence, no summarisation, a heuristic token counter, an unclosed
+implementation (no summarisation, no semantic memory, a heuristic token counter, an unclosed
 filesystem TOCTOU window bounded but not eliminated by handle-pinning).
