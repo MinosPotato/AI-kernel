@@ -13,12 +13,34 @@
 //! acting on behalf of the user. That is the identity policy sees, the identity audit events
 //! record, and the identity that owns the transcript in the
 //! [`ContextStore`](aik_api::context::ContextStore).
+//!
+//! # Session lifecycle, and where the decisions are not
+//!
+//! This module can start a session, resume one, list them, clear one and compact one. It
+//! decides none of those. Every command below is a call into [`ContextStore`] under the run's
+//! own context, and the answer — including a refusal — is printed as it comes back.
+//!
+//! That is the rule the whole crate is built on, applied to the one subsystem the frontend
+//! now touches directly. Concretely:
+//!
+//! * **The owner comes from the context, never from what was typed.** `--session` supplies an
+//!   id and nothing else. The principal is built once from resolved settings, and no command
+//!   here takes one.
+//! * **`/sessions` shows what the store returns.** There is no filtering in this file,
+//!   because a second filter would be a second place for the rule to be wrong. The store
+//!   filters to what the run may act for; the frontend renders the result.
+//! * **A refusal is propagated, not interpreted.** Resuming someone else's session prints the
+//!   store's `PermissionDenied` and exits. The frontend never decides that a session is
+//!   unreachable, and never decides that it is reachable either.
+//! * **A missing session is an error, not a fresh one.** Somebody who asked to continue a
+//!   particular conversation has not agreed to start a different one, and a frontend that
+//!   quietly substituted an empty session would hide both a typo and a deletion.
 
 use std::sync::Arc;
 
 use aik_api::agent::{Agent, AgentRequest, AgentUpdate, SessionId};
 use aik_api::audit::{AuthorizationDecided, ToolInvoked};
-use aik_api::context::ContextAssembled;
+use aik_api::context::{ContextAssembled, ContextStats, ContextStore};
 use aik_api::execution::ExecutionContext;
 use aik_api::measurement::RequestMeasured;
 use aik_api::model::ContentPart;
@@ -38,6 +60,15 @@ use crate::settings::Settings;
 
 /// The prompt shown before each line of input.
 pub const PROMPT: &str = "\n› ";
+
+/// How many evictable records `/compact` keeps when no count is given.
+///
+/// Enough that the conversation a person is having is still there afterwards, and small
+/// enough that compacting a session at the store's record bound reclaims almost all of it.
+/// Pinned records — the system prompt, durable task framing — are never counted against this
+/// and never removed, so the floor is really "this many turns of conversation, plus whatever
+/// was pinned".
+pub const DEFAULT_COMPACT_KEEP: usize = 100;
 
 /// What one iteration of the drive loop observed.
 enum Step {
@@ -72,6 +103,12 @@ pub struct Session<R> {
     decisions: EventStream<AuthorizationDecided>,
     invocations: EventStream<ToolInvoked>,
     measurements: EventStream<RequestMeasured>,
+    /// The transcript store, for the lifecycle commands.
+    ///
+    /// Resolvable from the open registry by design — a context store is infrastructure, not a
+    /// gated capability, and what keeps it safe is that sessions are owned rather than that it
+    /// is unreachable. Holding it lets the frontend *ask*; it does not let it decide.
+    context: Arc<dyn ContextStore>,
     /// What every prompt answered in this session has cost so far. See
     /// [`SessionStats`].
     session_stats: SessionStats,
@@ -104,9 +141,11 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
     ) -> Result<Self> {
         Ok(Self {
             agent: kernel.service::<dyn Agent>()?,
+            context: kernel.service::<dyn ContextStore>()?,
             console,
             principal: settings.principal(),
-            session: SessionId::new(),
+            // A run that named no session gets a fresh id, which is `SessionId`'s default.
+            session: settings.session.unwrap_or_default(),
             verbose: settings.verbose,
             approvals,
             windows: kernel.subscribe::<ContextAssembled>(),
@@ -134,9 +173,48 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
         self.session_stats
     }
 
+    /// The context every operation this session performs runs under.
+    ///
+    /// One constructor, used by the turn and by every lifecycle command alike, so that "who
+    /// is asking" is decided in exactly one place. Two of these would be two chances for a
+    /// command to run as somebody the run is not — and the difference would be invisible
+    /// until it showed somebody another principal's session.
+    fn cx(&self) -> ExecutionContext {
+        ExecutionContext::new().with_principal(self.principal.clone())
+    }
+
     /// The conversation this session is appending to.
     pub fn id(&self) -> SessionId {
         self.session
+    }
+
+    /// Confirms the session named by `--session` exists and this run may use it.
+    ///
+    /// Called before the first turn, and it is a *report* rather than a check: the store is
+    /// asked for the session's statistics under this run's own context, and whatever comes
+    /// back is what happens. `PermissionDenied` propagates unchanged, because the store owns
+    /// that decision and the frontend must not restate it; `Ok(None)` — no such session —
+    /// becomes an error rather than a fresh session, because starting a different
+    /// conversation is not what was asked for.
+    ///
+    /// A run that was not given `--session` has nothing to resume and returns immediately.
+    /// Its own new id is not looked up: it cannot exist yet, and asking would only invent a
+    /// way for a randomly-collided id to be reported as somebody else's.
+    pub async fn resume(&mut self, settings: &Settings) -> Result<()> {
+        let Some(session) = settings.session else {
+            return Ok(());
+        };
+        let cx = self.cx();
+        let Some(stats) = self.context.stats(&session, &cx).await? else {
+            return Err(Error::InvalidArgument(format!(
+                "there is no session `{session}` to resume"
+            )));
+        };
+        println!(
+            "  resumed session {session}: {} record(s), ~{} tokens",
+            stats.records, stats.tokens
+        );
+        Ok(())
     }
 
     /// Runs one prompt to completion and returns.
@@ -166,7 +244,7 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
                 continue;
             }
             if let Some(command) = line.strip_prefix('/') {
-                match self.command(command) {
+                match self.command(command).await {
                     Outcome::Quit => return Ok(Outcome::Quit),
                     Outcome::Finished => continue,
                 }
@@ -182,12 +260,38 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
     }
 
     /// Handles a `/command`, reporting whether the session should end.
-    fn command(&mut self, command: &str) -> Outcome {
-        match command.trim() {
+    ///
+    /// A failed lifecycle command reports the store's error and returns to the prompt, the
+    /// same way a failed turn does: a refused compaction is something to say out loud, not a
+    /// reason to end the conversation.
+    async fn command(&mut self, command: &str) -> Outcome {
+        let (verb, argument) = match command.trim().split_once(char::is_whitespace) {
+            Some((verb, rest)) => (verb, rest.trim()),
+            None => (command.trim(), ""),
+        };
+        match verb {
             "quit" | "q" | "exit" => Outcome::Quit,
             "new" => {
                 self.session = SessionId::new();
                 println!("  started a new conversation");
+                Outcome::Finished
+            }
+            "sessions" => {
+                if let Err(error) = self.list_sessions().await {
+                    println!("  error: {error}");
+                }
+                Outcome::Finished
+            }
+            "clear" => {
+                if let Err(error) = self.clear_session().await {
+                    println!("  error: {error}");
+                }
+                Outcome::Finished
+            }
+            "compact" => {
+                if let Err(error) = self.compact_session(argument).await {
+                    println!("  error: {error}");
+                }
                 Outcome::Finished
             }
             "session" => {
@@ -217,15 +321,98 @@ impl<R: AsyncBufRead + Unpin + Send> Session<R> {
                 if !other.is_empty() && other != "help" {
                     println!("  unknown command `/{other}`");
                 }
-                println!("  /new  /session  /tools  /quit");
+                println!("  /new  /session  /sessions  /clear  /compact [N]  /tools  /quit");
                 Outcome::Finished
             }
         }
     }
 
+    /// Prints the sessions this run may act for, and returns them.
+    ///
+    /// Metadata only, and that is a property of what the store hands back rather than of what
+    /// is printed here: enumeration returns [`ContextStats`], which have nowhere to put a
+    /// message. Nothing in this method filters, either — the store already returned exactly
+    /// the sessions this principal may act for, and a second filter would be a second place
+    /// for the rule to be wrong.
+    ///
+    /// It returns the rows rather than only printing them, and is public for the same reason:
+    /// what this command *shows* is the security-relevant part of it, and a test that could
+    /// only observe the store would pass just as happily if the command asked the store the
+    /// wrong question. It takes no principal and grants no access — the caller gets exactly
+    /// what the terminal would have shown.
+    pub async fn list_sessions(&self) -> Result<Vec<ContextStats>> {
+        let sessions = self.context.sessions(&self.cx()).await?;
+        if sessions.is_empty() {
+            println!("  no sessions");
+            return Ok(sessions);
+        }
+        for stats in &sessions {
+            let marker = if stats.session == self.session {
+                "*"
+            } else {
+                " "
+            };
+            println!(
+                "{marker} {}  {:>5} record(s)  ~{:>7} tokens  owner {}",
+                stats.session, stats.records, stats.tokens, stats.owner
+            );
+        }
+        println!("  {} session(s); * is the current one", sessions.len());
+        Ok(sessions)
+    }
+
+    /// Discards the current session's transcript.
+    ///
+    /// Deliberately not followed by starting a new one. `/clear` and `/new` are different
+    /// requests — one destroys a transcript, the other walks away from it — and a command
+    /// that quietly did both would make the destructive half unavoidable for anyone who
+    /// wanted the other.
+    async fn clear_session(&mut self) -> Result<()> {
+        let cx = self.cx();
+        let removed = self.context.clear(&self.session, &cx).await?;
+        println!(
+            "  cleared session {}: {removed} record(s) removed",
+            self.session
+        );
+        Ok(())
+    }
+
+    /// Reclaims the oldest evictable records of the current session.
+    ///
+    /// Deterministic and model-free: this is [`ContextStore::compact`], which drops the
+    /// oldest unpinned records and keeps the newest `keep` of them. No model is called, so
+    /// `/compact` costs nothing, cannot fail halfway, and produces the same result every time
+    /// — and the system prompt, being pinned, is never what it removes.
+    async fn compact_session(&mut self, argument: &str) -> Result<()> {
+        let keep = match argument {
+            "" => DEFAULT_COMPACT_KEEP,
+            raw => raw.parse::<usize>().map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "`/compact` takes the number of records to keep; `{raw}` is not one"
+                ))
+            })?,
+        };
+        let cx = self.cx();
+        let before = self.context.stats(&self.session, &cx).await?;
+        let removed = self.context.compact(&self.session, keep, &cx).await?;
+        let after = self.context.stats(&self.session, &cx).await?;
+
+        let reclaimed = match (&before, &after) {
+            (Some(before), Some(after)) => before.tokens.saturating_sub(after.tokens),
+            _ => 0,
+        };
+        println!(
+            "  compacted session {}: {removed} record(s) removed, ~{reclaimed} tokens reclaimed, \
+             {} kept",
+            self.session,
+            after.map_or(0, |stats| stats.records)
+        );
+        Ok(())
+    }
+
     /// Runs one prompt, printing updates and answering approvals as they arrive.
     async fn turn(&mut self, input: String) -> Result<()> {
-        let cx = ExecutionContext::new().with_principal(self.principal.clone());
+        let cx = self.cx();
         let request = AgentRequest {
             session: self.session,
             input: vec![ContentPart::text(input)],

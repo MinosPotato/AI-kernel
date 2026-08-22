@@ -243,6 +243,7 @@ pub struct HarnessBuilder {
     user: String,
     agent: String,
     database: Option<std::path::PathBuf>,
+    session: Option<aik_api::agent::SessionId>,
     ephemeral: bool,
     config: Option<Value>,
     extra: Vec<Arc<dyn Component>>,
@@ -260,6 +261,7 @@ impl HarnessBuilder {
             user: "alice".to_owned(),
             agent: "assistant".to_owned(),
             database: None,
+            session: None,
             ephemeral: false,
             config: None,
             extra: Vec::new(),
@@ -306,6 +308,13 @@ impl HarnessBuilder {
     #[must_use]
     pub fn database(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.database = Some(path.into());
+        self
+    }
+
+    /// Resumes an existing session, which is what `--session` spells.
+    #[must_use]
+    pub fn session(mut self, session: aik_api::agent::SessionId) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -379,6 +388,7 @@ impl HarnessBuilder {
             no_tools: self.tools == ToolSet::None,
             memory: self.memory.filter(|_| self.tools != ToolSet::None),
             database,
+            session: self.session,
             ephemeral: self.ephemeral,
             ..Options::default()
         };

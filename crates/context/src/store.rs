@@ -16,6 +16,7 @@ use aik_core::id::ComponentId;
 use aik_core::{Error, Result};
 use async_trait::async_trait;
 
+use crate::retention::RetentionSweeper;
 use crate::session::{AssemblyReporter, authorize};
 use crate::tokens::HeuristicTokenCounter;
 use crate::window::assemble;
@@ -284,6 +285,147 @@ impl ContextStore for InMemoryContextStore {
         sessions.remove(session);
         Ok(removed)
     }
+
+    async fn sessions(&self, cx: &ExecutionContext) -> Result<Vec<ContextStats>> {
+        let principal = cx.principal_or_system();
+        let sessions = self.sessions.read().expect("context store lock poisoned");
+
+        // Filtered, never refused: see `ContextStore::sessions`. A session this principal
+        // may not act for is simply not in the result, so the call cannot be used to learn
+        // that it exists.
+        let mut listed: Vec<ContextStats> = sessions
+            .iter()
+            .filter(|(_, state)| principal.may_act_for(&state.owner))
+            .map(|(id, state)| ContextStats {
+                session: *id,
+                owner: state.owner.clone(),
+                records: state.records.len(),
+                tokens: state.tokens,
+                created_at: state.created_at,
+                updated_at: state.updated_at,
+            })
+            .collect();
+
+        sort_sessions(&mut listed);
+        Ok(listed)
+    }
+
+    async fn compact(
+        &self,
+        session: &SessionId,
+        keep: usize,
+        cx: &ExecutionContext,
+    ) -> Result<usize> {
+        let principal = cx.principal_or_system();
+        let mut sessions = self.sessions.write().expect("context store lock poisoned");
+        let Some(state) = sessions.get_mut(session) else {
+            return Ok(0);
+        };
+        authorize(session, &state.owner, &principal)?;
+
+        let boundary = compaction_boundary(state.records.iter().map(|record| record.pinned), keep);
+        if boundary == 0 {
+            return Ok(0);
+        }
+
+        // Below the boundary, unpinned records go and pinned ones stay exactly where they
+        // are. Nothing above the boundary is touched at all.
+        let mut kept = Vec::with_capacity(state.records.len());
+        let mut removed = 0usize;
+        let mut reclaimed = 0u64;
+        for (position, record) in std::mem::take(&mut state.records).into_iter().enumerate() {
+            if position < boundary && !record.pinned {
+                removed += 1;
+                reclaimed += record.tokens;
+            } else {
+                kept.push(record);
+            }
+        }
+        state.records = kept;
+        // Saturating rather than plain subtraction on principle: the header is the thing
+        // every later append and every `stats` call trusts, so a bug that made it disagree
+        // with the records must not also panic in a release build. That the two agree is
+        // asserted by the conformance tests instead.
+        state.tokens = state.tokens.saturating_sub(reclaimed);
+
+        // Rebuilt rather than patched: positions of everything after the cut have moved, and
+        // an index that disagreed with the vector is how `get` starts returning the wrong
+        // record.
+        state.index.clear();
+        for (position, record) in state.records.iter().enumerate() {
+            state.index.insert(record.id, position);
+        }
+
+        // `next_sequence`, `created_at` and `updated_at` are deliberately untouched.
+        // Sequence numbers are never reused, and compaction is housekeeping rather than
+        // activity — see `ContextStore::compact`.
+        Ok(removed)
+    }
+}
+
+#[async_trait]
+impl RetentionSweeper for InMemoryContextStore {
+    /// Removes every stale session under one lock, without batching.
+    ///
+    /// The persistent store batches because a batch is a transaction, an allocation and a
+    /// hold on redb's single write slot. None of those exist here: removing a session is
+    /// dropping a `HashMap` entry, there is no fsync, and the write lock is held for the
+    /// length of one retain over the session map. Splitting that into batches would add a
+    /// cancellation point the caller cannot observe and nothing else.
+    ///
+    /// Owner-blind, exactly as [`RetentionSweeper`] requires: retention is a property of the
+    /// session, not of whoever happened to trigger the sweep.
+    async fn sweep_stale(&self, cutoff: Timestamp) -> Result<usize> {
+        let mut sessions = self.sessions.write().expect("context store lock poisoned");
+        let before = sessions.len();
+        sessions.retain(|_, state| state.updated_at > cutoff);
+        Ok(before - sessions.len())
+    }
+}
+
+/// Orders an enumeration: most recently updated first, ties broken by session id.
+///
+/// Shared by both stores so that a listing does not change order across a restart. The tie
+/// break matters more than it looks: a manual clock, or two appends inside one millisecond,
+/// makes equal `updated_at` values ordinary rather than exotic, and an order that depended on
+/// hash iteration would be untestable.
+pub(crate) fn sort_sessions(sessions: &mut [ContextStats]) {
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.session.cmp(&right.session))
+    });
+}
+
+/// Where compaction cuts: the position below which unpinned records are removed.
+///
+/// `pinned` is the session's records in append order, reduced to whether each is pinned.
+/// The rule, defined once here and applied by both stores: keep the newest `keep` unpinned
+/// records, keep every pinned record wherever it sits, and remove every unpinned record
+/// below them.
+///
+/// Walking backwards is what makes "newest" mean newest without sorting: the `keep + 1`-th
+/// unpinned record counting from the end is the newest one that does *not* survive, so the
+/// boundary sits immediately after it. Zero means nothing is removed — either the session
+/// holds no more than `keep` unpinned records, or it holds none at all.
+///
+/// Note that the return value is a boundary, not a set. Records below it that are pinned are
+/// excluded individually by the caller; a caller that removed the whole prefix would delete
+/// exactly the records this contract promises never to.
+pub(crate) fn compaction_boundary(pinned: impl Iterator<Item = bool>, keep: usize) -> usize {
+    let flags: Vec<bool> = pinned.collect();
+    let mut seen = 0usize;
+    for (position, is_pinned) in flags.iter().enumerate().rev() {
+        if *is_pinned {
+            continue;
+        }
+        seen += 1;
+        if seen > keep {
+            return position + 1;
+        }
+    }
+    0
 }
 
 #[cfg(test)]

@@ -161,6 +161,10 @@ async fn converse(assembled: &wiring::Assembled, settings: &Settings) -> Result<
             if let Some(recorder) = recorder {
                 session = session.with_recorder(recorder);
             }
+            // Before the turn, so a session that does not exist or is not this run's to use
+            // fails with one line instead of after a model call. The store answers; the
+            // frontend only reports.
+            session.resume(settings).await?;
             session.one_shot(prompt.clone()).await
         }
         // Interactive: subscribing holds a gate for as long as the session lasts, which is
@@ -171,6 +175,7 @@ async fn converse(assembled: &wiring::Assembled, settings: &Settings) -> Result<
             if let Some(recorder) = recorder {
                 session = session.with_recorder(recorder);
             }
+            session.resume(settings).await?;
             session.interactive().await.map(|_| ())
         }
     }

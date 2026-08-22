@@ -298,6 +298,11 @@ impl ContextWindow {
 }
 
 /// A session's full-fidelity totals.
+///
+/// This is also what [`ContextStore::sessions`] enumerates, and the choice of type is the
+/// security decision: it is a projection of the session *header*, so there is no field on it
+/// that could carry a message, a tool result or any other transcript content. Listing
+/// sessions therefore cannot become a way to read them, however the listing is rendered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextStats {
     /// The session described.
@@ -308,9 +313,18 @@ pub struct ContextStats {
     pub records: usize,
     /// Their total estimated cost, with nothing elided or dropped.
     pub tokens: u64,
-    /// When the session's first record was appended.
+    /// When the session was created, which is when its first record was appended.
+    ///
+    /// A property of the session rather than of whichever record is currently oldest:
+    /// [`ContextStore::compact`] does not move it, so a compacted session keeps the age it
+    /// has always had.
     pub created_at: Timestamp,
     /// When its most recent record was appended.
+    ///
+    /// Appending is the only thing that moves this. Reading a session does not, and neither
+    /// does [`ContextStore::compact`] — which is what makes it usable as the retention
+    /// clock: housekeeping that reset a session's idle time would guarantee the session
+    /// never expired.
     pub updated_at: Timestamp,
 }
 
@@ -401,11 +415,18 @@ pub const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 /// # Session ownership
 ///
 /// A session belongs to the principal whose [`ExecutionContext`] first appended to it.
-/// Every method must reject a caller that is neither that principal nor one acting
-/// [`on_behalf_of`](crate::permission::Principal::on_behalf_of) it, with
+/// Every method that *names* a session must reject a caller that is neither that principal
+/// nor one acting [`on_behalf_of`](crate::permission::Principal::on_behalf_of) it, with
 /// [`Error::PermissionDenied`](aik_core::Error::PermissionDenied). A context with no
 /// principal is the system acting for itself and gets its own identity, exactly as it does
 /// in [`ToolRegistry`](crate::tool::ToolRegistry) — not a wildcard.
+///
+/// [`ContextStore::sessions`] is the sole exception, and the exception is what keeps the
+/// rule honest: it names no session, so it filters to what the caller may act for instead
+/// of refusing. Erroring there would disclose that some other principal's session exists,
+/// which is precisely what the check above is for. The owner used in either case comes from
+/// the [`ExecutionContext`] and never from a tool argument or anything else a model can
+/// write.
 #[async_trait]
 pub trait ContextStore: Send + Sync + 'static {
     /// Appends a turn, creating the session if it does not exist.
@@ -467,6 +488,85 @@ pub trait ContextStore: Send + Sync + 'static {
     ///
     /// Clearing an unknown session is not an error; it removes nothing and returns zero.
     async fn clear(&self, session: &SessionId, cx: &ExecutionContext) -> Result<usize>;
+
+    /// Lists the sessions `cx` may act for, most recently updated first.
+    ///
+    /// This is the one method here that is *not* named a session, and it is therefore the
+    /// one that must not fail closed on someone else's data. It **filters**, exactly as
+    /// [`Scheduler::list`](crate::scheduler::Scheduler::list) and
+    /// [`MemoryStore::query`](crate::memory::MemoryStore::query) do: a session the caller
+    /// may not act for is left out of the result, and is never the reason for an error.
+    /// Refusing the whole call on encountering one would answer the question the ownership
+    /// check exists to refuse — whether that session exists at all — and would turn an
+    /// enumeration into an existence oracle for every principal on the machine.
+    ///
+    /// The complement holds too, and is why the two shapes coexist: every method that names
+    /// one session keeps returning
+    /// [`Error::PermissionDenied`](aik_core::Error::PermissionDenied), because a caller that
+    /// already has the id is not the audience this rule protects.
+    ///
+    /// Implementations must:
+    ///
+    /// 1. include a session if and only if `cx`'s principal
+    ///    [`may_act_for`](crate::permission::Principal::may_act_for) its owner, so a
+    ///    delegate sees what it acts for and nothing else;
+    /// 2. return [`ContextStats`] and nothing richer — enumeration reports what a session
+    ///    *costs*, never any part of what it says;
+    /// 3. order the result deterministically: most recently updated first, ties broken by
+    ///    session id, so two calls that see the same sessions agree about their order.
+    ///
+    /// A principal with no sessions gets an empty list, not an error.
+    async fn sessions(&self, cx: &ExecutionContext) -> Result<Vec<ContextStats>>;
+
+    /// Discards the oldest evictable records of a session, keeping the newest `keep` of
+    /// them, and returns how many were removed.
+    ///
+    /// This is what makes a session that reached an implementation's per-session record
+    /// bound recoverable rather than dead: compaction lowers the record count, and appending
+    /// resumes. Sequence numbers are not reused — the transcript stays append-only, and
+    /// compaction shortens it from the front rather than rewriting it.
+    ///
+    /// # What it is, precisely
+    ///
+    /// Deterministic and model-free. There is no summarisation here and there will not be:
+    /// replacing turns with a paragraph needs a model, which makes the operation fallible,
+    /// costly, non-deterministic and a prompt-injection surface. A component above this one
+    /// can summarise by reading records through [`ContextStore::get`] and appending the
+    /// result back as an ordinary pinned record; what this method does is only reclaim.
+    ///
+    /// Implementations must:
+    ///
+    /// 1. never remove a record with [`ContextRecord::pinned`] set, whatever `keep` says —
+    ///    a system prompt that compaction could delete would be a session that silently
+    ///    changed its instructions;
+    /// 2. retain the newest `keep` *unpinned* records, counting only unpinned ones, so that
+    ///    `keep` means the same thing however many pinned records a session happens to
+    ///    carry;
+    /// 3. remove every older unpinned record, oldest first;
+    /// 4. keep [`ContextStats::records`] and [`ContextStats::tokens`] exactly consistent with
+    ///    what remains;
+    /// 5. leave [`ContextStats::created_at`] and [`ContextStats::updated_at`] alone, so
+    ///    compaction is not activity and does not reset a retention clock.
+    ///
+    /// `keep` at or above the session's unpinned record count removes nothing and returns
+    /// zero, which makes compacting an already-compacted session a no-op rather than a
+    /// slow erosion. `keep` of zero removes every unpinned record and keeps every pinned
+    /// one.
+    ///
+    /// Compaction can strand a [`ContentPart::ToolResult`] whose call it removed. That is
+    /// already handled where it matters: [`ContextStore::window`] must not emit an
+    /// unanswered tool result, so the stranded record is elided from the model payload
+    /// rather than being allowed to reach a provider that would reject it.
+    ///
+    /// Compacting an unknown session is not an error; it removes nothing and returns zero,
+    /// exactly as [`ContextStore::clear`] does. Compacting a session owned by another
+    /// principal is [`Error::PermissionDenied`](aik_core::Error::PermissionDenied).
+    async fn compact(
+        &self,
+        session: &SessionId,
+        keep: usize,
+        cx: &ExecutionContext,
+    ) -> Result<usize>;
 }
 
 /// One context window was assembled.
