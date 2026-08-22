@@ -20,7 +20,7 @@ use aik_api::model::{
 };
 use aik_api::tool::{ToolCall, ToolName};
 use aik_approval::ApprovalBroker;
-use aik_cli::args::{Options, ToolSet};
+use aik_cli::args::{MemorySet, Options, ToolSet};
 use aik_cli::settings::Settings;
 use aik_core::ComponentId;
 use aik_core::prelude::*;
@@ -186,6 +186,43 @@ pub struct Harness {
     pub model: Arc<ScriptedModel>,
     /// The settings the kernel was built from.
     pub settings: Settings,
+    /// The directory holding this harness's database, kept alive for its lifetime.
+    ///
+    /// Deliberately *not* the filesystem root: a database inside the directory the agent's
+    /// filesystem tools are confined to would be a file the agent could read, and would
+    /// show up in every directory listing a test asserts on.
+    pub data: Option<tempfile::TempDir>,
+}
+
+impl Harness {
+    /// Stops the kernel and drops it, releasing the database file.
+    ///
+    /// Both halves matter. `shutdown` stops the components; the `Arc<Db>` is owned by the
+    /// registry the *kernel* owns, so redb keeps its exclusive lock until the kernel itself
+    /// is gone. A test that only awaited `shutdown` would find the next open of the same
+    /// path failing, and would be right to.
+    pub async fn stop(self) {
+        let Harness { kernel, data, .. } = self;
+        kernel.shutdown().await.expect("the kernel stops cleanly");
+        drop(kernel);
+        drop(data);
+    }
+
+    /// The tool registry the agent uses, which is the only door onto a tool.
+    pub fn tools(&self) -> Arc<dyn aik_api::tool::ToolRegistry> {
+        self.kernel
+            .context()
+            .service::<dyn aik_api::tool::ToolRegistry>()
+            .expect("the tool registry is published")
+    }
+
+    /// The execution context one of this run's turns would carry.
+    ///
+    /// Built from the resolved settings rather than assembled here, so a test cannot
+    /// accidentally assert against a principal the frontend would never produce.
+    pub fn cx(&self) -> ExecutionContext {
+        ExecutionContext::new().with_principal(self.settings.principal())
+    }
 }
 
 impl std::fmt::Debug for Harness {
@@ -200,10 +237,15 @@ impl std::fmt::Debug for Harness {
 pub struct HarnessBuilder {
     policy: Option<Value>,
     tools: ToolSet,
+    memory: Option<MemorySet>,
     prompt: Option<String>,
     replies: Vec<Reply>,
     user: String,
     agent: String,
+    database: Option<std::path::PathBuf>,
+    ephemeral: bool,
+    config: Option<Value>,
+    extra: Vec<Arc<dyn Component>>,
 }
 
 impl HarnessBuilder {
@@ -212,11 +254,66 @@ impl HarnessBuilder {
         Self {
             policy: None,
             tools: ToolSet::ReadOnly,
+            memory: None,
             prompt: None,
             replies: Vec::new(),
             user: "alice".to_owned(),
             agent: "assistant".to_owned(),
+            database: None,
+            ephemeral: false,
+            config: None,
+            extra: Vec::new(),
         }
+    }
+
+    /// Writes `document` as the run's `--config` file.
+    ///
+    /// A harness given a configuration file is *not* also given a `--db`, so whatever the
+    /// document says about `components.store.db.path` is the only thing that can produce a
+    /// database — which is the point of using one.
+    #[must_use]
+    pub fn config(mut self, document: Value) -> Self {
+        self.config = Some(document);
+        self
+    }
+
+    /// Names the agent, which is the principal a memory or a job ends up owned by.
+    #[must_use]
+    pub fn agent(mut self, agent: &str) -> Self {
+        self.agent = agent.to_owned();
+        self
+    }
+
+    /// Adds a component alongside the ones the frontend wires.
+    ///
+    /// For the things a real deployment contributes and the frontend does not: a job
+    /// handler, most obviously. It is added to the *same* builder `wiring::builder`
+    /// produced, so what it joins is the production kernel rather than a copy of it.
+    #[must_use]
+    pub fn component(mut self, component: Arc<dyn Component>) -> Self {
+        self.extra.push(component);
+        self
+    }
+
+    /// Sets which memory tools are registered, overriding the shipped default.
+    #[must_use]
+    pub fn memory(mut self, memory: MemorySet) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Opens this database rather than a fresh one, which is how a restart is spelled.
+    #[must_use]
+    pub fn database(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.database = Some(path.into());
+        self
+    }
+
+    /// Runs with no database at all.
+    #[must_use]
+    pub fn ephemeral(mut self) -> Self {
+        self.ephemeral = true;
+        self
     }
 
     /// Sets the policy document's rules.
@@ -255,7 +352,24 @@ impl HarnessBuilder {
     }
 
     /// Builds and starts the kernel, rooted at `root`.
+    ///
+    /// Durable by default, exactly as the shipped frontend is — but never at the path the
+    /// shipped frontend would choose. The database goes in a temporary directory of this
+    /// harness's own, and the environment handed to `Settings::resolve_from` is empty of
+    /// `HOME` and `XDG_DATA_HOME`, so a bug that lost the explicit path would fail the test
+    /// with "there is no default location for the database" rather than quietly opening the
+    /// database of whoever ran the suite.
     pub async fn build(self, root: &Path) -> Harness {
+        // A configuration file is the other way to name a database, so a harness using one
+        // gets no `--db` to mask a mistake in it.
+        let implicit = !self.ephemeral && self.database.is_none() && self.config.is_none();
+        let data = implicit.then(|| tempfile::tempdir().expect("a temporary data directory"));
+        let database = match (self.ephemeral, self.database.clone()) {
+            (true, _) => None,
+            (false, Some(path)) => Some(path),
+            (false, None) => data.as_ref().map(|data| data.path().join("aik.redb")),
+        };
+
         let mut options = Options {
             root: Some(root.to_path_buf()),
             user: Some(self.user.clone()),
@@ -263,6 +377,9 @@ impl HarnessBuilder {
             prompt: self.prompt.clone(),
             write: self.tools == ToolSet::ReadWrite,
             no_tools: self.tools == ToolSet::None,
+            memory: self.memory.filter(|_| self.tools != ToolSet::None),
+            database,
+            ephemeral: self.ephemeral,
             ..Options::default()
         };
         options.model = Some("scripted".to_owned());
@@ -274,13 +391,22 @@ impl HarnessBuilder {
         });
         options.policy = policy_file;
 
+        options.config = self.config.as_ref().map(|document| {
+            let path = root.join(".aik.json");
+            std::fs::write(&path, document.to_string()).expect("a configuration file");
+            path
+        });
+
         let mut settings = Settings::resolve_from(&options, Vec::<(String, String)>::new())
             .expect("resolved settings");
         settings.model_component = ComponentId::new(STUB_MODEL);
 
         let model = Arc::new(ScriptedModel::new(self.replies));
-        let (builder, broker) =
+        let (mut builder, broker) =
             aik_cli::wiring::builder(&settings, ModelId::new("scripted")).expect("wiring");
+        for component in self.extra {
+            builder = builder.shared_component(component);
+        }
         let kernel = builder
             .component(StubModelComponent::new(model.clone()))
             .build()
@@ -292,6 +418,7 @@ impl HarnessBuilder {
             broker,
             model,
             settings,
+            data,
         }
     }
 }

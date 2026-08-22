@@ -2,9 +2,25 @@
 //!
 //! This module registers components and nothing else. Every decision it makes is a *wiring*
 //! decision — which tools exist, which policy engine reads which configuration, where
-//! approvals go — and none of them is an authorization decision. The frontend cannot allow
-//! anything: it can only decline to register a capability, which narrows what the rest of
-//! the system will consider and can never widen it.
+//! approvals go, whether anything is written to a disk — and none of them is an
+//! authorization decision. The frontend cannot allow anything: it can only decline to
+//! register a capability, which narrows what the rest of the system will consider and can
+//! never widen it.
+//!
+//! # The durable stack
+//!
+//! The transcript, the agent's memories and the schedule are three subsystems over one
+//! database, and each publishes the same capability under the same component id whichever
+//! backend is chosen. So the choice is one `match` on [`Storage`] and nothing downstream
+//! changes: the agent resolves `dyn ContextStore`, the memory tools bind to
+//! `dyn MemoryStore`, and neither can tell — nor should be able to tell — whether what it
+//! got survives a restart.
+//!
+//! The database itself is opened by [`StoreComponent`], which reads its path from the
+//! configuration tree. The frontend resolves that path in
+//! [`Settings`](crate::settings::Settings) and pins it there, so the component never
+//! consults the process environment on its own and the path in the banner is the path on
+//! disk.
 
 use std::sync::Arc;
 
@@ -12,15 +28,18 @@ use aik_agent::AgentComponent;
 use aik_api::model::{ModelId, ModelProvider};
 use aik_api::permission::ApprovalSink;
 use aik_approval::{ApprovalBroker, ApprovalComponent};
-use aik_context::ContextComponent;
+use aik_context::{ContextComponent, RedbContextComponent};
 use aik_core::prelude::*;
 use aik_fs::{FsListTool, FsReadTool, FsWriteTool};
+use aik_memory::{MemoryComponent, MemoryToolsComponent, RedbMemoryComponent};
 use aik_ollama::OllamaComponent;
 use aik_policy::RuleBasedPolicyEngine;
+use aik_scheduler::{RedbSchedulerComponent, SchedulerComponent};
+use aik_store::StoreComponent;
 use aik_tools::ToolsComponent;
 
-use crate::args::ToolSet;
-use crate::settings::Settings;
+use crate::args::{MemorySet, ToolSet};
+use crate::settings::{Settings, Storage};
 
 /// The configuration path the policy document is read from.
 pub const POLICY_SECTION: &str = "policy";
@@ -75,6 +94,33 @@ pub fn builder(
         }
     }
 
+    // The same limit again, over the record store. The tools are handed out by a component
+    // that binds them to whichever `dyn MemoryStore` the kernel published, so the volatile
+    // and the durable backend are wired identically and the frontend never has to know
+    // which one it got.
+    let memory_tools = MemoryToolsComponent::new();
+    match settings.memory {
+        MemorySet::Off => {}
+        MemorySet::Recall => {
+            tools = tools
+                .with_tool(memory_tools.get())
+                .with_tool(memory_tools.query());
+        }
+        MemorySet::Remember => {
+            tools = tools
+                .with_tool(memory_tools.get())
+                .with_tool(memory_tools.query())
+                .with_tool(memory_tools.put());
+        }
+        MemorySet::Full => {
+            tools = tools
+                .with_tool(memory_tools.get())
+                .with_tool(memory_tools.query())
+                .with_tool(memory_tools.put())
+                .with_tool(memory_tools.delete());
+        }
+    }
+
     let agent = AgentComponent::new(settings.agent.clone(), settings.loop_settings(model))
         .described("the terminal frontend's assistant")
         .requires(aik_tools::DEFAULT_COMPONENT_ID)
@@ -84,11 +130,32 @@ pub fn builder(
     let builder = Kernel::builder()
         .config(settings.config.clone())
         .component(ApprovalComponent::new(broker.clone()))
-        .component(tools)
-        .component(ContextComponent::new())
-        .component(agent);
+        .component(tools);
 
-    Ok((builder, broker))
+    // One decision, applied to all three: see [`Storage`]. Both arms publish the same
+    // capabilities under the same component ids, so nothing downstream — the agent, the
+    // memory tools, the registry — can tell which one it got except by outliving a restart.
+    let builder = match &settings.storage {
+        Storage::Ephemeral => builder
+            .component(ContextComponent::new())
+            .component(MemoryComponent::new())
+            .component(SchedulerComponent::new()),
+        Storage::Persistent(_) => builder
+            .component(StoreComponent::new())
+            .component(RedbContextComponent::new())
+            .component(RedbMemoryComponent::new())
+            .component(RedbSchedulerComponent::new()),
+    };
+
+    // Registered only when it has something to bind. With no memory tools exposed, the
+    // store is still there — it is infrastructure, and something other than a tool may come
+    // to use it — but nothing hands a model a door onto it.
+    let builder = match settings.memory {
+        MemorySet::Off => builder,
+        _ => builder.component(memory_tools),
+    };
+
+    Ok((builder.component(agent), broker))
 }
 
 /// Builds the frontend's kernel, with the Ollama provider as its model source.

@@ -180,6 +180,14 @@ fn banner(settings: &Settings) {
     println!("{} {VERSION}", args::PROGRAM);
     println!("  agent:  {} acting for {}", settings.agent, settings.user);
     println!("  root:   {}", settings.root.display());
+    // Said out loud for the same reason the absent policy is: where a durable record of
+    // every conversation lands is something a person should be told, not something they
+    // discover later.
+    match settings.database() {
+        Some(path) => println!("  store:  {}", path.display()),
+        None => println!("  store:  none (--ephemeral: nothing is written to disk)"),
+    }
+    println!("  memory: {}", settings.memory.as_str());
     if !settings.has_policy() {
         println!(
             "  policy: none configured, so every tool call will be denied.\n\
