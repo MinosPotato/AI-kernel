@@ -13,6 +13,7 @@ members = [
     "crates/store",
     "crates/memory",
     "crates/scheduler",
+    "crates/integration",
     "crates/agent",
     "crates/cli",
 ]

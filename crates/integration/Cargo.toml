@@ -1,0 +1,37 @@
+[package]
+name = "aik-integration"
+description = "Cross-subsystem integration tests for the AI kernel. Contains no library code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+
+# Every dependency is dev-only and deliberately so: this crate ships nothing. It exists
+# because the behaviour it asserts belongs to no single subsystem — a test that the
+# scheduler, the memory store and the policy engine agree about a principal cannot live in
+# any one of their suites without that crate depending on the other two.
+[dev-dependencies]
+aik-core.workspace = true
+aik-api.workspace = true
+aik-store.workspace = true
+aik-context.workspace = true
+aik-memory.workspace = true
+aik-scheduler.workspace = true
+aik-tools.workspace = true
+aik-policy.workspace = true
+aik-fs.workspace = true
+aik-agent.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tempfile.workspace = true

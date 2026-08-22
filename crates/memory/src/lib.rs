@@ -15,6 +15,11 @@
 //!   the same conformance tests, because "persistent" must not mean "subtly different".
 //! * [`MemoryComponent`] and [`RedbMemoryComponent`] — the kernel wiring for each, including
 //!   the background sweep that reclaims expired records.
+//! * [`tools`] — the four tools that put memory within an agent's reach, and the component
+//!   that binds them to whichever store the kernel published. They are how an agent stores
+//!   and recalls anything: through the tool registry, so that policy is consulted and the
+//!   owner is the principal the run is for. See that module for why that is the only path
+//!   offered.
 //!
 //! ```
 //! use aik_api::execution::ExecutionContext;
@@ -72,6 +77,11 @@
 //! * **It does not decide retention policy.** Records expire if something set
 //!   `expires_at`; nothing here decides what that should be for a given kind, because that
 //!   is a judgement about the value of a memory rather than about storing one.
+//! * **It does not remember or recall on its own.** Nothing watches a conversation for facts
+//!   worth keeping, and nothing slips recalled records into a prompt. A memory is written
+//!   when something asks for it to be written — through [`tools`], that means a model asked
+//!   and a policy agreed — so every memory in the store is one an audit trail can account
+//!   for.
 
 mod component;
 mod expiry;
@@ -79,6 +89,7 @@ mod owner;
 mod persistent;
 mod query;
 mod store;
+pub mod tools;
 
 pub use component::{
     DEFAULT_COMPONENT_ID, DEFAULT_EXPIRY_SWEEP_INTERVAL, MemoryComponent, RedbMemoryComponent,
@@ -86,3 +97,7 @@ pub use component::{
 pub use expiry::{DEFAULT_SWEEP_BATCH, ExpirySweeper};
 pub use persistent::RedbMemoryStore;
 pub use store::InMemoryMemoryStore;
+pub use tools::{
+    DEFAULT_TOOLS_COMPONENT_ID, MemoryDeleteTool, MemoryGetTool, MemoryPutTool, MemoryQueryTool,
+    MemoryToolsComponent,
+};

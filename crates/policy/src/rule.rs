@@ -12,8 +12,31 @@ use crate::pattern::Pattern;
 
 /// Matches a [`Principal`](aik_api::permission::Principal).
 ///
-/// Both fields constrain independently (logical AND); omitting a field means "any" for
-/// that field. The default matcher — both fields omitted — matches every principal.
+/// Every field constrains independently (logical AND); omitting a field means "any" for
+/// that field. The default matcher — every field omitted — matches every principal.
+///
+/// # Matching delegated authority
+///
+/// [`on_behalf_of`](PrincipalMatcher::on_behalf_of) is what lets a rule tell one delegate
+/// from another, and it exists because without it they are indistinguishable here. Two
+/// subsystems mint delegated principals: an agent runs as itself acting for the user who
+/// started it, and every scheduled firing runs as a fixed scheduler identity acting for the
+/// job's owner. Both therefore reach this matcher under *one* id — `assistant`, `scheduler`
+/// — however many people's work they are doing.
+///
+/// So a rule written as `{ "id": "scheduler", "effect": { "decision": "allow" } }` grants
+/// every owner's jobs the same authority, which is almost never what the operator meant.
+/// Naming the delegator is what narrows it:
+///
+/// ```json
+/// { "principal": { "id": "scheduler", "on_behalf_of": "alice" },
+///   "action": "filesystem.write", "resource": "/home/alice/*",
+///   "effect": { "decision": "allow" } }
+/// ```
+///
+/// The field is optional so that every policy written before it existed keeps its meaning
+/// exactly. That does mean the *broad* form is still the short one; a rule about delegated
+/// work should say whose work it is about.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PrincipalMatcher {
@@ -22,6 +45,21 @@ pub struct PrincipalMatcher {
     /// If present, the principal must be of this kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<PrincipalKind>,
+    /// Matched against the principal this one is
+    /// [acting for](aik_api::permission::Principal::on_behalf_of).
+    ///
+    /// Omitting it — the default — matches **any delegation state**, including none, which
+    /// is what every rule written before this field existed continues to mean. Present, the
+    /// principal must be acting for somebody *and* that somebody must match: so `"*"` reads
+    /// "any delegate, nobody autonomous", and `"alice"` reads "whatever is acting for
+    /// Alice".
+    ///
+    /// There is deliberately no way to say "acting for nobody" yet. The question this field
+    /// was added to answer is which delegator, and a spelling for the autonomous case should
+    /// be chosen when something actually needs to deny autonomous action specifically —
+    /// inventing one now would be guessing at a syntax nothing has asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<Pattern>,
 }
 
 impl Default for PrincipalMatcher {
@@ -29,6 +67,7 @@ impl Default for PrincipalMatcher {
         Self {
             id: Pattern::Any,
             kind: None,
+            on_behalf_of: None,
         }
     }
 }
@@ -37,6 +76,24 @@ impl PrincipalMatcher {
     fn matches(&self, principal: &aik_api::permission::Principal) -> bool {
         self.id.matches(principal.id.as_str())
             && self.kind.is_none_or(|kind| kind == principal.kind)
+            && delegation_matches(self.on_behalf_of.as_ref(), principal.on_behalf_of.as_ref())
+    }
+}
+
+/// Whether a principal's delegation satisfies a matcher's `on_behalf_of`.
+///
+/// Absent matcher: anything, delegated or not — the backward-compatible reading, and the
+/// only one that leaves an existing policy document meaning what it meant. Present matcher:
+/// the principal has to be acting for somebody, and that somebody has to match. A principal
+/// acting for nobody therefore fails *every* present matcher, `"*"` included, which is what
+/// makes `"*"` mean "some delegate" rather than "anyone at all".
+fn delegation_matches(
+    matcher: Option<&Pattern>,
+    on_behalf_of: Option<&aik_api::permission::PrincipalId>,
+) -> bool {
+    match matcher {
+        None => true,
+        Some(pattern) => on_behalf_of.is_some_and(|owner| pattern.matches(owner.as_str())),
     }
 }
 
@@ -102,6 +159,14 @@ impl PolicyRule {
             return Err(Error::config(
                 "principal.id",
                 "principal id pattern must not be empty",
+            ));
+        }
+        if let Some(on_behalf_of) = &self.principal.on_behalf_of
+            && on_behalf_of.is_vacuous()
+        {
+            return Err(Error::config(
+                "principal.on_behalf_of",
+                "principal on_behalf_of pattern must not be empty",
             ));
         }
         if let Some(resource) = &self.resource
@@ -218,6 +283,7 @@ mod tests {
             principal: PrincipalMatcher {
                 id: Pattern::parse("agent-1"),
                 kind: Some(PrincipalKind::Agent),
+                on_behalf_of: None,
             },
             action: Pattern::parse("*"),
             resource: None,
@@ -293,6 +359,120 @@ mod tests {
         rule.resource = None;
         rule.principal.id = Pattern::parse("");
         assert!(rule.validate().is_err());
+    }
+
+    fn matcher(json: serde_json::Value) -> PrincipalMatcher {
+        serde_json::from_value(json).expect("a valid matcher")
+    }
+
+    fn delegate(id: &str, owner: Option<&str>) -> aik_api::permission::Principal {
+        let principal = aik_api::permission::Principal::new(id, PrincipalKind::System);
+        match owner {
+            Some(owner) => principal.on_behalf_of(owner),
+            None => principal,
+        }
+    }
+
+    #[test]
+    fn an_omitted_on_behalf_of_matches_every_delegation_state() {
+        // The backward-compatibility guarantee: a document written before this field existed
+        // still selects exactly the principals it always did.
+        let any = matcher(serde_json::json!({ "id": "scheduler" }));
+        assert_eq!(any.on_behalf_of, None);
+        assert!(any.matches(&delegate("scheduler", None)));
+        assert!(any.matches(&delegate("scheduler", Some("alice"))));
+        assert!(any.matches(&delegate("scheduler", Some("bob"))));
+    }
+
+    #[test]
+    fn a_named_on_behalf_of_matches_that_delegator_and_nobody_else() {
+        let for_alice = matcher(serde_json::json!({ "id": "scheduler", "on_behalf_of": "alice" }));
+        assert!(for_alice.matches(&delegate("scheduler", Some("alice"))));
+        assert!(!for_alice.matches(&delegate("scheduler", Some("bob"))));
+        assert!(
+            !for_alice.matches(&delegate("scheduler", None)),
+            "a principal acting for nobody is not acting for alice"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_on_behalf_of_means_some_delegate_rather_than_anyone() {
+        let any_delegate = matcher(serde_json::json!({ "id": "scheduler", "on_behalf_of": "*" }));
+        assert!(any_delegate.matches(&delegate("scheduler", Some("alice"))));
+        assert!(any_delegate.matches(&delegate("scheduler", Some("bob"))));
+        assert!(
+            !any_delegate.matches(&delegate("scheduler", None)),
+            "`*` here separates delegated work from autonomous work; matching both would \
+             make the field unable to express the only distinction it was added for"
+        );
+    }
+
+    #[test]
+    fn on_behalf_of_matches_by_prefix_like_every_other_axis() {
+        let team = matcher(serde_json::json!({ "id": "*", "on_behalf_of": "team-*" }));
+        assert!(team.matches(&delegate("scheduler", Some("team-ops"))));
+        assert!(!team.matches(&delegate("scheduler", Some("teamster"))));
+    }
+
+    #[test]
+    fn the_delegation_matcher_composes_with_the_other_axes_rather_than_replacing_them() {
+        let matcher = matcher(serde_json::json!({
+            "id": "scheduler", "kind": "system", "on_behalf_of": "alice"
+        }));
+        assert!(matcher.matches(&delegate("scheduler", Some("alice"))));
+        assert!(
+            !matcher.matches(&delegate("agent", Some("alice"))),
+            "id still constrains"
+        );
+        assert!(
+            !matcher.matches(
+                &aik_api::permission::Principal::new("scheduler", PrincipalKind::Agent)
+                    .on_behalf_of("alice")
+            ),
+            "kind still constrains"
+        );
+    }
+
+    #[test]
+    fn an_empty_on_behalf_of_pattern_fails_validation() {
+        // The same typo guard the other axes have: an empty string parses as an exact match
+        // on nothing, which can only ever be a mistake in a document.
+        let rule = PolicyRule {
+            principal: PrincipalMatcher {
+                id: Pattern::parse("*"),
+                kind: None,
+                on_behalf_of: Some(Pattern::parse("")),
+            },
+            action: Pattern::parse("*"),
+            resource: None,
+            context: None,
+            effect: Decision::Allow,
+            description: None,
+        };
+        let error = rule.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("on_behalf_of"),
+            "the failure has to name the field that is wrong: {error}"
+        );
+    }
+
+    #[test]
+    fn a_matcher_round_trips_through_configuration() {
+        let matcher = matcher(serde_json::json!({ "id": "scheduler", "on_behalf_of": "alice" }));
+        let json = serde_json::to_value(&matcher).unwrap();
+        assert_eq!(json["on_behalf_of"], serde_json::json!("alice"));
+        assert_eq!(
+            serde_json::from_value::<PrincipalMatcher>(json).unwrap(),
+            matcher
+        );
+
+        let plain = PrincipalMatcher::default();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(
+            json.get("on_behalf_of").is_none(),
+            "an unset delegation matcher is absent rather than null, so a round trip cannot \
+             turn `any` into something narrower"
+        );
     }
 
     #[test]

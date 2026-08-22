@@ -91,6 +91,34 @@ impl ExecutionContext {
         }
     }
 
+    /// The principal this operation acts as, defaulting to the system.
+    ///
+    /// A context with no principal is the system acting **on its own behalf** — a startup
+    /// task, a scheduled firing, a maintenance sweep. It is a specific identity, not a
+    /// wildcard and not "unauthenticated": [`Principal::system`] owns what it creates and
+    /// [`Principal::may_act_for`](crate::permission::Principal::may_act_for) gives it no
+    /// authority over anybody else's records.
+    ///
+    /// This lives here, on the context, because it is a security default rather than a
+    /// convenience. Every subsystem that owns resources — the context store, the memory
+    /// store, the scheduler, the tool registry — has to answer "who is this?" the same way,
+    /// and a copy of the answer per crate is a copy that can drift. There is one answer, and
+    /// this is it.
+    ///
+    /// ```
+    /// use aik_api::execution::ExecutionContext;
+    /// use aik_api::permission::{Principal, PrincipalKind};
+    ///
+    /// assert_eq!(ExecutionContext::new().principal_or_system(), Principal::system());
+    ///
+    /// let alice = Principal::new("alice", PrincipalKind::User);
+    /// let cx = ExecutionContext::new().with_principal(alice.clone());
+    /// assert_eq!(cx.principal_or_system(), alice);
+    /// ```
+    pub fn principal_or_system(&self) -> Principal {
+        self.principal.clone().unwrap_or_else(Principal::system)
+    }
+
     /// Returns true if the operation has been cancelled or its deadline has passed.
     pub fn is_expired(&self, clock: &dyn Clock) -> bool {
         self.cancellation.is_cancelled()

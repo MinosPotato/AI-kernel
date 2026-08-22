@@ -143,6 +143,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-integration"
+version = "0.1.0"
+dependencies = [
+ "aik-agent",
+ "aik-api",
+ "aik-context",
+ "aik-core",
+ "aik-fs",
+ "aik-memory",
+ "aik-policy",
+ "aik-scheduler",
+ "aik-store",
+ "aik-tools",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "aik-memory"
 version = "0.1.0"
 dependencies = [
@@ -150,6 +172,7 @@ dependencies = [
  "aik-context",
  "aik-core",
  "aik-store",
+ "aik-tools",
  "async-trait",
  "serde",
  "serde_json",

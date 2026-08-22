@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::expiry::{DEFAULT_SWEEP_BATCH, ExpirySweeper, is_live};
-use crate::owner::{authorize, principal_of};
+use crate::owner::authorize;
 use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
 
 /// One row per record, keyed by id.
@@ -205,7 +205,7 @@ impl RedbMemoryStore {
 impl MemoryStore for RedbMemoryStore {
     async fn put(&self, record: MemoryRecord, cx: &ExecutionContext) -> Result<()> {
         let db = self.db.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let _queued = self.db.writes().lock().await;
         let joined =
             tokio::task::spawn_blocking(move || put_blocking(db.database(), record, &principal))
@@ -215,7 +215,7 @@ impl MemoryStore for RedbMemoryStore {
 
     async fn get(&self, id: &MemoryId, cx: &ExecutionContext) -> Result<Option<MemoryRecord>> {
         let db = self.db.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let id = *id;
         let joined =
             tokio::task::spawn_blocking(move || get_blocking(db.database(), id, &principal)).await;
@@ -224,7 +224,7 @@ impl MemoryStore for RedbMemoryStore {
 
     async fn delete(&self, id: &MemoryId, cx: &ExecutionContext) -> Result<bool> {
         let db = self.db.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let id = *id;
         let _queued = self.db.writes().lock().await;
         let joined =
@@ -236,7 +236,7 @@ impl MemoryStore for RedbMemoryStore {
     async fn query(&self, query: &MemoryQuery, cx: &ExecutionContext) -> Result<Vec<MemoryMatch>> {
         reject_unsupported(query)?;
         let db = self.db.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let query = query.clone();
         let now = self.clock.now();
         let joined = tokio::task::spawn_blocking(move || {

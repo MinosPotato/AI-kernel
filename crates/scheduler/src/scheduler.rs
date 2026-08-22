@@ -40,7 +40,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::events::Publisher;
-use crate::owner::{authorize, principal_of};
+use crate::owner::authorize;
 use crate::runner::{Firing, RunGuard, RunSlot, Running, execute};
 use crate::state::{JobState, Recovery, first_run, next_run, recover, validate};
 use crate::store::JobStore;
@@ -558,7 +558,7 @@ impl Scheduler for JobScheduler {
         }
         validate(&spec, self.is_persistent())?;
 
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let now = self.publisher.now();
         let mut schedule = self.schedule.lock().await;
 
@@ -618,7 +618,7 @@ impl Scheduler for JobScheduler {
     /// frees its id for somebody else — so both are authorised before either is touched, and
     /// a refusal leaves the schedule exactly as it was.
     async fn cancel(&self, id: &JobId, cx: &ExecutionContext) -> Result<bool> {
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let mut schedule = self.schedule.lock().await;
 
         let scheduled = schedule.get(id).cloned();
@@ -666,7 +666,7 @@ impl Scheduler for JobScheduler {
 
     /// Lists the jobs `cx` may act for, ordered by id.
     async fn list(&self, cx: &ExecutionContext) -> Result<Vec<ScheduledJob>> {
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let schedule = self.schedule.lock().await;
         Ok(schedule
             .values()

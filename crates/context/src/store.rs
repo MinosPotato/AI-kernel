@@ -16,7 +16,7 @@ use aik_core::id::ComponentId;
 use aik_core::{Error, Result};
 use async_trait::async_trait;
 
-use crate::session::{AssemblyReporter, authorize, principal_of};
+use crate::session::{AssemblyReporter, authorize};
 use crate::tokens::HeuristicTokenCounter;
 use crate::window::assemble;
 
@@ -155,7 +155,7 @@ impl ContextStore for InMemoryContextStore {
         entry: ContextEntry,
         cx: &ExecutionContext,
     ) -> Result<ContextRecord> {
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let now = self.clock.now();
         // Counted outside the lock: an arbitrarily large message must not hold up every
         // other session while it is measured.
@@ -222,7 +222,7 @@ impl ContextStore for InMemoryContextStore {
         let Some(state) = sessions.get(session) else {
             return Ok(None);
         };
-        authorize(session, &state.owner, &principal_of(cx))?;
+        authorize(session, &state.owner, &cx.principal_or_system())?;
 
         Ok(state
             .index
@@ -242,7 +242,7 @@ impl ContextStore for InMemoryContextStore {
             let Some(state) = sessions.get(session) else {
                 return Ok(ContextWindow::empty());
             };
-            authorize(session, &state.owner, &principal_of(cx))?;
+            authorize(session, &state.owner, &cx.principal_or_system())?;
             assemble(&state.records, budget, self.counter.as_ref())
         };
 
@@ -261,7 +261,7 @@ impl ContextStore for InMemoryContextStore {
         let Some(state) = sessions.get(session) else {
             return Ok(None);
         };
-        authorize(session, &state.owner, &principal_of(cx))?;
+        authorize(session, &state.owner, &cx.principal_or_system())?;
 
         Ok(Some(ContextStats {
             session: *session,
@@ -278,7 +278,7 @@ impl ContextStore for InMemoryContextStore {
         let Some(state) = sessions.get(session) else {
             return Ok(0);
         };
-        authorize(session, &state.owner, &principal_of(cx))?;
+        authorize(session, &state.owner, &cx.principal_or_system())?;
 
         let removed = state.records.len();
         sessions.remove(session);

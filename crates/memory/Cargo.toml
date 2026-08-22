@@ -28,3 +28,8 @@ tempfile.workspace = true
 # Dev-only, and only for the test that proves two durable subsystems can share one database
 # file. Nothing in `aik-memory` itself knows the transcript store exists.
 aik-context.workspace = true
+# Dev-only, and only so the wiring examples in `crate::tools` are compiled rather than
+# merely written down: registering a tool is what those examples are about, and an example
+# that shows it without the registry would be showing half of it. Nothing in `aik-memory`
+# itself depends on the registry — the tools are written against `aik_api::tool::Tool`.
+aik-tools.workspace = true

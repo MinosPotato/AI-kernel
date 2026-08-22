@@ -18,19 +18,9 @@
 //! can never construct one — and defence in depth against a confused caller. It is not a
 //! boundary against hostile code already inside the process.
 
-use aik_api::execution::ExecutionContext;
 use aik_api::memory::MemoryId;
 use aik_api::permission::{Principal, PrincipalId};
 use aik_core::{Error, Result};
-
-/// The principal a context is acting as.
-///
-/// A context with no principal is the system acting for itself — its own identity, not a
-/// wildcard — exactly as it is in [`ToolRegistry`](aik_api::tool::ToolRegistry) and in the
-/// context store.
-pub(crate) fn principal_of(cx: &ExecutionContext) -> Principal {
-    cx.principal.clone().unwrap_or_else(Principal::system)
-}
 
 /// Fails closed unless `principal` may act for the record's `owner`.
 ///

@@ -75,7 +75,7 @@ use aik_store::{Db, store_error};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::session::{AssemblyReporter, authorize, principal_of};
+use crate::session::{AssemblyReporter, authorize};
 use crate::store::DEFAULT_MAX_RECORDS_PER_SESSION;
 use crate::tokens::HeuristicTokenCounter;
 use crate::window::assemble;
@@ -240,7 +240,7 @@ impl ContextStore for RedbContextStore {
     ) -> Result<ContextRecord> {
         let db = self.db.clone();
         let counter = self.counter.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let session = *session;
         let now = self.clock.now();
         let max_records = self.max_records;
@@ -268,7 +268,7 @@ impl ContextStore for RedbContextStore {
         cx: &ExecutionContext,
     ) -> Result<Option<ContextRecord>> {
         let db = self.db.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let session = *session;
         let id = *id;
 
@@ -287,7 +287,7 @@ impl ContextStore for RedbContextStore {
     ) -> Result<ContextWindow> {
         let db = self.db.clone();
         let counter = self.counter.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let session = *session;
         let budget = *budget;
 
@@ -315,7 +315,7 @@ impl ContextStore for RedbContextStore {
         cx: &ExecutionContext,
     ) -> Result<Option<ContextStats>> {
         let db = self.db.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let session = *session;
 
         let joined =
@@ -326,7 +326,7 @@ impl ContextStore for RedbContextStore {
 
     async fn clear(&self, session: &SessionId, cx: &ExecutionContext) -> Result<usize> {
         let db = self.db.clone();
-        let principal = principal_of(cx);
+        let principal = cx.principal_or_system();
         let session = *session;
 
         let _queued = self.db.writes().lock().await;

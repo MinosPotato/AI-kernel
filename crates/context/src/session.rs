@@ -18,14 +18,6 @@ use aik_core::event::{Envelope, EventBus};
 use aik_core::id::ComponentId;
 use aik_core::{Error, Result};
 
-/// The principal a context is acting as.
-///
-/// A context with no principal is the system acting for itself — its own identity, not a
-/// wildcard — exactly as it is in [`ToolRegistry`](aik_api::tool::ToolRegistry).
-pub(crate) fn principal_of(cx: &ExecutionContext) -> Principal {
-    cx.principal.clone().unwrap_or_else(Principal::system)
-}
-
 /// Fails closed unless `principal` owns `session`.
 ///
 /// The principal is passed in rather than the [`ExecutionContext`] because a persistent
