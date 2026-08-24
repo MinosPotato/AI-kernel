@@ -230,6 +230,13 @@ fn banner(settings: &Settings) {
         None => println!("  store:  none (--ephemeral: nothing is written to disk)"),
     }
     println!("  memory: {}", settings.runtime.memory.as_str());
+    if !settings.runtime.has_system_prompt() {
+        println!(
+            "  prompt: none configured, so the agent is told nothing about what it can do.\n\
+             \x20         set `{}` to say so.",
+            aik_runtime::SYSTEM_PROMPT_KEY,
+        );
+    }
     if !settings.has_policy() {
         println!(
             "  policy: none configured, so every tool call will be denied.\n\

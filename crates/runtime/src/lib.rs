@@ -58,7 +58,8 @@ pub mod wiring;
 
 pub use jobs::{AgentJobComponent, AgentJobHandler, AgentJobPayload};
 pub use settings::{
-    DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, JobExecution, MemorySet, POLICY_SECTION,
-    RuntimeSettings, Storage, ToolSet, pin_database_path,
+    AGENT_SECTION, DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, JobExecution, MemorySet,
+    POLICY_SECTION, RuntimeSettings, SYSTEM_PROMPT_KEY, Storage, ToolSet, pin_database_path,
+    system_prompt,
 };
 pub use wiring::{Assembled, assemble, builder, first_available_model};

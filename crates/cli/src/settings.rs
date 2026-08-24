@@ -26,7 +26,9 @@ use aik_api::agent::{AgentId, SessionId};
 use aik_api::model::ModelId;
 use aik_api::permission::{Principal, PrincipalId};
 use aik_core::prelude::*;
-use aik_runtime::{DEFAULT_AGENT, DEFAULT_USER, JobExecution, RuntimeSettings, pin_database_path};
+use aik_runtime::{
+    DEFAULT_AGENT, DEFAULT_USER, JobExecution, RuntimeSettings, pin_database_path, system_prompt,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -53,7 +55,6 @@ struct FileSettings {
     agent: Option<String>,
     user: Option<String>,
     root: Option<PathBuf>,
-    system_prompt: Option<String>,
     socket: Option<PathBuf>,
 }
 
@@ -166,7 +167,11 @@ impl Settings {
             // feature, and a schedule that only advanced while somebody happened to have a
             // terminal open would be worse than one that never fired at all.
             jobs: JobExecution::Disabled,
-            system_prompt: file.system_prompt,
+            // From the deployment's own section, never this frontend's: see
+            // [`aik_runtime::AGENT_SECTION`]. A terminal and a host over the same project are
+            // the same assistant, and one of them reading an instruction the other cannot see
+            // is two assistants answering from one database.
+            system_prompt: system_prompt(&config)?,
             config,
             model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
         };
@@ -445,9 +450,12 @@ mod tests {
 
     #[test]
     fn the_system_prompt_reaches_the_loop_settings() {
+        // From the deployment's section, which `aikd` reads too. A prompt only this frontend
+        // could see would be an assistant that knows about its memory in a terminal and not
+        // in a host process, over the same database.
         let (_directory, path) = write(
             "config.json",
-            r#"{ "cli": { "system_prompt": "be terse" } }"#,
+            r#"{ "agent": { "system_prompt": "be terse" } }"#,
         );
         let settings = resolve(&Options {
             config: Some(path),
@@ -457,6 +465,42 @@ mod tests {
         let loop_settings = settings.loop_settings(ModelId::new("m"));
         assert_eq!(loop_settings.system_prompt.as_deref(), Some("be terse"));
         assert_eq!(loop_settings.model.as_str(), "m");
+    }
+
+    #[test]
+    fn a_prompt_under_this_frontends_own_section_is_refused_rather_than_ignored() {
+        // What the key used to be. A configuration still naming it has to fail loudly here:
+        // silently ignoring it is how a host process ended up telling its agent nothing.
+        let (_directory, path) = write(
+            "config.json",
+            r#"{ "cli": { "system_prompt": "be terse" } }"#,
+        );
+        let error = Settings::resolve_from(
+            &Options {
+                config: Some(path),
+                ..Options::default()
+            },
+            env(&[("XDG_DATA_HOME", FAKE_XDG)]),
+        )
+        .expect_err("the prompt is not this frontend's setting");
+        assert!(matches!(error, Error::Config { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_misspelled_key_in_the_agents_section_is_refused() {
+        let (_directory, path) = write(
+            "config.json",
+            r#"{ "agent": { "system_promt": "be terse" } }"#,
+        );
+        let error = Settings::resolve_from(
+            &Options {
+                config: Some(path),
+                ..Options::default()
+            },
+            env(&[("XDG_DATA_HOME", FAKE_XDG)]),
+        )
+        .expect_err("an unknown key is a mistake, not a setting");
+        assert!(matches!(error, Error::Config { .. }), "{error}");
     }
 
     #[test]
