@@ -127,7 +127,7 @@ pub async fn serve(settings: DaemonSettings, shutdown: CancellationToken) -> Res
         });
     }
 
-    let model = match &settings.model {
+    let model = match settings.model() {
         Some(model) => model.clone(),
         None => wiring::first_available_model(&settings.runtime).await?,
     };

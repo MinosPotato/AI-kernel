@@ -15,46 +15,51 @@
 //! assembling a kernel here.
 //!
 //! The split is not tidiness. [`RuntimeSettings`] is what [`aik_runtime::wiring`] consumes,
-//! and both frontends hand it the same type resolved by the same rules, so a deployment
-//! assembled by `aik` and one assembled by `aikd` are the same deployment. Anything a
-//! terminal happens to need cannot drift into that, because it does not live there.
+//! and both frontends hand it the same type resolved by the same *function* —
+//! [`aik_runtime::Deployment::resolve`] — so a deployment assembled by `aik` and one assembled
+//! by `aikd` are the same deployment. Anything a terminal happens to need cannot drift into
+//! that, because it does not live there.
+//!
+//! What this module still decides is what a terminal alone decides: which host process to
+//! talk to (see [`resolve_socket`]), whether a job handler is wired here (never), and where
+//! durable state comes from when this run is a client of a host rather than a host itself.
+//! Every other key is read once, in [`aik_runtime::settings`], from a section neither
+//! frontend owns.
 
 use std::path::{Path, PathBuf};
 
 use aik_agent::AgentLoopSettings;
-use aik_api::agent::{AgentId, SessionId};
+use aik_api::agent::SessionId;
 use aik_api::model::ModelId;
-use aik_api::permission::{Principal, PrincipalId};
+use aik_api::permission::Principal;
 use aik_core::prelude::*;
-use aik_runtime::{
-    DEFAULT_AGENT, DEFAULT_USER, JobExecution, RuntimeSettings, pin_database_path, system_prompt,
-};
+use aik_runtime::{Deployment, JobExecution, RuntimeSettings, StorageChoice};
 use serde::Deserialize;
-use serde_json::{Value, json};
 
 use crate::args::Options;
 
 /// The configuration section this frontend reads its own settings from.
+///
+/// What is left in it is genuinely a terminal's: which host process to talk to, if any.
+/// Everything that describes the *deployment* — the agent, the user, the root, the model, the
+/// prompt — lives in [`aik_runtime::AGENT_SECTION`], and `deny_unknown_fields` on
+/// [`FileSettings`] is what turns a configuration still naming `cli.agent` into an error
+/// rather than a value silently resolved from somewhere else.
 pub const SECTION: &str = "cli";
 
-/// Where the shared database's path lives in the configuration tree, and how a run decides
-/// whether it has one at all.
+/// Where the shared database's path lives in the configuration tree, how a run decides
+/// whether it has one at all, and the environment prefix layered over the file.
 ///
-/// Re-exported from [`aik_runtime`]: the key names a *component's* section, so a
-/// frontend-specific alias for it could only ever disagree with the component that reads it.
-pub use aik_runtime::{DATABASE_PATH_KEY, Storage};
-
-/// The environment variable prefix layered over the configuration file.
-pub const ENV_PREFIX: &str = "AIK_";
+/// Re-exported from [`aik_runtime`]: the database key names a *component's* section, so a
+/// frontend-specific alias for it could only ever disagree with the component that reads it,
+/// and a second copy of the environment prefix would be a second thing to keep in step with
+/// `aikd`.
+pub use aik_runtime::{DATABASE_PATH_KEY, ENV_PREFIX, Storage};
 
 /// What the frontend reads from `cli` in the configuration tree.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileSettings {
-    model: Option<String>,
-    agent: Option<String>,
-    user: Option<String>,
-    root: Option<PathBuf>,
     socket: Option<PathBuf>,
 }
 
@@ -66,8 +71,6 @@ pub struct Settings {
     /// Shared with [`aik-daemon`](../aik_daemon/index.html) by construction — this is the
     /// type [`aik_runtime::wiring`] takes, not a copy of it.
     pub runtime: RuntimeSettings,
-    /// The model every turn is sent to, or `None` to ask the provider for one.
-    pub model: Option<ModelId>,
     /// Whether to print authorization and context events.
     pub verbose: bool,
     /// Where to append a JSONL measurement record of the run, if anywhere.
@@ -115,76 +118,62 @@ impl Settings {
             .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
             .collect();
 
-        let mut builder = Config::builder();
-        if let Some(path) = &options.config {
-            builder = builder.layer(read_json(path, "configuration")?);
-        }
-        if let Some(path) = &options.policy {
-            // A policy file holds the document alone, so it reads as a policy rather than as
-            // a configuration tree that happens to contain one.
-            builder = builder.layer(json!({ "policy": read_json(path, "policy")? }));
-        }
-        let config = builder
-            .env_from(ENV_PREFIX, vars.iter().map(|(key, value)| (key, value)))
-            .build();
+        let config = aik_runtime::load_config(
+            options.config.as_deref(),
+            options.policy.as_deref(),
+            vars.iter().map(|(key, value)| (key, value)),
+        )?;
 
         let file: FileSettings = config.get_or_default(SECTION)?;
 
         let socket = resolve_socket(options, &file, &vars);
 
-        let root = match options.root.clone().or(file.root) {
-            Some(root) => root,
-            None => std::env::current_dir()
-                .map_err(|error| Error::wrap("resolving the current directory", error))?,
-        };
-
-        // A client opens no database: the host holds it, exclusively, which is the whole
-        // reason there is a host. Resolving one anyway would mean a client refusing to start
-        // on a machine that has nowhere to *put* a database it was never going to open —
-        // which is exactly the machine a thin client is most likely to be.
-        let storage = if socket.is_some() {
-            Storage::Ephemeral
-        } else {
-            Storage::resolve(
-                options.ephemeral,
-                options.database.clone(),
-                &config,
-                vars.iter().map(|(key, value)| (key, value)),
-            )?
-        };
-        let config = pin_database_path(config, &storage)?;
-
-        let runtime = RuntimeSettings {
-            agent: AgentId::new(pick(&options.agent, &file.agent, DEFAULT_AGENT)),
-            user: PrincipalId::new(pick(&options.user, &file.user, DEFAULT_USER)),
-            root,
+        let deployment = Deployment {
+            agent: options.agent.clone(),
+            user: options.user.clone(),
+            root: options.root.clone(),
+            model: options.model.clone(),
             tools: options.tools(),
             memory: options.memory(),
-            storage,
             // A terminal is not a host process. It keeps the same durable schedule as one —
             // the same jobs, the same owners — and deliberately runs none of it: see
             // [`JobExecution`]. A conversation interrupted by a job firing at 3am is not a
             // feature, and a schedule that only advanced while somebody happened to have a
             // terminal open would be worse than one that never fired at all.
             jobs: JobExecution::Disabled,
-            // From the deployment's own section, never this frontend's: see
-            // [`aik_runtime::AGENT_SECTION`]. A terminal and a host over the same project are
-            // the same assistant, and one of them reading an instruction the other cannot see
-            // is two assistants answering from one database.
-            system_prompt: system_prompt(&config)?,
-            config,
-            model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
+            // A client opens no database: the host holds it, exclusively, which is the whole
+            // reason there is a host. Resolving one anyway would mean a client refusing to
+            // start on a machine that has nowhere to *put* a database it was never going to
+            // open — which is exactly the machine a thin client is most likely to be.
+            storage: match socket {
+                Some(_) => StorageChoice::None,
+                None => StorageChoice::Resolve {
+                    ephemeral: options.ephemeral,
+                    explicit: options.database.clone(),
+                },
+            },
         };
+
+        // Everything deployment-wide — the identities, the root, the model, the prompt, the
+        // database — is decided there and nowhere here: see [`aik_runtime::Deployment`]. A
+        // terminal and a host over one project are the same assistant, and a value one of
+        // them read from a key the other does not look at is two assistants answering from
+        // one database.
+        let runtime = deployment.resolve(config, vars.iter().map(|(key, value)| (key, value)))?;
 
         Ok(Self {
             runtime,
-            model: options.model.clone().or(file.model).map(ModelId::new),
             verbose: options.verbose,
             record: options.record.clone(),
             prompt: options.prompt.clone(),
             session: options.session,
             socket,
         })
+    }
+
+    /// The model every turn is sent to, or `None` to ask the provider for one.
+    pub fn model(&self) -> Option<&ModelId> {
+        self.runtime.model.as_ref()
     }
 
     /// The database this run will open, if it opens one.
@@ -250,28 +239,12 @@ fn resolve_socket(
         })
 }
 
-fn pick(flag: &Option<String>, file: &Option<String>, fallback: &str) -> String {
-    flag.clone()
-        .or_else(|| file.clone())
-        .unwrap_or_else(|| fallback.to_owned())
-}
-
-fn read_json(path: &Path, kind: &str) -> Result<Value> {
-    let text = std::fs::read_to_string(path).map_err(|error| {
-        Error::wrap(
-            format!("reading the {kind} file `{}`", path.display()),
-            error,
-        )
-    })?;
-    serde_json::from_str(&text)
-        .map_err(|error| Error::config(path.display().to_string(), error.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aik_api::permission::PrincipalKind;
-    use aik_runtime::{DATABASE_PATH_KEY, MemorySet};
+    use aik_api::permission::{PrincipalId, PrincipalKind};
+    use aik_runtime::{DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, MemorySet};
+    use serde_json::json;
     use std::io::Write as _;
 
     fn write(name: &str, contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -328,7 +301,7 @@ mod tests {
     fn identities_come_from_the_command_line_before_the_file() {
         let (_directory, path) = write(
             "config.json",
-            r#"{ "cli": { "agent": "from-file", "user": "someone" } }"#,
+            r#"{ "agent": { "agent": "from-file", "user": "someone" } }"#,
         );
         let options = Options {
             config: Some(path),
@@ -343,7 +316,10 @@ mod tests {
 
     #[test]
     fn the_environment_layers_over_the_file() {
-        let (_directory, path) = write("config.json", r#"{ "cli": { "model": "from-file" } }"#);
+        // Over the *deployment's* section, which is the point: `AIK_AGENT__MODEL` names one
+        // model for every frontend, where `AIK_CLI__MODEL` could only ever have named one for
+        // this one.
+        let (_directory, path) = write("config.json", r#"{ "agent": { "model": "from-file" } }"#);
         let options = Options {
             config: Some(path),
             ..Options::default()
@@ -351,13 +327,38 @@ mod tests {
 
         let settings = Settings::resolve_from(
             &options,
-            env(&[("AIK_CLI__MODEL", "from-env"), ("XDG_DATA_HOME", FAKE_XDG)]),
+            env(&[
+                ("AIK_AGENT__MODEL", "from-env"),
+                ("XDG_DATA_HOME", FAKE_XDG),
+            ]),
         )
         .expect("resolved");
-        assert_eq!(
-            settings.model.as_ref().map(ModelId::as_str),
-            Some("from-env")
-        );
+        assert_eq!(settings.model().map(ModelId::as_str), Some("from-env"));
+    }
+
+    #[test]
+    fn the_command_line_still_wins_over_the_configured_model() {
+        let (_directory, path) = write("config.json", r#"{ "agent": { "model": "from-file" } }"#);
+        let settings = resolve(&Options {
+            config: Some(path),
+            model: Some("from-flag".to_owned()),
+            ..Options::default()
+        });
+        assert_eq!(settings.model().map(ModelId::as_str), Some("from-flag"));
+    }
+
+    #[test]
+    fn a_scalar_where_the_deployments_section_belongs_names_the_variable_that_was_meant() {
+        // `AIK_AGENT=name` reads like it should set the agent's name. It does not: the
+        // environment layer puts a *string* at `agent`, replacing the section wholesale. Left
+        // to serde that is a type error against a struct nobody has heard of.
+        let error = Settings::resolve_from(
+            &Options::default(),
+            env(&[("AIK_AGENT", "aikd-agent"), ("XDG_DATA_HOME", FAKE_XDG)]),
+        )
+        .expect_err("a section is not a value");
+        assert!(matches!(error, Error::Config { .. }), "{error}");
+        assert!(error.to_string().contains("AIK_AGENT__AGENT"), "{error}");
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! is this crate, and deliberately only that.
 //!
 //! ```text
+//!   configuration ──▶ settings::Deployment ──▶ RuntimeSettings
+//!
 //!   RuntimeSettings ──▶ wiring::builder ──▶ KernelBuilder ──▶ Kernel
 //!         │                                                     │
 //!         │                                                     ▼
@@ -22,9 +24,12 @@
 //! * [`aik-daemon`](../aik_daemon/index.html) — a host process that owns the database, runs
 //!   the schedule, and serves clients over a local socket.
 //!
-//! Both assemble the *same* system from the same function. What differs is the settings they
-//! resolve and what they do with the kernel afterwards, which is exactly the difference that
-//! should be visible in their code and nowhere else.
+//! Both assemble the *same* system from the same function, out of settings resolved by the
+//! same function: [`settings::Deployment`] reads every deployment-wide value —
+//! [`AGENT_SECTION`], the policy document, the database path — so that neither frontend
+//! interprets any of it on its own. What differs is what each of them adds on top (a socket,
+//! a verbosity, a connection limit) and what they do with the kernel afterwards, which is
+//! exactly the difference that should be visible in their code and nowhere else.
 //!
 //! # What this crate is not allowed to be
 //!
@@ -58,8 +63,8 @@ pub mod wiring;
 
 pub use jobs::{AgentJobComponent, AgentJobHandler, AgentJobPayload};
 pub use settings::{
-    AGENT_SECTION, DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, JobExecution, MemorySet,
-    POLICY_SECTION, RuntimeSettings, SYSTEM_PROMPT_KEY, Storage, ToolSet, pin_database_path,
-    system_prompt,
+    AGENT_SECTION, DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, Deployment, ENV_PREFIX,
+    JobExecution, MemorySet, POLICY_SECTION, RuntimeSettings, SYSTEM_PROMPT_KEY, Storage,
+    StorageChoice, ToolSet, load_config, pin_database_path, system_prompt,
 };
 pub use wiring::{Assembled, assemble, builder, first_available_model};

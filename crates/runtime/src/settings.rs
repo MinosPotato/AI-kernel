@@ -26,7 +26,7 @@ use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
 use aik_core::ComponentId;
 use aik_core::prelude::*;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Where the shared database's path lives in the configuration tree.
 ///
@@ -258,13 +258,54 @@ pub fn pin_database_path(config: Config, storage: &Storage) -> Result<Config> {
 
 /// What is read from [`AGENT_SECTION`].
 ///
+/// Every field here is a property of the *deployment* rather than of whichever process
+/// happens to be running: who the agent is, who it acts for, which directory it is confined
+/// to, which model answers, and what it is told before its first turn. A terminal and a host
+/// process over one database that disagreed about any of them would be two different systems
+/// sharing a file — one writing memories nobody else can find, one auditing under a name the
+/// reviewer never sees, one confined to a directory the other is not.
+///
 /// `deny_unknown_fields` so that a misspelled key fails at startup naming itself, rather than
-/// being ignored — which is the failure mode this section exists to end: an instruction
-/// silently absent looks exactly like an assistant that decided not to act on it.
+/// being ignored — which is the failure mode this section exists to end: a setting silently
+/// absent looks exactly like an assistant that decided not to act on it.
+///
+/// The migration off the old per-frontend keys is made loud by the same derive on each
+/// frontend's own settings struct rather than by this one: `cli.agent` and `daemon.agent` are
+/// unknown fields of `cli` and `daemon`, so a configuration still naming one stops the
+/// frontend that reads that section instead of quietly resolving a different principal.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AgentSection {
+    agent: Option<String>,
+    user: Option<String>,
+    root: Option<PathBuf>,
+    model: Option<String>,
     system_prompt: Option<String>,
+}
+
+impl AgentSection {
+    /// Reads the section, or explains what is wrong with it.
+    ///
+    /// A scalar where the section should be is almost always `AIK_AGENT=name`: the
+    /// environment layer turns that into a *string* at `agent`, replacing the whole section.
+    /// serde would report it as a type error against a struct nobody outside this file has
+    /// heard of, so it is caught here and answered with the variable that was meant.
+    fn read(config: &Config) -> Result<Self> {
+        if let Some(value) = config.value(AGENT_SECTION)
+            && !value.is_null()
+            && !value.is_object()
+        {
+            return Err(Error::config(
+                AGENT_SECTION,
+                format!(
+                    "`{AGENT_SECTION}` is the deployment's own section, not a single value; \
+                     name the setting inside it (`{AGENT_SECTION}.agent`), or use the \
+                     environment variable `{ENV_PREFIX}AGENT__AGENT`"
+                ),
+            ));
+        }
+        config.get_or_default(AGENT_SECTION)
+    }
 }
 
 /// Reads the instructions pinned as the first record of every session.
@@ -276,10 +317,216 @@ struct AgentSection {
 /// Whitespace-only is [`None`] rather than an empty pinned record: a prompt that says nothing
 /// is not a prompt, and pinning it would spend a session's first record saying so.
 pub fn system_prompt(config: &Config) -> Result<Option<String>> {
-    let section: AgentSection = config.get_or_default(AGENT_SECTION)?;
-    Ok(section
+    Ok(AgentSection::read(config)?
         .system_prompt
-        .filter(|prompt| !prompt.trim().is_empty()))
+        .filter(|prompt| non_blank(prompt)))
+}
+
+/// Whether a configured string says anything at all.
+fn non_blank(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+/// The environment variable prefix every frontend layers over its configuration file.
+///
+/// One prefix and one section name, so `AIK_AGENT__USER` means the same thing to every
+/// frontend. Two copies of this constant would be two prefixes that agree until one of them
+/// is changed.
+pub const ENV_PREFIX: &str = "AIK_";
+
+/// Layers a frontend's configuration sources into one tree.
+///
+/// Lowest first: the configuration file, then the policy document, then the environment. The
+/// policy file is wrapped as [`POLICY_SECTION`] rather than merged at the root, so the file
+/// holds a policy document and reads as one instead of as a configuration tree that happens
+/// to contain a policy.
+///
+/// Shared rather than per-frontend for the same reason everything else here is: the order of
+/// these layers decides which of two sources wins, and a frontend that layered them in a
+/// different order would resolve a different deployment from the same files.
+pub fn load_config<I, K, V>(config: Option<&Path>, policy: Option<&Path>, vars: I) -> Result<Config>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut builder = Config::builder();
+    if let Some(path) = config {
+        builder = builder.layer(read_json(path, "configuration")?);
+    }
+    if let Some(path) = policy {
+        builder = builder.layer(json!({ "policy": read_json(path, "policy")? }));
+    }
+    Ok(builder.env_from(ENV_PREFIX, vars).build())
+}
+
+/// Reads a JSON file, naming it in whatever goes wrong.
+fn read_json(path: &Path, kind: &str) -> Result<Value> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        Error::wrap(
+            format!("reading the {kind} file `{}`", path.display()),
+            error,
+        )
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|error| Error::config(path.display().to_string(), error.to_string()))
+}
+
+/// How a frontend decides where durable state lives, before configuration is consulted.
+///
+/// Two answers rather than one because one frontend has a mode in which the question does not
+/// arise: `aik --socket` is a *client*, and a running host already holds the database
+/// exclusively. See [`StorageChoice::None`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageChoice {
+    /// Decide as [`Storage::resolve`] does: `--ephemeral`, an explicit path, configuration,
+    /// then the XDG default.
+    Resolve {
+        /// Whether this process was told to keep nothing on disk.
+        ephemeral: bool,
+        /// A path named on the command line, if any.
+        explicit: Option<PathBuf>,
+    },
+    /// This process opens no database whatever configuration says.
+    ///
+    /// Not the same statement as `--ephemeral`, which is a deployment with no durable state
+    /// at all. This is a process that is not the one holding it: resolving a path anyway
+    /// would mean a client refusing to start on a machine with nowhere to *put* a database it
+    /// was never going to open, which is exactly the machine a thin client is most likely to
+    /// be.
+    None,
+}
+
+impl Default for StorageChoice {
+    fn default() -> Self {
+        Self::Resolve {
+            ephemeral: false,
+            explicit: None,
+        }
+    }
+}
+
+/// What a frontend contributes to resolving a deployment.
+///
+/// The command line, and only the command line: everything else these fields can come from is
+/// read from [`AGENT_SECTION`] by [`Deployment::resolve`], which is the one place any of it is
+/// interpreted. A frontend that read `agent` or `user` or `root` out of its own section would
+/// be the bug this type exists to make unrepresentable — a host writing memories under one
+/// principal while a terminal searched as another, over one database.
+///
+/// What is *not* here is what genuinely differs between frontends: a socket to connect to or
+/// to bind, a connection limit, a verbosity, a one-shot prompt. Those stay in the frontend
+/// that has them, because nothing about them changes how the system is assembled.
+#[derive(Debug, Clone, Default)]
+pub struct Deployment {
+    /// The agent's identity, overriding `agent.agent`.
+    pub agent: Option<String>,
+    /// The user's identity, overriding `agent.user`.
+    pub user: Option<String>,
+    /// The confinement root, overriding `agent.root`.
+    pub root: Option<PathBuf>,
+    /// The model every turn is sent to, overriding `agent.model`.
+    pub model: Option<String>,
+    /// Which filesystem tools to register.
+    pub tools: ToolSet,
+    /// Which memory tools to register.
+    pub memory: MemorySet,
+    /// Whether scheduled work runs in this process.
+    pub jobs: JobExecution,
+    /// Where durable state goes, if anywhere.
+    pub storage: StorageChoice,
+}
+
+impl Deployment {
+    /// Resolves the configuration tree and these overrides into one [`RuntimeSettings`].
+    ///
+    /// Precedence for every deployment-wide value, highest first: the command line, then
+    /// [`AGENT_SECTION`] (which the environment layer has already been merged into by
+    /// [`load_config`]), then the built-in default.
+    ///
+    /// `vars` is the environment, supplied rather than read, because the database's default
+    /// location is derived from it and a test that read the process environment would resolve
+    /// to the database of whoever ran it.
+    pub fn resolve<I, K, V>(&self, config: Config, vars: I) -> Result<RuntimeSettings>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let vars: Vec<(String, String)> = vars
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
+            .collect();
+
+        let section = AgentSection::read(&config)?;
+
+        let storage = match &self.storage {
+            StorageChoice::None => Storage::Ephemeral,
+            StorageChoice::Resolve {
+                ephemeral,
+                explicit,
+            } => Storage::resolve(
+                *ephemeral,
+                explicit.clone(),
+                &config,
+                vars.iter().map(|(key, value)| (key, value)),
+            )?,
+        };
+        let config = pin_database_path(config, &storage)?;
+
+        Ok(RuntimeSettings {
+            agent: AgentId::new(pick(&self.agent, &section.agent, DEFAULT_AGENT)),
+            user: PrincipalId::new(pick(&self.user, &section.user, DEFAULT_USER)),
+            root: resolve_root(self.root.clone().or(section.root))?,
+            tools: self.tools,
+            memory: self.memory,
+            storage,
+            jobs: self.jobs,
+            system_prompt: section.system_prompt.filter(|prompt| non_blank(prompt)),
+            model: self
+                .model
+                .clone()
+                .or(section.model)
+                .filter(|model| non_blank(model))
+                .map(ModelId::new),
+            config,
+            model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
+        })
+    }
+}
+
+/// The command line, then the configuration file, then the built-in default.
+fn pick(flag: &Option<String>, file: &Option<String>, fallback: &str) -> String {
+    flag.clone()
+        .or_else(|| file.clone())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+/// Settles on the directory the filesystem tools will be confined to.
+///
+/// Absent means the working directory, which is what a person typing `aik` in a project
+/// expects and the only default that is not a guess about somebody else's filesystem.
+///
+/// The result is canonical wherever it can be, because the confinement boundary the tools
+/// enforce *is* the canonical one: [`FsReadTool`](aik_fs::FsReadTool) and its siblings
+/// canonicalize the root at construction and check every resolved path against that. Storing
+/// the raw form here would mean a banner, a status reply and an audit record naming a path
+/// that is not the boundary — a symlinked root would be reported as the link and enforced as
+/// its target — and a reader has no way to tell the two apart.
+///
+/// A root that does not exist is kept as it was written rather than being made an error here.
+/// Canonicalization needs the path to exist, and refusing at this point would break the two
+/// deployments that legitimately have no such directory: a run with no filesystem tools at
+/// all, and a client of a host process, neither of which ever touches it. A deployment that
+/// *does* register the tools still fails, loudly and with the same message it always did,
+/// when the tool canonicalizes the root itself.
+fn resolve_root(configured: Option<PathBuf>) -> Result<PathBuf> {
+    let root = match configured {
+        Some(root) => root,
+        None => std::env::current_dir()
+            .map_err(|error| Error::wrap("resolving the current directory", error))?,
+    };
+    Ok(std::fs::canonicalize(&root).unwrap_or(root))
 }
 
 /// Everything assembling a system needs, with every source already resolved.
@@ -301,6 +548,15 @@ pub struct RuntimeSettings {
     pub jobs: JobExecution,
     /// Instructions pinned as the first record of each session.
     pub system_prompt: Option<String>,
+    /// The model every turn is sent to, or `None` to ask the provider for one.
+    ///
+    /// Deployment-wide, like every other identity here: two frontends over one database that
+    /// named different models would produce one transcript answered by two assistants, and
+    /// the difference would show up as the agent changing its mind rather than as a
+    /// configuration mistake. `None` is resolved at startup by
+    /// [`first_available_model`](crate::wiring::first_available_model), which needs a running
+    /// provider and so cannot happen here.
+    pub model: Option<ModelId>,
     /// The whole configuration tree, handed to the kernel.
     pub config: Config,
     /// The component expected to publish `dyn ModelProvider`.
@@ -328,6 +584,7 @@ impl RuntimeSettings {
             storage: Storage::Ephemeral,
             jobs: JobExecution::default(),
             system_prompt: None,
+            model: None,
             config: Config::default(),
             model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
         }

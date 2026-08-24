@@ -1,30 +1,35 @@
 //! Turning options, configuration and the environment into one description of a host.
 //!
-//! The same resolution the terminal frontend does, over the same [`RuntimeSettings`], because
-//! the point of that type is that both processes assemble the same deployment. What is added
-//! here is the part only a host has: where it listens, and how many clients it will serve.
+//! Not "the same resolution the terminal frontend does" — literally the same function.
+//! [`aik_runtime::Deployment::resolve`] reads every deployment-wide value from a section
+//! neither frontend owns, so there is nothing here that could interpret `agent`, `user`,
+//! `root` or `model` differently from the way `aik` interprets them. What is added here is the
+//! part only a host has: where it listens, and how many clients it will serve.
 
 use std::path::PathBuf;
 
-use aik_api::agent::AgentId;
 use aik_api::model::ModelId;
-use aik_api::permission::PrincipalId;
 use aik_core::prelude::*;
 use aik_ipc::Endpoint;
-use aik_runtime::{
-    DEFAULT_AGENT, DEFAULT_USER, JobExecution, RuntimeSettings, Storage, pin_database_path,
-    system_prompt,
-};
+use aik_runtime::{Deployment, JobExecution, RuntimeSettings, StorageChoice};
 use serde::Deserialize;
-use serde_json::{Value, json};
 
 use crate::args::Options;
 
 /// The configuration section a host reads its own settings from.
+///
+/// What is left in it is genuinely a host's: where to bind, and how many clients to serve.
+/// Everything describing the deployment lives in [`aik_runtime::AGENT_SECTION`], and
+/// `deny_unknown_fields` on [`FileSettings`] is what turns a configuration still naming
+/// `daemon.agent` into an error rather than a principal quietly resolved from elsewhere.
 pub const SECTION: &str = "daemon";
 
 /// The environment variable prefix layered over the configuration file.
-pub const ENV_PREFIX: &str = "AIK_";
+///
+/// Re-exported from [`aik_runtime`] rather than declared again: `AIK_AGENT__USER` has to reach
+/// a host and a terminal alike, and two constants would be two prefixes that agree until one
+/// of them changes.
+pub use aik_runtime::ENV_PREFIX;
 
 /// How many clients may be connected at once when nothing says otherwise.
 ///
@@ -42,13 +47,16 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
 pub const MAX_CALLS_IN_FLIGHT: usize = 8;
 
 /// What a host reads from `daemon` in the configuration tree.
+///
+/// A socket, deliberately, even though `cli` has one too: they are not the same setting. A
+/// host's is the address it *binds*, and claiming it is what makes this process the host; a
+/// client's is the address it *connects to*. One deployment can legitimately have a host
+/// listening where no client is configured to look, and unifying them would make that
+/// unsayable while fixing nothing — a wrong socket fails immediately and visibly, which is the
+/// opposite of the silent drift this section's other keys had.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileSettings {
-    model: Option<String>,
-    agent: Option<String>,
-    user: Option<String>,
-    root: Option<PathBuf>,
     socket: Option<PathBuf>,
     max_connections: Option<usize>,
 }
@@ -58,8 +66,6 @@ struct FileSettings {
 pub struct DaemonSettings {
     /// How the system is assembled. Shared with the terminal frontend by construction.
     pub runtime: RuntimeSettings,
-    /// The model every turn is sent to, or `None` to ask the provider for one.
-    pub model: Option<ModelId>,
     /// Where to listen, and where the token beside it goes.
     pub endpoint: Endpoint,
     /// How many clients may be connected at once.
@@ -84,51 +90,35 @@ impl DaemonSettings {
             .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
             .collect();
 
-        let mut builder = Config::builder();
-        if let Some(path) = &options.config {
-            builder = builder.layer(read_json(path, "configuration")?);
-        }
-        if let Some(path) = &options.policy {
-            builder = builder.layer(json!({ "policy": read_json(path, "policy")? }));
-        }
-        let config = builder
-            .env_from(ENV_PREFIX, vars.iter().map(|(key, value)| (key, value)))
-            .build();
+        let config = aik_runtime::load_config(
+            options.config.as_deref(),
+            options.policy.as_deref(),
+            vars.iter().map(|(key, value)| (key, value)),
+        )?;
 
         let file: FileSettings = config.get_or_default(SECTION)?;
 
-        let root = match options.root.clone().or(file.root) {
-            Some(root) => root,
-            None => std::env::current_dir()
-                .map_err(|error| Error::wrap("resolving the current directory", error))?,
+        let deployment = Deployment {
+            agent: options.agent.clone(),
+            user: options.user.clone(),
+            root: options.root.clone(),
+            model: options.model.clone(),
+            tools: options.tools(),
+            memory: options.memory(),
+            // The whole reason this process exists: something has to actually run the
+            // schedule, and it has to be something that is always there.
+            jobs: JobExecution::Agent,
+            storage: StorageChoice::Resolve {
+                ephemeral: options.ephemeral,
+                explicit: options.database.clone(),
+            },
         };
 
-        let storage = Storage::resolve(
-            options.ephemeral,
-            options.database.clone(),
-            &config,
-            vars.iter().map(|(key, value)| (key, value)),
-        )?;
-        let config = pin_database_path(config, &storage)?;
-
-        // Built from the runtime's own defaults and then narrowed, rather than as a struct
-        // literal: the model provider's component id is the wiring's to know, and naming it
-        // here would be a second copy of it to keep in step.
-        let mut runtime = RuntimeSettings::new(root);
-        runtime.agent = AgentId::new(pick(&options.agent, &file.agent, DEFAULT_AGENT));
-        runtime.user = PrincipalId::new(pick(&options.user, &file.user, DEFAULT_USER));
-        runtime.tools = options.tools();
-        runtime.memory = options.memory();
-        runtime.storage = storage;
-        // The whole reason this process exists: something has to actually run the schedule,
-        // and it has to be something that is always there.
-        runtime.jobs = JobExecution::Agent;
-        // From the deployment's own section, never this frontend's: see
-        // [`aik_runtime::AGENT_SECTION`]. A host and a terminal over the same project are the
-        // same assistant, and the one configuration file this repository ships has to reach
-        // both of them.
-        runtime.system_prompt = system_prompt(&config)?;
-        runtime.config = config;
+        // The identities, the root, the model, the prompt and the database all come from the
+        // deployment's own section, never this frontend's: see [`aik_runtime::Deployment`].
+        // A host and a terminal over the same project are the same assistant, and the one
+        // configuration file this repository ships has to reach both of them.
+        let runtime = deployment.resolve(config, vars.iter().map(|(key, value)| (key, value)))?;
 
         let endpoint = Endpoint::resolve(
             options.socket.clone().or(file.socket),
@@ -137,7 +127,6 @@ impl DaemonSettings {
 
         Ok(Self {
             runtime,
-            model: options.model.clone().or(file.model).map(ModelId::new),
             endpoint,
             max_connections: options
                 .max_connections
@@ -145,30 +134,18 @@ impl DaemonSettings {
                 .unwrap_or(DEFAULT_MAX_CONNECTIONS),
         })
     }
-}
 
-fn pick(flag: &Option<String>, file: &Option<String>, fallback: &str) -> String {
-    flag.clone()
-        .or_else(|| file.clone())
-        .unwrap_or_else(|| fallback.to_owned())
-}
-
-fn read_json(path: &std::path::Path, kind: &str) -> Result<Value> {
-    let text = std::fs::read_to_string(path).map_err(|error| {
-        Error::wrap(
-            format!("reading the {kind} file `{}`", path.display()),
-            error,
-        )
-    })?;
-    serde_json::from_str(&text)
-        .map_err(|error| Error::config(path.display().to_string(), error.to_string()))
+    /// The model every turn is sent to, or `None` to ask the provider for one.
+    pub fn model(&self) -> Option<&ModelId> {
+        self.runtime.model.as_ref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aik_api::permission::PrincipalKind;
-    use aik_runtime::{MemorySet, ToolSet};
+    use aik_api::permission::{PrincipalId, PrincipalKind};
+    use aik_runtime::{DEFAULT_AGENT, DEFAULT_USER, MemorySet, Storage, ToolSet};
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -224,11 +201,15 @@ mod tests {
 
     #[test]
     fn the_command_line_wins_over_the_configuration_file() {
+        // The identities come from the deployment's section and the connection limit from
+        // this frontend's, which is the whole shape of the split: what a host *is* is shared,
+        // what a host *does with its socket* is its own.
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("aikd.json");
         std::fs::write(
             &path,
-            r#"{ "daemon": { "agent": "from-file", "user": "someone", "max_connections": 3 } }"#,
+            r#"{ "agent": { "agent": "from-file", "user": "someone" },
+                 "daemon": { "max_connections": 3 } }"#,
         )
         .expect("written");
 
@@ -241,6 +222,48 @@ mod tests {
         assert_eq!(settings.runtime.agent.as_str(), "from-flag");
         assert_eq!(settings.runtime.user.as_str(), "someone");
         assert_eq!(settings.max_connections, 3);
+    }
+
+    #[test]
+    fn the_model_is_the_deployments_and_the_command_line_still_wins() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("aikd.json");
+        std::fs::write(&path, r#"{ "agent": { "model": "from-file" } }"#).expect("written");
+
+        let configured = resolve(&Options {
+            config: Some(path.clone()),
+            ..Options::default()
+        });
+        assert_eq!(configured.model().map(ModelId::as_str), Some("from-file"));
+
+        let overridden = resolve(&Options {
+            config: Some(path),
+            model: Some("from-flag".to_owned()),
+            ..Options::default()
+        });
+        assert_eq!(overridden.model().map(ModelId::as_str), Some("from-flag"));
+    }
+
+    #[test]
+    fn the_root_is_the_deployments_own() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let root = directory.path().join("project");
+        std::fs::create_dir(&root).expect("a project directory");
+        let path = directory.path().join("aikd.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "agent": { "root": root } }).to_string(),
+        )
+        .expect("written");
+
+        let settings = resolve(&Options {
+            config: Some(path),
+            ..Options::default()
+        });
+        assert_eq!(
+            settings.runtime.root,
+            root.canonicalize().expect("a real directory"),
+        );
     }
 
     #[test]
