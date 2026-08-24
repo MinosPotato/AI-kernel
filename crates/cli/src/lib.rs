@@ -6,7 +6,8 @@
 //! no way to answer an approval prompt. This crate is that, and deliberately only that.
 //!
 //! ```text
-//!   argv ──▶ Options ──▶ Settings ──▶ wiring::assemble ──▶ Kernel
+//!   argv ──▶ Options ──▶ Settings ──▶ wiring::assemble ──▶ Kernel      (no --socket)
+//!                                 └─▶ client::run ──▶ aikd            (--socket)
 //!                          │                                 │
 //!                          │                                 ▼
 //!                          │                          dyn Agent, resolved
@@ -47,10 +48,22 @@
 //! assertion that a human will really be asked. A one-shot run does not, and the broker
 //! refuses every question immediately rather than waiting out a timeout in front of nobody.
 //! That is the whole difference, and it is one line in [`run`].
+//!
+//! # Two ways to reach a kernel
+//!
+//! With `--socket`, this command assembles nothing: it becomes a client of a running
+//! [`aikd`](../aik_daemon/index.html), which already holds the database — exclusively, since
+//! redb locks the file — along with the tools and the policy. See [`client`].
+//!
+//! Every rule above still holds, and holds for a stronger reason: a client cannot authorize,
+//! cannot impersonate and cannot widen anything, because it has no registry, no policy engine
+//! and no store, and because the protocol has nowhere to name a principal. What decides the
+//! two modes is whether a socket was configured, and nothing else.
 
 pub mod approval;
 pub mod args;
 pub mod audit;
+pub mod client;
 pub mod console;
 pub mod recorder;
 pub mod render;
@@ -122,9 +135,18 @@ fn report(error: &Error) -> String {
     message
 }
 
-/// Builds a kernel from `options` and drives one conversation through it.
+/// Drives one conversation, against a host process or against a kernel of this run's own.
+///
+/// The fork is one line, and it is the whole difference between the two modes. A client
+/// assembles nothing — see [`crate::client`] — because a running host already holds the
+/// database, the tools and the policy, and redb would refuse a second process the database
+/// anyway.
 pub async fn run(options: &Options) -> Result<()> {
     let settings = Settings::resolve(options)?;
+
+    if settings.socket.is_some() {
+        return client::run(&settings).await;
+    }
 
     let model = match &settings.model {
         Some(model) => model.clone(),
@@ -195,8 +217,11 @@ async fn converse(assembled: &wiring::Assembled, settings: &Settings) -> Result<
 
 fn banner(settings: &Settings) {
     println!("{} {VERSION}", args::PROGRAM);
-    println!("  agent:  {} acting for {}", settings.agent, settings.user);
-    println!("  root:   {}", settings.root.display());
+    println!(
+        "  agent:  {} acting for {}",
+        settings.runtime.agent, settings.runtime.user
+    );
+    println!("  root:   {}", settings.runtime.root.display());
     // Said out loud for the same reason the absent policy is: where a durable record of
     // every conversation lands is something a person should be told, not something they
     // discover later.
@@ -204,7 +229,7 @@ fn banner(settings: &Settings) {
         Some(path) => println!("  store:  {}", path.display()),
         None => println!("  store:  none (--ephemeral: nothing is written to disk)"),
     }
-    println!("  memory: {}", settings.memory.as_str());
+    println!("  memory: {}", settings.runtime.memory.as_str());
     if !settings.has_policy() {
         println!(
             "  policy: none configured, so every tool call will be denied.\n\

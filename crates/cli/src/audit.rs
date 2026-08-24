@@ -24,6 +24,19 @@
 //! already been refused; one that could prune it could edit the account of its own behaviour.
 //! So the only path is this one: a human, at a terminal, against a file mode `0600` in a
 //! directory mode `0700`.
+//!
+//! # Two ways to the same trail
+//!
+//! redb locks the database, so while a host process is running there is no second process
+//! that can open it. `--socket` therefore asks the host instead, and the host answers the
+//! same question under the same reading identity — the operator, not the agent. Nothing about
+//! visibility changes: the store applies
+//! [`AuditRecord::visible_to`](aik_api::audit::AuditRecord::visible_to) either way, and a
+//! socket in a `0700` directory establishes exactly what opening a `0600` file establishes,
+//! which is that the caller is the account that owns the database.
+//!
+//! The one thing that would be different — a *model* reaching this — is different in neither
+//! direction. There is no audit tool, and the protocol carries no way to reach the registry.
 
 use std::sync::Arc;
 
@@ -38,6 +51,8 @@ use aik_core::clock::Timestamp;
 use aik_core::{Error, Result};
 use aik_store::Db;
 
+use aik_ipc::protocol::{Reply, Request};
+
 use crate::args::{
     AuditCommand, AuditFilters, AuditOptions, DEFAULT_AUDIT_LIMIT, Options, PROGRAM,
 };
@@ -46,21 +61,118 @@ use crate::settings::Settings;
 /// Runs `aik audit`.
 pub async fn run(options: &AuditOptions) -> Result<()> {
     let settings = resolve(options)?;
-    let path = settings.database().ok_or_else(|| {
-        Error::other(
-            "there is no database to review; audit records are only kept when one is configured",
-        )
-    })?;
-
-    let db = Arc::new(Db::open(path)?);
-    let store = Arc::new(RedbAuditStore::new(db)?);
+    let trail = Trail::open(&settings)?;
 
     match &options.command {
-        AuditCommand::Review(filters) => review(&store, filters, &settings.user).await,
+        AuditCommand::Review(filters) => review(&trail, filters, &settings.runtime.user).await,
         AuditCommand::Prune {
             older_than,
             dry_run,
-        } => prune(&store, *older_than, *dry_run).await,
+        } => prune(&trail, *older_than, *dry_run).await,
+    }
+}
+
+/// Where the records are read from.
+///
+/// Two sources, one set of questions. Which one is in use is decided once, here, so that
+/// everything below — the query, the visibility rule, the rendering, the warning about a
+/// short trail — is the same code whichever answered.
+enum Trail {
+    /// The database file, opened directly. Only possible when no host holds it.
+    File(Arc<RedbAuditStore>),
+    /// A running host process, asked over its socket.
+    Host(std::path::PathBuf),
+}
+
+impl Trail {
+    /// Decides which source these options name, and prepares it.
+    fn open(settings: &Settings) -> Result<Self> {
+        if let Some(socket) = &settings.socket {
+            return Ok(Self::Host(socket.clone()));
+        }
+        let path = settings.database().ok_or_else(|| {
+            Error::other(
+                "there is no database to review; audit records are only kept when one is \
+                 configured",
+            )
+        })?;
+        let db = Arc::new(Db::open(path).map_err(|error| {
+            Error::wrap(
+                "opening the audit trail. If a host process is running it holds the database \
+                 open; ask it instead with `--socket <PATH>`",
+                error,
+            )
+        })?);
+        Ok(Self::File(Arc::new(RedbAuditStore::new(db)?)))
+    }
+
+    /// The matching records, how many the trail has ever issued, and who it was read as.
+    ///
+    /// The reading identity is returned rather than assumed, because the two sources decide it
+    /// differently and only one of them is this command's to decide. Against the file it is
+    /// the person who typed the command; through a host it is the identity that host was
+    /// configured with, and reporting the local one would name an identity that had nothing to
+    /// do with what came back.
+    async fn query(
+        &self,
+        query: &AuditQuery,
+        user: &PrincipalId,
+    ) -> Result<(Vec<AuditRecord>, u64, PrincipalId)> {
+        match self {
+            Self::File(store) => {
+                // The reader is the *person*: `Principal::new(user, User)`, never the agent.
+                // See this module's own documentation for why.
+                let reader = Principal::new(user.clone(), PrincipalKind::User);
+                let cx = ExecutionContext::new().with_principal(reader);
+                let records = store.query(query, &cx).await?;
+                let issued = store.last_sequence().await?;
+                Ok((records, issued, user.clone()))
+            }
+            Self::Host(socket) => {
+                let (reply, reader) = crate::client::audit(
+                    socket,
+                    Request::Audit {
+                        query: query.clone(),
+                    },
+                )
+                .await?;
+                match reply {
+                    Reply::Audit { records, issued } => Ok((records, issued, reader)),
+                    other => aik_ipc::protocol::unexpected("audit records", &other),
+                }
+            }
+        }
+    }
+
+    /// Removes, or counts, records at or before `cutoff`.
+    async fn prune(&self, cutoff: Timestamp, dry_run: bool) -> Result<u64> {
+        match self {
+            Self::File(store) => {
+                let count = if dry_run {
+                    store.count_older_than(cutoff).await?
+                } else {
+                    store.sweep_older_than(cutoff).await?
+                };
+                Ok(count as u64)
+            }
+            Self::Host(socket) => {
+                let older_than_ms = Timestamp::now()
+                    .as_millis()
+                    .saturating_sub(cutoff.as_millis());
+                let (reply, _) = crate::client::audit(
+                    socket,
+                    Request::Prune {
+                        older_than_ms,
+                        dry_run,
+                    },
+                )
+                .await?;
+                match reply {
+                    Reply::Pruned { removed, .. } => Ok(removed),
+                    other => aik_ipc::protocol::unexpected("a prune result", &other),
+                }
+            }
+        }
     }
 }
 
@@ -74,21 +186,15 @@ fn resolve(options: &AuditOptions) -> Result<Settings> {
         database: options.database.clone(),
         config: options.config.clone(),
         user: options.user.clone(),
+        socket: options.socket.clone(),
         ..Options::default()
     })
 }
 
 /// Prints matching records, newest first.
-async fn review(
-    store: &Arc<RedbAuditStore>,
-    filters: &AuditFilters,
-    user: &PrincipalId,
-) -> Result<()> {
-    let reader = Principal::new(user.clone(), PrincipalKind::User);
-    let cx = ExecutionContext::new().with_principal(reader);
+async fn review(trail: &Trail, filters: &AuditFilters, user: &PrincipalId) -> Result<()> {
     let query = build_query(filters, Timestamp::now());
-
-    let records = store.query(&query, &cx).await?;
+    let (records, total, user) = trail.query(&query, user).await?;
 
     if filters.json {
         for record in &records {
@@ -112,10 +218,9 @@ async fn review(
         .iter()
         .filter(|record| record.entry.kind().is_about_the_trail())
         .count();
-    // How many the store has ever issued, which is not how many it still holds: retention
-    // removes records and never renumbers the rest. Printed so a reader can see at a glance
-    // that the window they asked for is a window.
-    let total = store.last_sequence().await?;
+    // `total` is how many the store has ever issued, which is not how many it still holds:
+    // retention removes records and never renumbers the rest. Printed so a reader can see at
+    // a glance that the window they asked for is a window.
     println!(
         "\n{} record(s) shown as `{user}`; {total} issued in total.",
         records.len()
@@ -131,15 +236,11 @@ async fn review(
 }
 
 /// Removes, or counts, records older than `older_than`.
-async fn prune(
-    store: &Arc<RedbAuditStore>,
-    older_than: std::time::Duration,
-    dry_run: bool,
-) -> Result<()> {
+async fn prune(trail: &Trail, older_than: std::time::Duration, dry_run: bool) -> Result<()> {
     let cutoff = cutoff(Timestamp::now(), older_than);
 
     if dry_run {
-        let due = store.count_older_than(cutoff).await?;
+        let due = trail.prune(cutoff, true).await?;
         println!(
             "{due} record(s) are older than the given period and would be removed.\n\
              Nothing was removed; drop --dry-run to remove them."
@@ -147,7 +248,7 @@ async fn prune(
         return Ok(());
     }
 
-    let removed = store.sweep_older_than(cutoff).await?;
+    let removed = trail.prune(cutoff, false).await?;
     match removed {
         0 => println!("nothing is old enough to remove."),
         removed => println!(

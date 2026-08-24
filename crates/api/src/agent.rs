@@ -73,8 +73,16 @@ impl AgentRequest {
 /// Tool calls and their outcomes are reported as updates rather than hidden inside the
 /// agent, so a UI can show what the system is doing and a permission layer has something
 /// to attach approval to.
+///
+/// # Why the tag is adjacent rather than internal
+///
+/// [`AgentUpdate::Content`] carries a [`ContentPart`], which is itself tagged `type`.
+/// Flattening one into the other — which is what an internal tag does to a newtype variant —
+/// would put two `type` keys in one object, and the value would fail to serialise at all.
+/// An adjacent tag nests the payload under `value`, so every variant round-trips and a
+/// variant added later cannot reintroduce the collision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AgentUpdate {
     /// Incremental output.
     Content(ContentPart),

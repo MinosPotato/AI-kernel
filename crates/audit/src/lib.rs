@@ -55,7 +55,10 @@
 //! * **Append-only, structurally.** [`AuditStore`](aik_api::audit::AuditStore) has no update
 //!   and no delete. Removal exists only behind [`AuditRetentionSweeper`], which is a separate
 //!   trait held by the retention task and the operator's explicit prune — so holding the
-//!   store gives no ability to erase.
+//!   store gives no ability to erase. Both are registered as kernel services, because an
+//!   operator's prune has to reach the sweeper in whichever process is holding the database
+//!   open; neither is reachable by a model, which holds a
+//!   [`ToolRegistry`](aik_api::tool::ToolRegistry) and never the registry.
 //! * **Reads are authorized, and filters are not authorization.** A query returns only what
 //!   [`AuditRecord::visible_to`](aik_api::audit::AuditRecord::visible_to) allows: what a
 //!   principal did, and what was done on their behalf. Naming somebody else in a filter
