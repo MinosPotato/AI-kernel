@@ -59,8 +59,11 @@ aik -m llama3.1:8b "what is in src?"
 
 Without `-m`/`--model`, `aik` asks the provider for its first reported model and uses that —
 non-deterministic across a machine with several models pulled, so pin one explicitly for
-anything beyond casual use. The model can also be set in a config file (`cli.model`) or the
-`AIK_CLI__MODEL` environment variable; the command line wins over both.
+anything beyond casual use. The model can also be set in a config file (`agent.model`) or the
+`AIK_AGENT__MODEL` environment variable; the command line wins over both. It sits in `agent`
+rather than in `cli` or `daemon` for the reason [everything there
+does](#the-deployments-own-section): one database answered by two different models is one
+transcript with two assistants in it.
 
 An unknown model name is not caught locally — the CLI has no model catalogue of its own — and
 surfaces as whatever Ollama returns, typically an HTTP 404:
@@ -175,11 +178,8 @@ its memory exists and when to use it — the shipped `agent.system_prompt` in
 where to change the deployment's own judgement about what is worth remembering.
 
 The key sits in `agent`, not in `cli` or `daemon`, because it is a property of the deployment
-rather than of whichever frontend happens to be running: a terminal and a host process over
-the same database are the same assistant, and an instruction that reached only one of them
-would be an agent that recalls in one and does not in the other. Both frontends read it
-through `aik_runtime::system_prompt`, and both refuse a configuration that names it under
-their own section rather than ignoring it.
+rather than of whichever frontend happens to be running — see [the deployment's own
+section](#the-deployments-own-section) for the whole of what lives there and why.
 
 ### Ownership
 
@@ -394,6 +394,70 @@ defaults, read by the kernel's own layered `Config` mechanism — nothing CLI-sp
 format. `--policy` reads a policy document on its own and layers it in as the `policy` key,
 overriding whatever `--config` set there. Both are ordinary JSON; a missing file or invalid
 JSON is a startup error naming the file and the parse problem, not a fallback to defaults.
+
+Both frontends layer them in the same order, through the same function
+(`aik_runtime::load_config`), so `aik` and `aikd` given the same two files resolve the same
+tree.
+
+### The deployment's own section
+
+```json
+{
+  "agent": {
+    "agent": "assistant",
+    "user": "user",
+    "root": "/srv/project",
+    "model": "llama3.1:8b",
+    "system_prompt": "…"
+  },
+
+  "cli":    { "socket": "/run/user/1000/aik/aikd.sock" },
+  "daemon": { "socket": "/run/user/1000/aik/aikd.sock", "max_connections": 16 }
+}
+```
+
+Everything in `agent` describes the **deployment**, not the process reading it. A terminal and
+a host process over one database are the same assistant, so all five are read once, by
+`aik_runtime::Deployment::resolve`, and both frontends call it:
+
+| Key                  | What it decides                                                                |
+| -------------------- | ------------------------------------------------------------------------------ |
+| `agent.agent`        | The principal that owns memories and sessions, and that tool calls are attributed to. |
+| `agent.user`         | The person the agent acts for, and the identity `aik audit` reads under.        |
+| `agent.root`         | The directory the filesystem tools are confined to.                             |
+| `agent.model`        | The model every turn is sent to.                                                |
+| `agent.system_prompt`| What the agent is told before its first turn.                                   |
+
+Each of these used to exist twice — `cli.agent` **and** `daemon.agent`, and so on — and
+nothing checked that the two agreed. A file saying `daemon.agent = "aikd-agent"` and
+`cli.agent = "assistant"` was accepted by both processes: the host recorded memories owned by
+one principal, the terminal searched as the other and found nothing, and both were behaving
+exactly as configured. The same mistake in `user` hid records from `aik audit`; in `root` it
+moved the filesystem confinement boundary depending on which process was running.
+
+**Migrating.** Move `agent`, `user`, `root`, `model` and `system_prompt` out of `cli` and
+`daemon` into `agent`. The old keys are now unknown fields of sections that refuse them, so a
+configuration still naming one stops the frontend that reads that section — `cli.*` stops
+`aik`, `daemon.*` stops `aikd` — with an error naming the key, rather than resolving a
+different principal from the default. Each frontend only ever reads its own section, so a
+half-finished migration is caught by running both. Environment
+variables move with them — `AIK_CLI__MODEL` becomes `AIK_AGENT__MODEL`, and `AIK_AGENT__USER`,
+`AIK_AGENT__ROOT` and `AIK_AGENT__AGENT` now reach both frontends. (Bare `AIK_AGENT=name` sets
+the *section* to a string and is refused with a message naming `AIK_AGENT__AGENT`, which is
+what was meant.)
+
+`socket` stays per-frontend, because the two are not the same setting: `daemon.socket` is the
+address a host **binds**, and claiming it is what makes that process the host, while
+`cli.socket` is the address a client **connects to**. A deployment can legitimately have one
+without the other, and a wrong socket fails immediately and visibly — the opposite of the
+silent drift the shared keys had. `daemon.max_connections` is likewise a host's alone.
+
+`agent.root` is canonicalized during resolution, so the root a banner reports and the root the
+filesystem tools enforce are the same path by construction: the tools canonicalize it too, and
+a symlinked root reported as the link but enforced as its target is a difference a reader
+cannot see. A root that does not exist yet is carried through unchanged — resolution needs no
+directory, and a deployment that actually registers the filesystem tools still fails there,
+with the message it always had.
 
 A run with **no policy at all** is valid and denies every tool call — the banner says so
 explicitly rather than the tool calls just failing mysteriously:

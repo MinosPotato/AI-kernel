@@ -46,6 +46,7 @@ aik-agent = { version = "0.1.0", path = "crates/agent" }
 aik-runtime = { version = "0.1.0", path = "crates/runtime" }
 aik-ipc = { version = "0.1.0", path = "crates/ipc" }
 aik-daemon = { version = "0.1.0", path = "crates/daemon" }
+aik-cli = { version = "0.1.0", path = "crates/cli" }
 aik-ollama = { version = "0.1.0", path = "crates/ollama" }
 
 async-trait = "0.1"

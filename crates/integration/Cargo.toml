@@ -29,6 +29,13 @@ aik-tools.workspace = true
 aik-policy.workspace = true
 aik-fs.workspace = true
 aik-agent.workspace = true
+# Both frontends, because the property under test in `deployment.rs` is that they resolve the
+# *same* deployment from one configuration file. That claim cannot be made from inside either
+# of their own suites: a test that only ever asks one frontend what it read is exactly the test
+# that let `cli.agent` and `daemon.agent` drift apart.
+aik-runtime.workspace = true
+aik-cli.workspace = true
+aik-daemon.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 serde.workspace = true

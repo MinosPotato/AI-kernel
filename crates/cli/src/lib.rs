@@ -148,7 +148,7 @@ pub async fn run(options: &Options) -> Result<()> {
         return client::run(&settings).await;
     }
 
-    let model = match &settings.model {
+    let model = match settings.model() {
         Some(model) => model.clone(),
         None => {
             let model = wiring::first_available_model(&settings).await?;
