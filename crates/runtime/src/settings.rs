@@ -25,6 +25,7 @@ use aik_api::model::ModelId;
 use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
 use aik_core::ComponentId;
 use aik_core::prelude::*;
+use serde::Deserialize;
 use serde_json::Value;
 
 /// Where the shared database's path lives in the configuration tree.
@@ -36,6 +37,19 @@ pub const DATABASE_PATH_KEY: &str = "components.store.db.path";
 
 /// The configuration path the policy document is read from.
 pub const POLICY_SECTION: &str = "policy";
+
+/// The configuration section the agent's own settings are read from.
+///
+/// Deliberately *not* a frontend's section. What the agent is told before its first turn is a
+/// property of the deployment, in the same way the policy document and the database path are:
+/// a terminal and a host process serving the same project are the same assistant, and an
+/// instruction that reached one of them and not the other would be two different assistants
+/// answering from one database. Frontend sections carry what is genuinely a frontend's — a
+/// socket, a verbosity, a one-shot prompt — and this is not that.
+pub const AGENT_SECTION: &str = "agent";
+
+/// Where the agent's pinned instructions live in the configuration tree.
+pub const SYSTEM_PROMPT_KEY: &str = "agent.system_prompt";
 
 /// The agent identity used when nothing configures one.
 pub const DEFAULT_AGENT: &str = "assistant";
@@ -242,6 +256,32 @@ pub fn pin_database_path(config: Config, storage: &Storage) -> Result<Config> {
         .build())
 }
 
+/// What is read from [`AGENT_SECTION`].
+///
+/// `deny_unknown_fields` so that a misspelled key fails at startup naming itself, rather than
+/// being ignored — which is the failure mode this section exists to end: an instruction
+/// silently absent looks exactly like an assistant that decided not to act on it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AgentSection {
+    system_prompt: Option<String>,
+}
+
+/// Reads the instructions pinned as the first record of every session.
+///
+/// One reader, used by every frontend, because the alternative is what it replaced: two
+/// frontends each reading a key of their own, one shipped configuration file naming one of
+/// them, and a host process that assembled the same kernel and told the agent nothing.
+///
+/// Whitespace-only is [`None`] rather than an empty pinned record: a prompt that says nothing
+/// is not a prompt, and pinning it would spend a session's first record saying so.
+pub fn system_prompt(config: &Config) -> Result<Option<String>> {
+    let section: AgentSection = config.get_or_default(AGENT_SECTION)?;
+    Ok(section
+        .system_prompt
+        .filter(|prompt| !prompt.trim().is_empty()))
+}
+
 /// Everything assembling a system needs, with every source already resolved.
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
@@ -332,6 +372,16 @@ impl RuntimeSettings {
         settings
     }
 
+    /// Whether the agent is told anything before its first turn.
+    ///
+    /// Absent is valid — an agent with no instructions still works — and is worth a frontend
+    /// saying out loud, for the same reason an absent policy is: what it produces is an
+    /// assistant that never mentions the durable memory it has, which reads as a broken
+    /// memory rather than as a missing sentence.
+    pub fn has_system_prompt(&self) -> bool {
+        self.system_prompt.is_some()
+    }
+
     /// Whether a policy document was configured at all.
     ///
     /// An absent one is valid and denies everything, which is the right default and a
@@ -369,6 +419,58 @@ mod tests {
             Some(DEFAULT_USER),
         );
         assert_ne!(principal.id.as_str(), DEFAULT_USER);
+    }
+
+    #[test]
+    fn the_agents_instructions_come_from_the_deployments_own_section() {
+        let config = Config::builder()
+            .layer(json!({ "agent": { "system_prompt": "you have a durable memory" } }))
+            .build();
+
+        assert_eq!(
+            system_prompt(&config).expect("a valid section").as_deref(),
+            Some("you have a durable memory"),
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_prompt_is_nothing_rather_than_an_empty_pinned_record() {
+        assert_eq!(system_prompt(&Config::default()).expect("valid"), None);
+
+        let blank = Config::builder()
+            .layer(json!({ "agent": { "system_prompt": "  \n " } }))
+            .build();
+        assert_eq!(system_prompt(&blank).expect("valid"), None);
+    }
+
+    #[test]
+    fn a_misspelled_key_in_the_agents_section_fails_rather_than_being_ignored() {
+        // The whole point of the section: an instruction that does not arrive is
+        // indistinguishable, from the outside, from a model that chose not to act on it.
+        let config = Config::builder()
+            .layer(json!({ "agent": { "system_promt": "you have a durable memory" } }))
+            .build();
+
+        let error = system_prompt(&config).expect_err("an unknown key is a mistake");
+        assert!(matches!(error, Error::Config { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_prompt_that_is_not_a_string_is_refused() {
+        let config = Config::builder()
+            .layer(json!({ "agent": { "system_prompt": ["a", "b"] } }))
+            .build();
+
+        let error = system_prompt(&config).expect_err("a prompt is text");
+        assert!(matches!(error, Error::Config { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_deployment_reports_whether_its_agent_was_told_anything() {
+        let mut settings = RuntimeSettings::new("/tmp");
+        assert!(!settings.has_system_prompt());
+        settings.system_prompt = Some("be terse".to_owned());
+        assert!(settings.has_system_prompt());
     }
 
     #[test]

@@ -170,9 +170,16 @@ tool.
 No memory is read into a prompt on the agent's behalf and nothing watches a conversation for
 facts worth keeping. Every memory in the store is one a model asked for and a policy allowed,
 which is what makes the audit trail complete. The consequence is that the model has to be told
-its memory exists and when to use it — the shipped `cli.system_prompt` in
+its memory exists and when to use it — the shipped `agent.system_prompt` in
 [`crates/cli/aik.example.json`](../crates/cli/aik.example.json) does exactly that, and is
 where to change the deployment's own judgement about what is worth remembering.
+
+The key sits in `agent`, not in `cli` or `daemon`, because it is a property of the deployment
+rather than of whichever frontend happens to be running: a terminal and a host process over
+the same database are the same assistant, and an instruction that reached only one of them
+would be an agent that recalls in one and does not in the other. Both frontends read it
+through `aik_runtime::system_prompt`, and both refuse a configuration that names it under
+their own section rather than ignoring it.
 
 ### Ownership
 

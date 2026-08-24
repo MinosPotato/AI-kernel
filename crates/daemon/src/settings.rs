@@ -13,6 +13,7 @@ use aik_core::prelude::*;
 use aik_ipc::Endpoint;
 use aik_runtime::{
     DEFAULT_AGENT, DEFAULT_USER, JobExecution, RuntimeSettings, Storage, pin_database_path,
+    system_prompt,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -48,7 +49,6 @@ struct FileSettings {
     agent: Option<String>,
     user: Option<String>,
     root: Option<PathBuf>,
-    system_prompt: Option<String>,
     socket: Option<PathBuf>,
     max_connections: Option<usize>,
 }
@@ -123,7 +123,11 @@ impl DaemonSettings {
         // The whole reason this process exists: something has to actually run the schedule,
         // and it has to be something that is always there.
         runtime.jobs = JobExecution::Agent;
-        runtime.system_prompt = file.system_prompt;
+        // From the deployment's own section, never this frontend's: see
+        // [`aik_runtime::AGENT_SECTION`]. A host and a terminal over the same project are the
+        // same assistant, and the one configuration file this repository ships has to reach
+        // both of them.
+        runtime.system_prompt = system_prompt(&config)?;
         runtime.config = config;
 
         let endpoint = Endpoint::resolve(
@@ -262,6 +266,74 @@ mod tests {
         });
         assert_eq!(settings.runtime.tools, ToolSet::None);
         assert_eq!(settings.runtime.memory, MemorySet::Off);
+    }
+
+    #[test]
+    fn the_agents_instructions_reach_a_host_from_the_deployments_own_section() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("aikd.json");
+        std::fs::write(
+            &path,
+            r#"{ "agent": { "system_prompt": "you have a durable memory" } }"#,
+        )
+        .expect("written");
+
+        let settings = resolve(&Options {
+            config: Some(path),
+            ..Options::default()
+        });
+
+        assert_eq!(
+            settings.runtime.system_prompt.as_deref(),
+            Some("you have a durable memory"),
+        );
+    }
+
+    #[test]
+    fn the_shipped_configuration_tells_this_hosts_agent_about_its_memory() {
+        // The regression. `docs/CLI.md` starts a host with this exact file, and the prompt in
+        // it is the only thing that tells the agent its memory is durable and is never
+        // recalled for it. A host that resolved it to `None` produced an assistant that would
+        // store a fact when asked and then, in the next session, explain that it could not
+        // look one up — which is what this file existing at all is meant to prevent.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("cli")
+            .join("aik.example.json");
+
+        let settings = resolve(&Options {
+            config: Some(path),
+            ..Options::default()
+        });
+
+        assert!(
+            settings.runtime.has_system_prompt(),
+            "the shipped configuration must reach a host as well as a terminal",
+        );
+        let prompt = settings
+            .runtime
+            .system_prompt
+            .as_deref()
+            .expect("a prompt just asserted present");
+        assert!(prompt.contains("memory.query"), "{prompt}");
+        assert!(settings.runtime.has_policy());
+    }
+
+    #[test]
+    fn a_prompt_under_this_frontends_own_section_is_refused_rather_than_ignored() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("aikd.json");
+        std::fs::write(&path, r#"{ "daemon": { "system_prompt": "be terse" } }"#).expect("written");
+
+        let error = DaemonSettings::resolve_from(
+            &Options {
+                config: Some(path),
+                ..Options::default()
+            },
+            env(&[("XDG_RUNTIME_DIR", "/nonexistent/run")]),
+        )
+        .expect_err("the prompt is not this frontend's setting");
+        assert!(matches!(error, Error::Config { .. }), "{error}");
     }
 
     #[test]

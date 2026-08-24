@@ -294,6 +294,7 @@ impl Host {
 /// Builds a host: a temporary root and socket, a policy document, and a script.
 pub struct HostBuilder {
     policy: Option<Value>,
+    config: Option<Value>,
     turns: Vec<Turn>,
     delay: Duration,
     options: Options,
@@ -312,12 +313,25 @@ impl HostBuilder {
     pub fn new() -> Self {
         Self {
             policy: None,
+            config: None,
             turns: Vec::new(),
             delay: Duration::ZERO,
             options: Options::default(),
             database: None,
             socket: None,
         }
+    }
+
+    /// Starts the host with `--config <file>` holding this tree.
+    ///
+    /// Written to a file and passed as the flag rather than injected into the resolved
+    /// settings, because the thing worth testing is the resolution: a key the host reads from
+    /// somewhere a shipped configuration file does not put it is exactly the failure this
+    /// exists to catch.
+    #[must_use]
+    pub fn config(mut self, config: Value) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// The policy document's rules.
@@ -393,6 +407,12 @@ impl HostBuilder {
                 .clone()
                 .unwrap_or_else(|| root.join("run").join("aikd.sock")),
         );
+
+        if let Some(config) = &self.config {
+            let path = root.join(".aikd.json");
+            std::fs::write(&path, config.to_string()).expect("a configuration file");
+            options.config = Some(path);
+        }
 
         if let Some(policy) = &self.policy {
             let path = root.join(".policy.json");
