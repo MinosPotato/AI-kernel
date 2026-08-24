@@ -30,12 +30,36 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-scheduler`](crates/scheduler) | Time- and event-triggered jobs, persistent across restarts |
 | [`aik-audit`](crates/audit) | The durable, append-only trail of authorization decisions and tool calls |
 | [`aik-agent`](crates/agent) | The agent loop: model turns, bounded context, authorization-gated tool calls |
+| [`aik-runtime`](crates/runtime) | System assembly: one description of a deployment, wired into a kernel |
+| [`aik-ipc`](crates/ipc) | The authenticated local protocol between the host process and its clients |
+| [`aik-daemon`](crates/daemon) | The host process (`aikd`): one owner of the database, running the schedule |
 | [`aik-cli`](crates/cli) | The terminal frontend: a conversation, streamed updates, interactive approvals |
 
 `aik-core` does not depend on `aik-api`, and neither depends on any of the subsystem
 crates. A kernel can be built and run with none of the subsystem contracts present, no
-model provider, no tool registry, and no policy engine at all. Only `aik-cli` depends on
-all of them, because assembling them is the whole of what a frontend does.
+model provider, no tool registry, and no policy engine at all. Only `aik-runtime` depends on
+all of them, because assembling them is the whole of what it does; `aik-cli` and `aik-daemon`
+depend on it rather than on the subsystems, so the terminal and the host process assemble the
+same system by construction rather than by agreement.
+
+## Two processes
+
+redb hands the database to exactly one process, and a schedule needs something that is always
+there to run it. So there is a host process, and everything else talks to it:
+
+```bash
+aikd --policy policy.json                 # holds the database, runs the schedule
+aik --socket "$XDG_RUNTIME_DIR/aik/aikd.sock"          # a conversation, through the host
+aik audit --socket "$XDG_RUNTIME_DIR/aik/aikd.sock"    # the trail, through the host
+```
+
+The socket is mode `0600` in a directory mode `0700`, the peer's account is checked by the
+kernel before a byte of the protocol is read, and a per-instance token is written beside the
+socket. No request carries a principal, a tool name or a policy: the host derives the one
+identity in play from the connection it authenticated. There is no network listener, and
+adding one needs a transport identity that is not a uid — see [`aik-ipc`](crates/ipc).
+
+With no host running, `aik` assembles its own kernel exactly as before.
 
 ## The mechanisms
 

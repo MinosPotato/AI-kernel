@@ -11,6 +11,10 @@ document is for building a mental model of the whole system and for troubleshoot
 `aik` has one subcommand, `aik audit`, which reviews the durable record of what the system was
 allowed to do — see [The audit trail](#the-audit-trail-aik-audit).
 
+There is also a second binary, `aikd`, the host process that owns the database and runs the
+schedule. With one running, `aik` becomes a client of it rather than assembling a kernel of
+its own — see [The host process](#the-host-process-aikd).
+
 ## Prerequisites
 
 - Rust 1.85 or newer (edition 2024) — `rustc --version`
@@ -244,6 +248,132 @@ redb's lock is held by the `Arc<Db>` the kernel registry owns, and the registry 
 means dropping the `Kernel`. In the binary that is process exit, so it never comes up; in a
 test or an in-process restart it does, and the suite asserts it (`durable.rs`,
 `shutdown_releases_the_database_so_the_next_run_can_open_it`).
+
+## The host process: `aikd`
+
+```bash
+aikd --config crates/cli/aik.example.json --root .        # holds the database, runs jobs
+aik  --socket "$XDG_RUNTIME_DIR/aik/aikd.sock" "hello"    # a conversation, through the host
+aik audit --socket "$XDG_RUNTIME_DIR/aik/aikd.sock"       # the trail, through the host
+```
+
+### Why there is one
+
+Two facts, and neither is negotiable:
+
+- **redb locks the database.** Exactly one process may have it open, which is what makes a
+  write spanning the transcript, the memories, the schedule and the audit trail one
+  transaction. A second `aik` started while a host is running does not get a second view of
+  the data; it fails to open it.
+- **A schedule needs something that is always there.** A job that fires at 3am fires in
+  whatever process is running at 3am. A terminal is not that process, and a terminal that
+  *were* would interleave unattended agent turns with somebody's conversation. So a terminal
+  run stores jobs and runs none of them; `aikd` runs them.
+
+### What it serves
+
+One kernel, assembled by exactly the same code a terminal run uses
+([`aik-runtime`](../crates/runtime)), from the same kind of resolved settings. `aikd` adds a
+lifetime and a door; it decides nothing about authorization that `aik` does not.
+
+Clients ask for conversations, session listings, `clear`, `compact`, scheduled jobs and audit
+queries. They cannot ask for anything else, and in particular:
+
+- **No request names a principal.** There is nowhere on the wire to put one. Every
+  `ExecutionContext` the host builds carries a principal derived from its own settings.
+- **No request names a tool, a handler or a policy.** A scheduled job says *when* and *what to
+  ask*; the host stamps the handler and the owner.
+- **No response carries a tool's arguments or output.** The types on the wire are the kernel's
+  own, with the limits their own documentation already states.
+
+### Authentication
+
+Three checks, in this order, and each is doing a different job:
+
+1. **The filesystem.** The socket is mode `0600` in a directory mode `0700`, both owned by the
+   account running the host, and a symbolic link in either position is refused rather than
+   followed. This is the check the peer cannot influence, and the socket is bound under a
+   temporary name and renamed into place so the path a client connects to never exists at any
+   looser mode.
+2. **Peer credentials.** The operating system reports the connecting account, before a byte of
+   the peer's handshake is parsed. Another account is disconnected without being sent a
+   protocol at all, and the refusal is logged — reaching the socket from another account means
+   the directory's mode is not what it should be.
+3. **A token.** 256 bits from `/dev/urandom`, written mode `0600` beside the socket and
+   regenerated on every start, compared in constant time. Against an attacker who already runs
+   as this account it proves nothing, and is not claimed to; what it stops is a *stale* or
+   *confused* client — a process holding an old path, a script pointed at the wrong endpoint.
+
+A client checks the host in the same way before handing over its token: same account, same
+modes, no symlinks. Skipping that would make the token an anti-credential.
+
+A version mismatch is only reported *after* the token is accepted, so a peer that has not
+authenticated learns nothing about the host, and a malformed handshake is indistinguishable
+from a wrong token.
+
+### Where the socket lives
+
+```bash
+aikd --socket /run/user/1000/aik/aikd.sock   # explicit
+AIK_SOCKET=/run/user/1000/aik/aikd.sock aikd # the environment
+aikd                                         # $XDG_RUNTIME_DIR/aik/aikd.sock
+```
+
+With neither `--socket` nor `$AIK_SOCKET` nor `$XDG_RUNTIME_DIR`, `aikd` refuses to start
+rather than falling back to a shared temporary directory, for the same reason the database
+does: a socket somebody else can create first is a socket somebody else can be listening on.
+
+`aik` reads the same `$AIK_SOCKET`, so the two cannot end up naming different sockets. It has
+**no** default socket: with none configured, `aik` assembles its own kernel exactly as it
+always did. A default that quietly turned every `aik` into a client of whatever happened to be
+listening would change what the command is based on something nobody typed.
+
+### Approvals
+
+A client says at connection time whether a human is present. One that does holds an approval
+gate for as long as the connection lasts, which is the same assertion an interactive terminal
+session makes; one that does not gets the immediate refusal a one-shot run gets. A client that
+disappears stops asserting, so a question asked afterwards has nobody to reach and is refused.
+
+Questions are broadcast to every attached console and the first answer wins. That is a
+property of a host with more than one console: routing a question to the connection whose call
+caused it would silently refuse every scheduled job's approval, since the client that
+scheduled it is usually long gone.
+
+### Bounds and shutdown
+
+`--max-clients` (default 16) bounds connections, counting those still in their handshake, so a
+client in a restart loop cannot exhaust the host's file descriptors. A peer that never
+completes a handshake is timed out. Each connection may have 8 calls in flight; the excess is
+refused with an error naming the limit rather than by disconnecting.
+
+`SIGINT` or `SIGTERM` stops the host: clients are told, work in flight is cancelled, parked
+approvals are refused by the closing broker, and the socket and its token are removed. A
+second signal is not special-cased — shutdown is already bounded, and an operator who wants it
+to stop *now* has `SIGKILL`.
+
+There is no `--daemonize`, no pid file and no log configuration. A service manager does that
+better, and a process that hides itself hides its failures too.
+
+### Reviewing the trail while a host is running
+
+The database is locked, so `aik audit` cannot open it and says so, naming `--socket` as the way
+through. Reading through the host reads under the same identity it would against the file —
+the operator, not the agent — because a socket in a `0700` directory establishes exactly what
+opening a `0600` file establishes. `--socket` together with `--db` or `--user` is a usage
+error rather than a silently ignored flag: both would let somebody believe they had reviewed a
+different trail, or reviewed it as somebody else.
+
+`aik audit prune --socket ...` works too, and is the reason the host exposes a destructive
+operation at all: the alternative would be an operator stopping the host in order to apply a
+retention period, which is a strictly worse thing to make routine. It removes nothing a sweep
+would spare, and the removal is itself recorded in the trail.
+
+### There is no network listener
+
+Unix sockets, peer credentials and file modes are the whole of the authentication story, and
+none of the three exists on a network address. Remote access needs a transport identity that
+is not a uid and a trust decision that is not a file mode; adding it means adding both.
 
 ## Configuration and policy files
 

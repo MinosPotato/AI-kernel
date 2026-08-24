@@ -3,3 +3,6 @@ Cargo.lock.bak
 *.profraw
 .claude/
 .serena/
+graphify-out/
+mutants.out/
+mutants.out.old/

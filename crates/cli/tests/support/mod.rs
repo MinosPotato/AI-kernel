@@ -409,7 +409,7 @@ impl HarnessBuilder {
 
         let mut settings = Settings::resolve_from(&options, Vec::<(String, String)>::new())
             .expect("resolved settings");
-        settings.model_component = ComponentId::new(STUB_MODEL);
+        settings.runtime.model_component = ComponentId::new(STUB_MODEL);
 
         let model = Arc::new(ScriptedModel::new(self.replies));
         let (mut builder, broker) =

@@ -97,10 +97,11 @@ dependencies = [
  "aik-audit",
  "aik-context",
  "aik-core",
- "aik-fs",
+ "aik-daemon",
+ "aik-ipc",
  "aik-memory",
  "aik-ollama",
- "aik-policy",
+ "aik-runtime",
  "aik-scheduler",
  "aik-store",
  "aik-tools",
@@ -148,6 +149,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-daemon"
+version = "0.1.0"
+dependencies = [
+ "aik-agent",
+ "aik-api",
+ "aik-approval",
+ "aik-audit",
+ "aik-context",
+ "aik-core",
+ "aik-ipc",
+ "aik-runtime",
+ "aik-scheduler",
+ "aik-store",
+ "aik-tools",
+ "async-trait",
+ "futures",
+ "futures-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "aik-fs"
 version = "0.1.0"
 dependencies = [
@@ -179,6 +206,20 @@ dependencies = [
  "aik-tools",
  "async-trait",
  "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "aik-ipc"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-approval",
+ "aik-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -233,6 +274,31 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "aik-runtime"
+version = "0.1.0"
+dependencies = [
+ "aik-agent",
+ "aik-api",
+ "aik-approval",
+ "aik-audit",
+ "aik-context",
+ "aik-core",
+ "aik-fs",
+ "aik-memory",
+ "aik-ollama",
+ "aik-policy",
+ "aik-scheduler",
+ "aik-store",
+ "aik-tools",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

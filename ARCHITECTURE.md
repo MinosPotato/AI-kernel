@@ -42,6 +42,9 @@ AI-kernel/
 │  ├─ memory/   → aik-memory   : a persistent record store, retrieved by kind and metadata
 │  ├─ scheduler/→ aik-scheduler: time- and event-triggered jobs, optionally durable
 │  ├─ agent/    → aik-agent    : the agent loop tying every capability above together
+│  ├─ runtime/  → aik-runtime  : system assembly — settings in, wired kernel out
+│  ├─ ipc/      → aik-ipc      : the authenticated local protocol, host and client halves
+│  ├─ daemon/   → aik-daemon   : the host process (the `aikd` binary)
 │  └─ cli/      → aik-cli      : a terminal frontend (the `aik` binary)
 ```
 
@@ -57,11 +60,18 @@ whichever `PolicyEngine` and `ApprovalSink` (`aik-approval`) it is given; `aik-f
 first `Tool` implementation, and the first code in the workspace that touches the host
 filesystem; `aik-context` implements `ContextStore`; `aik-scheduler` implements `Scheduler`, running
 unattended work against the same shared database; `aik-agent` composes a `ModelProvider`,
-a `ToolRegistry` and a `ContextStore` into a request/response loop; `aik-cli` is the first
-and, so far, only thing that assembles a real kernel, wires every crate above into it, and
-lets a human type a question. None of this layer is itself part of the kernel — see
+a `ToolRegistry` and a `ContextStore` into a request/response loop; `aik-runtime` is the one
+thing that assembles a real kernel out of all of them; `aik-daemon` is the long-lived process
+that owns that kernel, the database under it and the schedule over it, and serves clients over
+a local socket; `aik-cli` lets a human type a question, either into a kernel of its own or
+into a running host. None of this layer is itself part of the kernel — see
 [What deliberately is not in the kernel](#what-deliberately-is-not-in-the-kernel) — but it is
 part of this repository, developed against `aik-api`'s contracts to keep them honest.
+
+The dependency direction is what keeps the two frontends honest about assembly: `aik-runtime`
+depends on every implementation crate and nothing depends back on it except `aik-cli` and
+`aik-daemon`. Neither frontend can register a component the other does not, because neither
+registers components at all.
 
 ## `aik-core` — the kernel
 

@@ -1,6 +1,6 @@
 [package]
-name = "aik-cli"
-description = "A terminal frontend for the AI kernel: one conversation, streamed updates, and interactive approvals."
+name = "aik-daemon"
+description = "The AI kernel's host process: one owner of the durable database, serving clients over an authenticated local socket."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,43 +9,43 @@ repository.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "aik"
+name = "aikd"
 path = "src/main.rs"
-# `main.rs` exposes nothing; documenting it only collides with the `aik` facade crate.
+# `main.rs` exposes nothing; documenting it only collides with the library.
 doc = false
 
 [lints]
 workspace = true
 
 [dependencies]
-aik-agent.workspace = true
-aik-ipc.workspace = true
-aik-runtime.workspace = true
 aik-api.workspace = true
 aik-approval.workspace = true
 aik-audit.workspace = true
-aik-context.workspace = true
 aik-core.workspace = true
-aik-memory.workspace = true
-aik-ollama.workspace = true
-aik-scheduler.workspace = true
+aik-ipc.workspace = true
+aik-runtime.workspace = true
 aik-store.workspace = true
-aik-tools.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
-    "io-std",
+    "net",
     "io-util",
     "signal",
+    "sync",
+    "time",
 ] }
 tokio-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-aik-daemon.workspace = true
+aik-agent.workspace = true
+aik-context.workspace = true
+aik-scheduler.workspace = true
+aik-tools.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

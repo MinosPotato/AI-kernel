@@ -59,17 +59,42 @@ impl Wiring {
         }
     }
 
-    /// Subscribes and publishes the store. Called from `init`, once.
-    fn init(&self, ctx: &ComponentContext, store: Arc<dyn AuditStore>) -> Result<()> {
+    /// Subscribes and publishes the store and the sweeper. Called from `init`, once.
+    ///
+    /// # Why the sweeper is published as well
+    ///
+    /// Reading and removing stay two capabilities, and holding the store still gives no
+    /// ability to erase — that is the whole point of the split and it is unchanged. What is
+    /// published here is the *removing* half, under the same component id, so that an
+    /// operator's explicit prune can reach it in a process that is already holding the
+    /// database open.
+    ///
+    /// That is the case this exists for. redb locks the file, so while a host process is
+    /// running there is no second process that could open the trail to prune it, and the
+    /// alternative would be an operator stopping the host in order to apply a retention
+    /// period — which is a strictly worse thing to make routine.
+    ///
+    /// It widens nothing a model can reach. The registry is held by components and by
+    /// whatever assembled the kernel; an agent holds a
+    /// [`ToolRegistry`](aik_api::tool::ToolRegistry) and never a
+    /// [`Registry`](aik_core::Registry), there is no audit tool, and there will not be one.
+    fn init(
+        &self,
+        ctx: &ComponentContext,
+        store: Arc<dyn AuditStore>,
+        sweeper: Arc<dyn AuditRetentionSweeper>,
+    ) -> Result<()> {
         *self.subscriptions.lock().expect("the subscription lock") = Some((
             ctx.subscribe::<AuthorizationDecided>(),
             ctx.subscribe::<ToolInvoked>(),
         ));
 
         if self.default {
-            ctx.provide_default::<dyn AuditStore>(store)
+            ctx.provide_default::<dyn AuditStore>(store)?;
+            ctx.provide_default::<dyn AuditRetentionSweeper>(sweeper)
         } else {
-            ctx.provide::<dyn AuditStore>(store)
+            ctx.provide::<dyn AuditStore>(store)?;
+            ctx.provide::<dyn AuditRetentionSweeper>(sweeper)
         }
     }
 
@@ -229,7 +254,7 @@ impl Component for AuditComponent {
         self.store
             .set(store.clone())
             .expect("init runs at most once per component");
-        self.wiring.init(ctx, store)
+        self.wiring.init(ctx, store.clone(), store)
     }
 
     async fn start(&self, ctx: &ComponentContext) -> Result<()> {
@@ -343,7 +368,7 @@ impl Component for RedbAuditComponent {
         self.store
             .set(store.clone())
             .expect("init runs at most once per component");
-        self.wiring.init(ctx, store)
+        self.wiring.init(ctx, store.clone(), store)
     }
 
     async fn start(&self, ctx: &ComponentContext) -> Result<()> {

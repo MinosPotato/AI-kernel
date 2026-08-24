@@ -14,6 +14,9 @@ members = [
     "crates/store",
     "crates/memory",
     "crates/scheduler",
+    "crates/runtime",
+    "crates/ipc",
+    "crates/daemon",
     "crates/integration",
     "crates/agent",
     "crates/cli",
@@ -40,6 +43,9 @@ aik-store = { version = "0.1.0", path = "crates/store" }
 aik-memory = { version = "0.1.0", path = "crates/memory" }
 aik-scheduler = { version = "0.1.0", path = "crates/scheduler" }
 aik-agent = { version = "0.1.0", path = "crates/agent" }
+aik-runtime = { version = "0.1.0", path = "crates/runtime" }
+aik-ipc = { version = "0.1.0", path = "crates/ipc" }
+aik-daemon = { version = "0.1.0", path = "crates/daemon" }
 aik-ollama = { version = "0.1.0", path = "crates/ollama" }
 
 async-trait = "0.1"

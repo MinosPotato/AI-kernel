@@ -175,7 +175,7 @@ async fn an_ephemeral_run_opens_no_database_but_still_holds_all_three_subsystems
         .build(workspace.root.path())
         .await;
 
-    assert_eq!(harness.settings.storage, Storage::Ephemeral);
+    assert_eq!(harness.settings.runtime.storage, Storage::Ephemeral);
     assert!(
         harness.kernel.context().service::<Db>().is_err(),
         "an ephemeral run must not have opened a database",
@@ -210,7 +210,7 @@ async fn the_configured_database_is_the_file_that_is_actually_opened() {
     assert_eq!(harness.settings.database(), Some(path.as_path()));
     assert!(path.exists(), "the store opened something, somewhere else");
     assert_eq!(
-        harness.settings.config.value(DATABASE_PATH_KEY),
+        harness.settings.runtime.config.value(DATABASE_PATH_KEY),
         Some(&json!(path.to_string_lossy())),
         "the path the frontend reported must be the path the component was handed",
     );
@@ -682,7 +682,7 @@ async fn deletion_is_reachable_only_when_it_was_asked_for() {
         .expect_err("the tool was never registered");
     assert_eq!(error.kind(), aik_core::ErrorKind::NotFound, "{error}");
     assert!(
-        harness.settings.memory != MemorySet::Full,
+        harness.settings.runtime.memory != MemorySet::Full,
         "the default must not be the one that can forget",
     );
     harness.stop().await;
@@ -821,6 +821,7 @@ async fn the_shipped_example_configuration_describes_the_system_that_exists() {
     assert_eq!(
         harness
             .settings
+            .runtime
             .system_prompt
             .as_deref()
             .map(str::trim)

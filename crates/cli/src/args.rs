@@ -15,71 +15,13 @@ use aik_core::{Error, Result};
 /// The program name used in help and error messages.
 pub const PROGRAM: &str = "aik";
 
-/// Which filesystem tools a run registers.
+/// Which filesystem tools a run registers, and which memory tools.
 ///
-/// A tool that is not registered cannot be reached at all, whatever policy says, so this is
-/// the outer of the two limits on what the agent can touch — see
-/// [`Options::write`](Options::write).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ToolSet {
-    /// No tools whatsoever. The agent can only talk.
-    None,
-    /// Reading and listing, confined to the root.
-    #[default]
-    ReadOnly,
-    /// Reading, listing and writing, confined to the root.
-    ReadWrite,
-}
-
-/// Which memory tools a run registers.
-///
-/// The same outer limit [`ToolSet`] is for the filesystem, applied to the record store: a
-/// memory tool that is not registered cannot be reached however permissive the policy is.
-/// The modes are cumulative, and the default is [`MemorySet::Remember`] — an assistant that
-/// can recall but never record has nothing to recall.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MemorySet {
-    /// No memory tools. The agent cannot reach the record store at all.
-    Off,
-    /// `memory.get` and `memory.query`: recall only, nothing written and nothing forgotten.
-    Recall,
-    /// Recall, plus `memory.put`.
-    #[default]
-    Remember,
-    /// Everything, including `memory.delete`.
-    ///
-    /// Deletion is the one memory operation that destroys evidence: a model that can forget
-    /// on its own can erase what it was told to do and the record that it was told. It is
-    /// therefore never on by default, and the shipped policy still puts every deletion to a
-    /// human. Expiry — a `ttl_seconds` on the record — is the non-destructive way to bound
-    /// how long a memory lasts, and needs no tool at all.
-    Full,
-}
-
-impl MemorySet {
-    /// Parses a `--memory` value, or explains what the accepted ones are.
-    pub fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "off" => Ok(Self::Off),
-            "recall" => Ok(Self::Recall),
-            "remember" => Ok(Self::Remember),
-            "full" => Ok(Self::Full),
-            other => Err(usage(format!(
-                "`--memory` takes one of off, recall, remember, full; got `{other}`"
-            ))),
-        }
-    }
-
-    /// The mode's name, as `--memory` spells it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Recall => "recall",
-            Self::Remember => "remember",
-            Self::Full => "full",
-        }
-    }
-}
+/// Re-exported from [`aik_runtime`] rather than defined here: both are *wiring* decisions —
+/// which capability exists at all — and the host process makes exactly the same two. A
+/// second definition would be a second thing to keep in step, and the drift would show up as
+/// a tool present in one frontend and absent in the other.
+pub use aik_runtime::{MemorySet, ToolSet};
 
 /// What the user asked for on the command line.
 ///
@@ -128,6 +70,18 @@ pub struct Options {
     ///
     /// See [`crate::recorder`] for exactly what is and is not written.
     pub record: Option<PathBuf>,
+    /// The host process's socket, if this run is to be a client of one.
+    ///
+    /// Present changes what `aik` *is*: it assembles no kernel, opens no database and
+    /// registers no tool, because a running host process already holds all three.
+    ///
+    /// Every option that would describe an assembly or an identity — `--write`,
+    /// `--no-tools`, `--memory`, `--db`, `--ephemeral`, `--policy`, `--root`, `--model`,
+    /// `--agent`, `--user` — is refused alongside it rather than silently ignored, and so is
+    /// `--record`, which records events a client never sees. Accepting any of them would
+    /// suggest this run could narrow what the host serves, or choose who it acts as. It can
+    /// do neither: only the host's own configuration can.
+    pub socket: Option<PathBuf>,
 }
 
 impl Options {
@@ -211,6 +165,8 @@ pub const HELP: &str = concat!(
     "    -v, --verbose        print authorization and context events as they happen\n",
     "    -R, --record <FILE>  append a JSONL measurement record of the run to FILE\n",
     "                         (counts and timings only — see docs/MEASUREMENTS.md)\n",
+    "    -s, --socket <PATH>  talk to a running `aikd` on this socket instead of\n",
+    "                         assembling a kernel here; see HOST PROCESS below\n",
     "    -h, --help           print this help\n",
     "    -V, --version        print the version\n",
     "\n",
@@ -223,6 +179,13 @@ pub const HELP: &str = concat!(
     "    An interactive session answers `require_approval` from the terminal. A one-shot\n",
     "    run does not attach a responder, so a policy that defers to a human refuses\n",
     "    instead of waiting for one who is not there.\n",
+    "\n",
+    "HOST PROCESS:\n",
+    "    Only one process may hold the database: it is locked while open. `aikd` is the\n",
+    "    process that holds it, runs the schedule, and serves clients over a local socket\n",
+    "    that only your account can reach. With one running, pass --socket (or set\n",
+    "    AIK_SOCKET) and this command becomes a client of it; without one, `aik` assembles\n",
+    "    its own kernel exactly as before.\n",
     "\n",
     "AUDIT:\n",
     "    Every authorization decision and every tool call is recorded durably. Review it\n",
@@ -254,6 +217,8 @@ pub const AUDIT_HELP: &str = concat!(
     "    -u, --user <ID>       the identity to read as [default: user]\n",
     "    -c, --config <FILE>   JSON configuration file, consulted for the database path\n",
     "        --db <FILE>       the shared database file\n",
+    "    -s, --socket <PATH>   ask a running `aikd` on this socket instead of opening the\n",
+    "                          database directly, which it holds locked while it runs\n",
     "    -h, --help            print this help\n",
     "\n",
     "WHAT YOU CAN SEE:\n",
@@ -328,12 +293,20 @@ where
             "-p" | "--policy" => options.policy = Some(PathBuf::from(value(&flag)?)),
             "--write" => options.write = true,
             "--no-tools" => options.no_tools = true,
-            "--memory" => options.memory = Some(MemorySet::parse(&value(&flag)?)?),
+            "--memory" => {
+                let raw = value(&flag)?;
+                options.memory = Some(MemorySet::parse(&raw).map_err(|error| {
+                    usage(format!(
+                        "`--memory` takes one of off, recall, remember, full; got `{raw}` ({error})"
+                    ))
+                })?);
+            }
             "--db" => options.database = Some(PathBuf::from(value(&flag)?)),
             "--ephemeral" => options.ephemeral = true,
             "--session" => options.session = Some(parse_session(&value(&flag)?)?),
             "-v" | "--verbose" => options.verbose = true,
             "-R" | "--record" => options.record = Some(PathBuf::from(value(&flag)?)),
+            "-s" | "--socket" => options.socket = Some(PathBuf::from(value(&flag)?)),
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(usage(format!("unknown option `{other}`")));
             }
@@ -368,6 +341,33 @@ where
              session to resume"
                 .to_owned(),
         ));
+    }
+
+    // Every option below describes how a system is *assembled*, and a client assembles
+    // nothing. Refusing them is the honest answer: a `--write` accepted and ignored would
+    // read as "this connection may write", and a `--no-tools` accepted and ignored would
+    // read as the far more dangerous converse.
+    if options.socket.is_some() {
+        let conflicting = [
+            ("--write", options.write),
+            ("--no-tools", options.no_tools),
+            ("--memory", options.memory.is_some()),
+            ("--db", options.database.is_some()),
+            ("--ephemeral", options.ephemeral),
+            ("--policy", options.policy.is_some()),
+            ("--root", options.root.is_some()),
+            ("--model", options.model.is_some()),
+            ("--agent", options.agent.is_some()),
+            ("--user", options.user.is_some()),
+            ("--record", options.record.is_some()),
+        ];
+        if let Some((name, _)) = conflicting.into_iter().find(|(_, given)| *given) {
+            return Err(usage(format!(
+                "`--socket` and `{name}` contradict each other: a client assembles nothing, \
+                 so what it may reach is the host process's configuration and not this \
+                 command's"
+            )));
+        }
     }
 
     if !words.is_empty() {
@@ -413,6 +413,13 @@ pub struct AuditOptions {
     /// principal did and what was done on their behalf, and nothing else. See
     /// [`crate::audit`] for why it is the user rather than the agent.
     pub user: Option<String>,
+    /// The host process's socket, if the trail is to be read through one.
+    ///
+    /// The database is locked by whichever process has it open, so a review while `aikd`
+    /// runs has to go through `aikd`. It reads under the same identity either way — see
+    /// [`crate::audit`] — because the socket already establishes that the caller is the
+    /// account that owns the database, which is the same thing opening the file establishes.
+    pub socket: Option<PathBuf>,
 }
 
 /// Reviewing, or pruning.
@@ -478,6 +485,7 @@ fn parse_audit<I: Iterator<Item = String>>(args: I) -> Result<Invocation> {
         database: None,
         config: None,
         user: None,
+        socket: None,
     };
     let mut filters = AuditFilters::default();
     let mut older_than: Option<Duration> = None;
@@ -503,6 +511,8 @@ fn parse_audit<I: Iterator<Item = String>>(args: I) -> Result<Invocation> {
             "--db" => options.database = Some(PathBuf::from(value(&flag)?)),
             "-c" | "--config" => options.config = Some(PathBuf::from(value(&flag)?)),
             "-u" | "--user" => options.user = Some(value(&flag)?),
+            "-s" | "--socket" => options.socket = Some(PathBuf::from(value(&flag)?)),
+
             "--principal" => filters.principal = Some(value(&flag)?),
             "--tool" => filters.tool = Some(value(&flag)?),
             "--correlation" => filters.correlation = Some(parse_correlation(&value(&flag)?)?),
@@ -528,7 +538,7 @@ fn parse_audit<I: Iterator<Item = String>>(args: I) -> Result<Invocation> {
         if filters != AuditFilters::default() {
             return Err(audit_usage(format!(
                 "`{PROGRAM} {AUDIT_COMMAND} {PRUNE_COMMAND}` takes only --older-than, \
-                 --dry-run, --db, --config and --user"
+                 --dry-run, --db, --config, --socket and --user"
             )));
         }
         let older_than = older_than.ok_or_else(|| {
@@ -550,6 +560,26 @@ fn parse_audit<I: Iterator<Item = String>>(args: I) -> Result<Invocation> {
             )));
         }
         options.command = AuditCommand::Review(Box::new(filters));
+    }
+
+    // A socket names a *host*, and the host decides both which database it holds and which
+    // identity a review reads as. Accepting either alongside it and ignoring them would let
+    // somebody believe they had reviewed a different trail, or reviewed it as somebody else.
+    if options.socket.is_some() {
+        if options.database.is_some() {
+            return Err(audit_usage(
+                "`--socket` and `--db` contradict each other: the host holds the database, and \
+                 which one that is is its configuration rather than this command's"
+                    .to_owned(),
+            ));
+        }
+        if options.user.is_some() {
+            return Err(audit_usage(
+                "`--socket` and `--user` contradict each other: a review through a host reads \
+                 as the identity that host was configured with"
+                    .to_owned(),
+            ));
+        }
     }
 
     Ok(Invocation::Audit(Box::new(options)))
