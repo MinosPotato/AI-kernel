@@ -180,7 +180,7 @@ every "Implemented by" column below is a separate crate.
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
 | `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query is `Unsupported`) |
 | `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               | `aik-policy` (`PolicyEngine`), `aik-approval` (`ApprovalSink`) |
-| `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) | `aik-scheduler` (cron is `Unsupported`) |
+| `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) | `aik-scheduler` |
 | `agent`      | `Agent`, sessions, streaming updates                                   | `aik-agent` (`AgentLoop`) |
 | `platform`   | `PlatformIntegration`: the single seam for Hyprland/Wayland/OS backends | not yet implemented |
 

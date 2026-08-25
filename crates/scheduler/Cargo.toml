@@ -16,6 +16,7 @@ aik-core.workspace = true
 aik-api.workspace = true
 aik-store.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }

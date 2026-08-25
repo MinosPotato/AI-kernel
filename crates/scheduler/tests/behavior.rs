@@ -39,7 +39,8 @@ crate::both_backends!(
     an_event_triggered_job_has_no_next_run,
     an_event_the_job_does_not_name_does_not_fire_it,
     the_scheduler_does_not_trigger_jobs_on_its_own_events,
-    cron_is_refused_at_scheduling_time,
+    a_cron_job_fires_at_its_next_matching_occurrence,
+    a_malformed_cron_expression_is_refused_at_scheduling_time,
     an_interval_that_cannot_advance_is_refused,
     persistence_is_accepted_only_where_it_can_be_honoured,
     an_overlapping_firing_is_skipped_rather_than_queued,
@@ -375,7 +376,33 @@ async fn the_scheduler_does_not_trigger_jobs_on_its_own_events(backend: Backend)
     );
 }
 
-async fn cron_is_refused_at_scheduling_time(backend: Backend) {
+async fn a_cron_job_fires_at_its_next_matching_occurrence(backend: Backend) {
+    let f = fixture(backend, TestHandler::new()).await;
+    // `START` (see support.rs) is 2023-11-14T22:13:20Z — 20 seconds past the minute, so
+    // "every minute" is next due 40 seconds later, at 22:14:00.
+    f.scheduler()
+        .schedule(
+            spec(
+                "every-minute",
+                Trigger::Cron {
+                    expression: "* * * * *".into(),
+                },
+            ),
+            &anonymous(),
+        )
+        .await
+        .unwrap();
+
+    advance(Duration::from_secs(40)).await;
+
+    f.handler(HANDLER).wait_for_calls(1).await;
+    assert_eq!(
+        f.handler(HANDLER).calls()[0].job,
+        JobId::new("every-minute")
+    );
+}
+
+async fn a_malformed_cron_expression_is_refused_at_scheduling_time(backend: Backend) {
     let f = fixture(backend, TestHandler::new()).await;
     let error = f
         .scheduler()
@@ -383,7 +410,7 @@ async fn cron_is_refused_at_scheduling_time(backend: Backend) {
             spec(
                 "nightly",
                 Trigger::Cron {
-                    expression: "0 3 * * *".into(),
+                    expression: "not a cron expression".into(),
                 },
             ),
             &anonymous(),
@@ -391,7 +418,7 @@ async fn cron_is_refused_at_scheduling_time(backend: Backend) {
         .await
         .unwrap_err();
 
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
     assert!(f.scheduler().list(&anonymous()).await.unwrap().is_empty());
 }
 
