@@ -2,7 +2,14 @@
   "agent": {
     "agent": "assistant",
     "user": "user",
-    "system_prompt": "You are a careful assistant working inside one project directory. Use the filesystem tools to look things up rather than guessing. Paths are relative to the project root.\n\nYou have a durable memory that outlives this conversation, and nothing from it is recalled automatically: if you want something you were told before, look it up with memory.query or memory.get. Record something with memory.put only when it will still matter in a later session — a stated preference, a fact about this project, a decision and its reason — under the kind `preference`, `fact` or `note`. Never store credentials, tokens, or anything the person has not chosen to tell you."
+    "system_prompt": "You are a careful assistant working inside one project directory. Use the filesystem tools to look things up rather than guessing. Paths are relative to the project root.\n\nYou have a durable memory that outlives this conversation, and nothing from it is recalled automatically: if you want something you were told before, look it up with memory.query or memory.get. Record something with memory.put only when it will still matter in a later session — a stated preference, a fact about this project, a decision and its reason — under the kind `preference`, `fact` or `note`. Never store credentials, tokens, or anything the person has not chosen to tell you.\n\nIf you can run programs, there is no shell: name one program and give its arguments as separate strings. Pipes, redirection, globs and `&&` are not interpreted and must not be used.",
+
+    "exec": {
+      "programs": ["git", "rg", "ls", "cat", "wc"],
+      "writable": false,
+      "network": false,
+      "timeout_ms": 30000
+    }
   },
 
   "components": {
@@ -67,6 +74,120 @@
         "effect": {
           "decision": "require_approval",
           "prompt": "let the agent write to this file?"
+        }
+      },
+
+      {
+        "description": "Running a program is a capability the agent has only when a frontend was started with --exec, and the tool refuses any program outside agent.exec.programs before policy is even asked. These rules are the second limit: which of those programs, and which commands with them. A `resource` ending in `*` is a prefix, so patterns are written with the separating space included — `command/git ` — and never as a bare `command/git*`, which would also match a program called `gitk`.",
+        "action": "process.execute",
+        "effect": { "decision": "allow" }
+      },
+
+      {
+        "description": "Which programs may run at all. A program named here can still have individual commands refused below; one not named here is refused outright, whatever agent.exec.programs later grows to include.",
+        "action": "process.execute",
+        "resource": "program/git",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "program/rg",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "program/ls",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "program/cat",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "program/wc",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "program/*",
+        "effect": { "decision": "deny", "reason": "not an approved program" }
+      },
+
+      {
+        "description": "Then which commands. `git` is the interesting one: inspecting the repository is read-only and allowed, and everything else it can be asked to do — push, config, running a hook, a subcommand nobody thought of — goes to a human, who is shown the command that will actually run. Note what this does not say: `command/git log *` allows every flag `git log` accepts, including ones that can make git start another program, because a prefix pattern cannot express \"these arguments and no others\". What bounds that is the sandbox, not this rule. A deployment that wants argument-level control moves these three to require_approval.",
+        "action": "process.execute",
+        "resource": "command/git status",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/git status *",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/git log",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/git log *",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/git diff",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/git diff *",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/git *",
+        "effect": {
+          "decision": "require_approval",
+          "prompt": "let the agent run this git command?"
+        }
+      },
+
+      {
+        "description": "The rest read and count and nothing else, so any arguments are allowed. They still cannot reach outside the sandbox: what `cat` can open is decided by the mount namespace, not by this rule.",
+        "action": "process.execute",
+        "resource": "command/rg *",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/ls",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/ls *",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/cat *",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "process.execute",
+        "resource": "command/wc *",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "description": "Anything not matched above — including a command shape a future change adds — is put to a human rather than allowed or silently refused.",
+        "action": "process.execute",
+        "resource": "command/*",
+        "effect": {
+          "decision": "require_approval",
+          "prompt": "let the agent run this command?"
         }
       },
 

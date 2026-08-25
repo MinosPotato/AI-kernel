@@ -125,6 +125,85 @@ impl MemorySet {
     }
 }
 
+/// Whether a deployment can run programs at all, and behind what.
+///
+/// The default is [`ExecSet::Off`], and it is the only default that could be right. Every
+/// other tool in the workspace carries out a request itself, so registering it grants exactly
+/// what its documentation says. This one *starts host code*: registering it grants whatever
+/// the allowlisted programs do, which is not a property this crate can know. Turning it on is
+/// therefore a decision somebody makes, per deployment, having chosen the programs.
+///
+/// The two enabled modes are not two strengths of the same thing. [`ExecSet::Sandboxed`] is an
+/// enforcement boundary the program cannot reach around; [`ExecSet::Unconfined`] is no boundary
+/// at all, with the program allowlist as the entire security argument. See
+/// [`Sandbox::Unconfined`](aik_exec::Sandbox::Unconfined).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecSet {
+    /// No process execution. The agent cannot start anything.
+    #[default]
+    Off,
+    /// Allowlisted programs, inside a namespace sandbox.
+    ///
+    /// The sandbox is verified at startup: a host that cannot provide one fails to start
+    /// rather than quietly running programs unconfined.
+    Sandboxed,
+    /// Allowlisted programs, with no sandbox.
+    ///
+    /// Never reached by omitting configuration. A deployment that selects this is saying that
+    /// its allowlist is the boundary, because nothing else will be.
+    Unconfined,
+}
+
+impl ExecSet {
+    /// Parses a mode name, or explains what the accepted ones are.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "off" => Ok(Self::Off),
+            "sandboxed" => Ok(Self::Sandboxed),
+            "unconfined" => Ok(Self::Unconfined),
+            other => Err(Error::InvalidArgument(format!(
+                "exec takes one of off, sandboxed, unconfined; got `{other}`"
+            ))),
+        }
+    }
+
+    /// The mode's name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sandboxed => "sandboxed",
+            Self::Unconfined => "unconfined",
+        }
+    }
+
+    /// Whether this mode registers the tool at all.
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// What a deployment says about running programs, read from `agent.exec`.
+///
+/// Separate from [`ExecSet`] because the two answer different questions and come from
+/// different places: the mode is a command-line decision a frontend makes per run, and this is
+/// the deployment's standing description of *what* may run — which programs, whether they may
+/// write, whether they have a network. A frontend can decline to register the tool; it cannot
+/// add a program to this list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecSettings {
+    /// The bare program names that may be run. Empty means the tool cannot be registered.
+    pub programs: Vec<String>,
+    /// Whether programs may write to the confinement root.
+    pub writable: bool,
+    /// Whether programs have a network.
+    pub network: bool,
+    /// The per-call wall-clock timeout, in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Where programs are looked for, overriding the built-in search path.
+    pub search_path: Option<String>,
+}
+
 /// Whether unattended scheduled work actually runs in this process.
 ///
 /// A schedule and a thing that runs it are two different capabilities, and wiring them
@@ -281,6 +360,7 @@ struct AgentSection {
     root: Option<PathBuf>,
     model: Option<String>,
     system_prompt: Option<String>,
+    exec: ExecSettings,
 }
 
 impl AgentSection {
@@ -431,6 +511,8 @@ pub struct Deployment {
     pub tools: ToolSet,
     /// Which memory tools to register.
     pub memory: MemorySet,
+    /// Whether programs may be run, and behind what.
+    pub exec: ExecSet,
     /// Whether scheduled work runs in this process.
     pub jobs: JobExecution,
     /// Where durable state goes, if anywhere.
@@ -480,6 +562,8 @@ impl Deployment {
             root: resolve_root(self.root.clone().or(section.root))?,
             tools: self.tools,
             memory: self.memory,
+            exec: self.exec,
+            exec_settings: section.exec,
             storage,
             jobs: self.jobs,
             system_prompt: section.system_prompt.filter(|prompt| non_blank(prompt)),
@@ -542,6 +626,10 @@ pub struct RuntimeSettings {
     pub tools: ToolSet,
     /// Which memory tools to register.
     pub memory: MemorySet,
+    /// Whether programs may be run, and behind what.
+    pub exec: ExecSet,
+    /// Which programs may be run, and how, read from `agent.exec`.
+    pub exec_settings: ExecSettings,
     /// Where the durable subsystems keep what they hold, if anywhere.
     pub storage: Storage,
     /// Whether scheduled jobs are executed in this process, and by what.
@@ -581,6 +669,8 @@ impl RuntimeSettings {
             root: root.into(),
             tools: ToolSet::default(),
             memory: MemorySet::default(),
+            exec: ExecSet::default(),
+            exec_settings: ExecSettings::default(),
             storage: Storage::Ephemeral,
             jobs: JobExecution::default(),
             system_prompt: None,

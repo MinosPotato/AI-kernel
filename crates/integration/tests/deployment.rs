@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use aik_cli::settings::Settings;
 use aik_core::Error;
 use aik_daemon::settings::DaemonSettings;
-use aik_runtime::{MemorySet, RuntimeSettings, Storage, ToolSet};
+use aik_runtime::{ExecSet, MemorySet, RuntimeSettings, Storage, ToolSet};
 use serde_json::{Value, json};
 
 /// An XDG data root that exists nowhere.
@@ -100,6 +100,11 @@ fn same_deployment(terminal: &RuntimeSettings, host: &RuntimeSettings) {
     assert_eq!(terminal.storage, host.storage, "where durable state lives");
     assert_eq!(terminal.tools, host.tools, "which filesystem tools exist");
     assert_eq!(terminal.memory, host.memory, "which memory tools exist");
+    assert_eq!(terminal.exec, host.exec, "whether programs may be run");
+    assert_eq!(
+        terminal.exec_settings, host.exec_settings,
+        "which programs may be run, and how",
+    );
 }
 
 /// Asserts that two resolutions describe the same *assistant*.
@@ -210,6 +215,54 @@ fn every_deployment_wide_value_reaches_both_frontends_from_the_shared_section() 
         Storage::Persistent(PathBuf::from(FAKE_DATA).join("aik").join("aik.redb")),
         "and the host still owns the one the deployment configures",
     );
+}
+
+#[test]
+fn what_may_be_executed_is_the_deployment_s_and_reaches_both_frontends() {
+    // The mode is a per-run decision either frontend makes; *what* may run is not, and a host
+    // and a terminal that disagreed about the allowlist would be two different boundaries over
+    // one project. The default matters as much: a configuration that says nothing about
+    // execution must leave it off in both.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = write(
+        directory.path(),
+        &json!({
+            "agent": {
+                "exec": {
+                    "programs": ["git", "rg"],
+                    "writable": true,
+                    "timeout_ms": 5000,
+                },
+            },
+        }),
+    );
+
+    let terminal = terminal(&path).expect("the terminal frontend resolves it");
+    let host = host(&path).expect("the host frontend resolves it");
+
+    assert_eq!(terminal.exec_settings.programs, ["git", "rg"]);
+    assert!(terminal.exec_settings.writable);
+    assert!(
+        !terminal.exec_settings.network,
+        "a network is granted, never defaulted into",
+    );
+    assert_eq!(terminal.exec_settings.timeout_ms, Some(5000));
+    assert_eq!(terminal.exec_settings, host.exec_settings);
+
+    assert_eq!(
+        (terminal.exec, host.exec),
+        (ExecSet::Off, ExecSet::Off),
+        "naming programs does not by itself let anything run them",
+    );
+}
+
+#[test]
+fn the_shipped_configuration_runs_no_programs_unless_asked() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = write(directory.path(), &shipped());
+
+    let terminal = terminal(&path).expect("the terminal frontend resolves the shipped file");
+    assert_eq!(terminal.exec, ExecSet::Off);
 }
 
 #[test]

@@ -20,7 +20,7 @@ use crate::args::Options;
 ///
 /// What is left in it is genuinely a host's: where to bind, and how many clients to serve.
 /// Everything describing the deployment lives in [`aik_runtime::AGENT_SECTION`], and
-/// `deny_unknown_fields` on [`FileSettings`] is what turns a configuration still naming
+/// `deny_unknown_fields` on this section's own settings is what turns a configuration still naming
 /// `daemon.agent` into an error rather than a principal quietly resolved from elsewhere.
 pub const SECTION: &str = "daemon";
 
@@ -105,6 +105,7 @@ impl DaemonSettings {
             model: options.model.clone(),
             tools: options.tools(),
             memory: options.memory(),
+            exec: options.exec(),
             // The whole reason this process exists: something has to actually run the
             // schedule, and it has to be something that is always there.
             jobs: JobExecution::Agent,

@@ -21,7 +21,7 @@ pub const PROGRAM: &str = "aik";
 /// which capability exists at all — and the host process makes exactly the same two. A
 /// second definition would be a second thing to keep in step, and the drift would show up as
 /// a tool present in one frontend and absent in the other.
-pub use aik_runtime::{MemorySet, ToolSet};
+pub use aik_runtime::{ExecSet, MemorySet, ToolSet};
 
 /// What the user asked for on the command line.
 ///
@@ -54,6 +54,12 @@ pub struct Options {
     pub write: bool,
     /// Whether to register no tools at all.
     pub no_tools: bool,
+    /// Whether to register the process-execution tool, and behind what, or `None` to take
+    /// the default.
+    ///
+    /// An `Option` for the same reason as [`Options::memory`]: `--exec` alongside
+    /// `--no-tools` is a contradiction to be rejected rather than a race between two switches.
+    pub exec: Option<ExecSet>,
     /// Which memory tools to register, or `None` to take the default.
     ///
     /// An `Option` rather than a bare [`MemorySet`] so that `--memory` combined with
@@ -91,6 +97,17 @@ impl Options {
             (true, _) => ToolSet::None,
             (false, true) => ToolSet::ReadWrite,
             (false, false) => ToolSet::ReadOnly,
+        }
+    }
+
+    /// Whether these options ask for the process-execution tool.
+    ///
+    /// `--no-tools` covers this one too, for the reason it covers memory: it means no tools at
+    /// all, and it has to keep meaning that as tools are added.
+    pub fn exec(&self) -> ExecSet {
+        match self.no_tools {
+            true => ExecSet::Off,
+            false => self.exec.unwrap_or_default(),
         }
     }
 
@@ -152,6 +169,9 @@ pub const HELP: &str = concat!(
     "    -p, --policy <FILE>  JSON policy document, overriding the one in --config\n",
     "        --write          also register the filesystem write tool\n",
     "        --no-tools       register no tools at all, memory included\n",
+    "        --exec <MODE>    run programs from agent.exec.programs: off, sandboxed (in a\n",
+    "                         namespace sandbox), unconfined (no sandbox at all — the\n",
+    "                         allowlist is then the only limit) [default: off]\n",
     "        --memory <MODE>  which memory tools to register: off, recall (get, query),\n",
     "                         remember (recall plus put), full (also delete)\n",
     "                         [default: remember]\n",
@@ -174,6 +194,15 @@ pub const HELP: &str = concat!(
     "    By default the transcript, the agent's memories and any persistent scheduled job\n",
     "    are kept in one database, created 0600 in a 0700 directory. `--ephemeral` keeps\n",
     "    all three in memory instead, so nothing this run says or learns reaches the disk.\n",
+    "\n",
+    "RUNNING PROGRAMS:\n",
+    "    `--exec sandboxed` lets the agent run the programs named in agent.exec.programs,\n",
+    "    each in its own user, mount, pid and network namespace: no network, no view of the\n",
+    "    filesystem beyond /usr and the confinement root, and nothing writable unless\n",
+    "    agent.exec.writable says so. There is no shell — a call names a program and a list\n",
+    "    of arguments — and policy is asked about both the program and the whole command.\n",
+    "    `--exec unconfined` runs them with no sandbox, as your account, seeing everything\n",
+    "    you can see; the allowlist is then the entire boundary.\n",
     "\n",
     "APPROVALS:\n",
     "    An interactive session answers `require_approval` from the terminal. A one-shot\n",
@@ -293,6 +322,14 @@ where
             "-p" | "--policy" => options.policy = Some(PathBuf::from(value(&flag)?)),
             "--write" => options.write = true,
             "--no-tools" => options.no_tools = true,
+            "--exec" => {
+                let raw = value(&flag)?;
+                options.exec = Some(ExecSet::parse(&raw).map_err(|error| {
+                    usage(format!(
+                        "`--exec` takes one of off, sandboxed, unconfined; got `{raw}` ({error})"
+                    ))
+                })?);
+            }
             "--memory" => {
                 let raw = value(&flag)?;
                 options.memory = Some(MemorySet::parse(&raw).map_err(|error| {
@@ -326,6 +363,12 @@ where
         ));
     }
 
+    if options.no_tools && options.exec.is_some() {
+        return Err(usage(
+            "`--no-tools` and `--exec` contradict each other".to_owned(),
+        ));
+    }
+
     if options.ephemeral && options.database.is_some() {
         return Err(usage(
             "`--ephemeral` and `--db` contradict each other".to_owned(),
@@ -352,6 +395,7 @@ where
             ("--write", options.write),
             ("--no-tools", options.no_tools),
             ("--memory", options.memory.is_some()),
+            ("--exec", options.exec.is_some()),
             ("--db", options.database.is_some()),
             ("--ephemeral", options.ephemeral),
             ("--policy", options.policy.is_some()),
@@ -731,6 +775,45 @@ mod tests {
     fn write_and_no_tools_select_the_tool_set() {
         assert_eq!(options(&["--write"]).tools(), ToolSet::ReadWrite);
         assert_eq!(options(&["--no-tools"]).tools(), ToolSet::None);
+    }
+
+    #[test]
+    fn nothing_is_executable_unless_a_run_asks_for_it() {
+        assert_eq!(options(&[]).exec(), ExecSet::Off);
+        assert_eq!(
+            options(&["--write", "--memory", "full"]).exec(),
+            ExecSet::Off
+        );
+    }
+
+    #[test]
+    fn every_exec_mode_is_selectable_by_name() {
+        for (name, expected) in [
+            ("off", ExecSet::Off),
+            ("sandboxed", ExecSet::Sandboxed),
+            ("unconfined", ExecSet::Unconfined),
+        ] {
+            assert_eq!(options(&["--exec", name]).exec(), expected);
+            assert_eq!(expected.as_str(), name);
+        }
+    }
+
+    #[test]
+    fn an_unknown_exec_mode_is_rejected_rather_than_taken_as_the_default() {
+        // Silently falling back would be the dangerous direction here: a misspelling that
+        // resolved to `unconfined` would remove the sandbox without saying so.
+        let error = parse(["--exec", "sandbox"]).unwrap_err();
+        assert!(
+            format!("{error}").contains("off, sandboxed, unconfined"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_tools_means_no_execution_either() {
+        assert_eq!(options(&["--no-tools"]).exec(), ExecSet::Off);
+        let error = parse(["--no-tools", "--exec", "sandboxed"]).unwrap_err();
+        assert!(format!("{error}").contains("contradict"), "{error}");
     }
 
     #[test]

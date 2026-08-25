@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use aik_core::{Error, Result};
-use aik_runtime::MemorySet;
+use aik_runtime::{ExecSet, MemorySet};
 
 /// The program name used in help and error messages.
 pub const PROGRAM: &str = "aikd";
@@ -42,6 +42,8 @@ pub struct Options {
     pub no_tools: bool,
     /// Which memory tools to register, or `None` to take the default.
     pub memory: Option<MemorySet>,
+    /// Whether to register the process-execution tool, and behind what.
+    pub exec: Option<ExecSet>,
     /// Where the shared database lives.
     pub database: Option<PathBuf>,
     /// Whether to run with no database at all.
@@ -82,6 +84,9 @@ pub const HELP: &str = concat!(
     "        --write          also register the filesystem write tool\n",
     "        --no-tools       register no tools at all, memory included\n",
     "        --memory <MODE>  which memory tools to register: off, recall, remember, full\n",
+    "        --exec <MODE>    run the programs in agent.exec.programs: off, sandboxed,\n",
+    "                         unconfined (no sandbox — the allowlist is the only limit)\n",
+    "                         [default: off]\n",
     "                         [default: remember]\n",
     "        --db <FILE>      the shared database file [default: the path in\n",
     "                         components.store.db.path, else\n",
@@ -145,6 +150,12 @@ where
             "-p" | "--policy" => options.policy = Some(PathBuf::from(value(&flag)?)),
             "--write" => options.write = true,
             "--no-tools" => options.no_tools = true,
+            "--exec" => {
+                options.exec = Some(
+                    ExecSet::parse(&value(&flag)?)
+                        .map_err(|error| usage(format!("`--exec` is wrong: {error}")))?,
+                );
+            }
             "--memory" => {
                 let raw = value(&flag)?;
                 options.memory = Some(
@@ -167,6 +178,12 @@ where
     if options.no_tools && options.memory.is_some() {
         return Err(usage(
             "`--no-tools` and `--memory` contradict each other".to_owned(),
+        ));
+    }
+
+    if options.no_tools && options.exec.is_some() {
+        return Err(usage(
+            "`--no-tools` and `--exec` contradict each other".to_owned(),
         ));
     }
     if options.ephemeral && options.database.is_some() {
@@ -199,6 +216,14 @@ impl Options {
             return MemorySet::Off;
         }
         self.memory.unwrap_or_default()
+    }
+
+    /// Whether these options ask for the process-execution tool. See [`Options::memory`].
+    pub fn exec(&self) -> ExecSet {
+        if self.no_tools {
+            return ExecSet::Off;
+        }
+        self.exec.unwrap_or_default()
     }
 }
 
@@ -244,6 +269,19 @@ mod tests {
         let options = serve(&["--no-tools"]);
         assert_eq!(options.tools(), aik_runtime::ToolSet::None);
         assert_eq!(options.memory(), MemorySet::Off);
+        assert_eq!(options.exec(), ExecSet::Off);
+    }
+
+    #[test]
+    fn a_host_runs_no_programs_unless_asked_and_names_the_modes_it_takes() {
+        assert_eq!(serve(&[]).exec(), ExecSet::Off);
+        assert_eq!(serve(&["--exec", "sandboxed"]).exec(), ExecSet::Sandboxed);
+
+        let error = parse(["--exec", "sandbox"].iter().map(|a| (*a).to_owned())).unwrap_err();
+        assert!(
+            format!("{error}").contains("off, sandboxed, unconfined"),
+            "{error}"
+        );
     }
 
     #[test]

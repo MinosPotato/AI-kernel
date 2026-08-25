@@ -23,6 +23,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-tools`](crates/tools) | The authorization-gated `ToolRegistry` implementation |
 | [`aik-policy`](crates/policy) | A deterministic, configuration-driven `PolicyEngine` |
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
+| [`aik-exec`](crates/exec) | Running allowlisted programs behind an OS-level sandbox |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
 | [`aik-context`](crates/context) | An agent's transcript, and the budgeted model window derived from it |
 | [`aik-store`](crates/store) | The one embedded database the durable subsystems share |
@@ -447,6 +448,62 @@ somebody is about to answer. Every untrusted string is escaped before it is prin
 approval prompts deliberately show only what the policy engine and the registry wrote:
 the question, the action and the resource, never the tool's arguments.
 
+## Running programs
+
+[`aik-exec`](crates/exec) is the first capability where the thing being authorized is not a
+request the implementation carries out, but *arbitrary host code it starts*. `aik-fs` resolves
+a path, checks it against a root and reads bytes; nothing it hands the host can decide to do
+something else. A program can — `git` is not a promise to read a repository, it is a promise
+to run whatever `/usr/bin/git` is.
+
+So four things decide whether a program runs, and only one of them is a boundary:
+
+| Measure | Answers | Bounds |
+|---|---|---|
+| Registration (`--exec`) | Does this deployment run anything at all? | What exists |
+| The allowlist (`agent.exec.programs`) | Which programs? | What is asked for |
+| Policy (`process.execute`) | Which commands, for whom? | What is asked for |
+| The sandbox | What can it reach once running? | **What happens** |
+
+The first three are cooperative and worth having — they are what an audit trail records and a
+human approves — but none survives contact with a program that does something other than what
+its name suggests. The sandbox does. A sandboxed child gets its own user, mount, pid, ipc and
+uts namespaces; a read-only view of `/usr` and the loader's files and *nothing else of `/etc`*;
+a private `/proc`, a minimal `/dev` and a size-capped tmpfs `/tmp`; no network unless the
+deployment granted one; the confinement root, read-only by default, as its single writable
+path; an environment built from nothing rather than inherited; a session of its own with no
+terminal; and resource limits the OS keeps enforcing whatever the kernel does afterwards.
+
+It is off unless asked for, and asking for it verifies it: `--exec sandboxed` finds
+`bwrap`, starts a throwaway sandbox at startup to prove the host can provide one, and fails to
+start if it cannot — rather than running programs unconfined and saying nothing.
+
+```bash
+aik --exec sandboxed          # allowlisted programs, confined
+aik --exec unconfined         # no sandbox: the allowlist is then the only limit
+```
+
+There is no shell. A call names one program and gives its arguments as separate strings;
+nothing is split on whitespace, glob-expanded or passed to `sh -c`, so an argument containing
+`; rm -rf /` is one argument containing those characters. A deployment that allowlists a shell
+has undone both the allowlist and this paragraph, which is the one entry nobody should add.
+
+Each call declares two resources, so a policy can answer at either grain, and the command a
+human is asked about is the command that will actually run:
+
+```json
+{ "action": "process.execute", "resource": "program/git",       "effect": { "decision": "allow" } },
+{ "action": "process.execute", "resource": "command/git log *", "effect": { "decision": "allow" } },
+{ "action": "process.execute", "resource": "command/git *",
+  "effect": { "decision": "require_approval", "prompt": "let the agent run this git command?" } }
+```
+
+The command is rendered so that distinct argument vectors always produce distinct strings —
+anything not made purely of unambiguous characters is single-quoted — because a rule written
+for `git commit -m fix` must not also match one argument that merely looks like three.
+Resource patterns match by prefix with no word boundary, which is why every pattern above
+carries its separating space: `command/git*` would also match `gitk`.
+
 ## Configuration
 
 The kernel reads no files. It accepts JSON layers, deep-merged in order, so the host
@@ -468,6 +525,17 @@ Kernel settings:
 |---|---|---|
 | `kernel.event_capacity` | 256 | Per-event-type broadcast buffer |
 | `kernel.shutdown_timeout_ms` | 10000 | How long shutdown waits for background tasks |
+
+Deployment-wide settings live in one `agent` section, read by every frontend so a terminal and
+a host process over one database cannot describe two different assistants:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `agent.agent` / `agent.user` | `assistant` / `user` | The identities policy and the audit trail see |
+| `agent.root` | the working directory | The confinement root, for files and for programs |
+| `agent.exec.programs` | none | The bare program names `aik-exec` will run |
+| `agent.exec.writable` | `false` | Whether a program may write to the root |
+| `agent.exec.network` | `false` | Whether a program has a network |
 
 ## Development
 
@@ -505,10 +573,16 @@ The system works end to end: `aik-cli` starts a kernel, `aik-ollama` carries too
 both directions, and a model can ask for a tool, have the request authorized, have a human
 approve it, and answer from the result — with every step of that visible in the audit
 events, and now kept: `aik-audit` writes those events into the shared database as an
-append-only trail, and `aik audit` is how an operator reads it back afterwards. What comes
-next builds *on* the kernel rather than *into* it: process execution behind an OS-level
-sandbox, and a daemon that hosts the kernel for more than one frontend — each as a component
-in its own crate, following the same pattern.
+append-only trail, and `aik audit` is how an operator reads it back afterwards. Both of the
+things that were next have since been built the same way, *on* the kernel rather than into it:
+`aik-daemon` hosts the kernel for more than one frontend, and `aik-exec` runs programs behind
+an OS-level sandbox — the first capability here whose subject is arbitrary host code rather
+than a request the implementation carries out itself, and therefore the first one where a
+cooperative check was not enough and an enforcement boundary was required.
+
+What is genuinely not built yet: cron triggers (`aik-scheduler` refuses them rather than
+accepting a schedule it cannot keep), semantic memory (`aik-memory` has no `Embedder` behind
+it), context summarisation, and any platform integration at all.
 
 The full pipeline — filesystem confinement, policy evaluation, human approval, tool exposure
 narrowing, verbose auditing, and the CLI's own error and session handling — has been manually
@@ -518,4 +592,7 @@ covered, the two bugs it found and fixed, and the token/context cost baseline it
 `docs/CLI.md`'s [limitations sections](docs/CLI.md#other-known-limitations-not-bugs) separate
 what is a genuine defect from what is a documented, deliberate property of the current
 implementation (no summarisation, no semantic memory, a heuristic token counter, an unclosed
-filesystem TOCTOU window bounded but not eliminated by handle-pinning).
+filesystem TOCTOU window bounded but not eliminated by handle-pinning). `aik-exec` documents
+its own such property in the crate: it installs no seccomp filter, so a sandboxed child is
+separated from the host by namespaces and mount visibility rather than by a syscall policy,
+and the boundary is only as strong as the kernel's user-namespace implementation.

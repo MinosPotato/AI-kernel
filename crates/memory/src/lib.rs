@@ -43,7 +43,8 @@
 //!
 //! # Security
 //!
-//! A record belongs to the principal that stored it. [`crate::owner`] holds the reasoning;
+//! A record belongs to the principal that stored it. The reasoning is with the ownership
+//! rules themselves;
 //! the short version is that the owner is taken from the
 //! [`ExecutionContext`](aik_api::execution::ExecutionContext) and never from the record, so
 //! content a model produced cannot choose whose memory it becomes, and a replacement keeps
@@ -63,7 +64,7 @@
 //! # What this deliberately does not do
 //!
 //! * **It does not rank by meaning.** [`MemoryQuery`](aik_api::memory::MemoryQuery) can
-//!   carry search text or a pre-computed embedding, and [`MemoryRecord`] can carry one too,
+//!   carry search text or a pre-computed embedding, and [`MemoryRecord`](aik_api::memory::MemoryRecord) can carry one too,
 //!   but nothing here compares them. Semantic retrieval needs an
 //!   [`Embedder`](aik_api::model::Embedder) and an index built for approximate nearest
 //!   neighbours — real infrastructure with its own cost and failure modes, not something to

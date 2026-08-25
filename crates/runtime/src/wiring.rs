@@ -61,6 +61,7 @@ use aik_approval::{ApprovalBroker, ApprovalComponent};
 use aik_audit::{AuditComponent, RedbAuditComponent};
 use aik_context::{ContextComponent, RedbContextComponent};
 use aik_core::prelude::*;
+use aik_exec::{ExecTool, Sandbox};
 use aik_fs::{FsListTool, FsReadTool, FsWriteTool};
 use aik_memory::{MemoryComponent, MemoryToolsComponent, RedbMemoryComponent};
 use aik_ollama::OllamaComponent;
@@ -70,7 +71,9 @@ use aik_store::StoreComponent;
 use aik_tools::ToolsComponent;
 
 use crate::jobs::AgentJobComponent;
-use crate::settings::{JobExecution, MemorySet, RuntimeSettings, Storage, ToolSet};
+use crate::settings::{
+    ExecSet, ExecSettings, JobExecution, MemorySet, RuntimeSettings, Storage, ToolSet,
+};
 
 /// The configuration path the policy document is read from.
 pub use crate::settings::POLICY_SECTION;
@@ -123,6 +126,15 @@ pub fn builder(
                 .with_tool(FsListTool::new(&settings.root)?)
                 .with_tool(FsWriteTool::new(&settings.root)?);
         }
+    }
+
+    // Registering this is not like registering the others: it does not grant a capability
+    // whose limits are written here, it starts host code whose limits are whatever the
+    // allowlisted programs happen to have. So it is off unless a deployment turned it on, and
+    // turning it on with a sandbox is verified *now* — a host that cannot provide one fails to
+    // start rather than running programs unconfined and saying nothing.
+    if settings.exec.is_enabled() {
+        tools = tools.with_tool(exec_tool(settings)?);
     }
 
     // The same limit again, over the record store. The tools are handed out by a component
@@ -198,6 +210,56 @@ pub fn builder(
     Ok((builder.component(agent), broker))
 }
 
+/// Builds the process-execution tool this deployment asked for.
+///
+/// Every refusal here is a startup failure naming the setting that caused it, because each of
+/// them is a deployment that would otherwise look enabled and be either useless or unsafe: an
+/// allowlist nobody filled in, a root that does not exist, a sandbox the host cannot provide.
+fn exec_tool(settings: &RuntimeSettings) -> Result<ExecTool> {
+    let ExecSettings {
+        programs,
+        writable,
+        network,
+        timeout_ms,
+        search_path,
+    } = &settings.exec_settings;
+
+    if programs.is_empty() {
+        return Err(Error::config(
+            format!("{}.exec.programs", crate::settings::AGENT_SECTION),
+            "process execution was enabled but no programs are allowed; name the programs the \
+             agent may run, or leave execution off",
+        ));
+    }
+
+    let sandbox = match settings.exec {
+        ExecSet::Sandboxed => Sandbox::bubblewrap()?,
+        ExecSet::Unconfined => Sandbox::unconfined(),
+        // Unreachable: the caller checks `is_enabled` first. Answered rather than panicked on,
+        // because a wiring function is the wrong place to be certain about a caller.
+        ExecSet::Off => {
+            return Err(Error::config(
+                format!("{}.exec", crate::settings::AGENT_SECTION),
+                "process execution is off",
+            ));
+        }
+    };
+
+    // The confinement root is the deployment's, not a second one: a workspace a program could
+    // write that the filesystem tools could not read would be two different ideas of where
+    // this agent works.
+    let mut tool = ExecTool::new(&settings.root, sandbox, programs.iter())?
+        .writable(*writable)
+        .with_network(*network);
+    if let Some(timeout) = timeout_ms {
+        tool = tool.with_timeout(std::time::Duration::from_millis(*timeout));
+    }
+    if let Some(path) = search_path {
+        tool = tool.with_search_path(path.clone());
+    }
+    Ok(tool)
+}
+
 /// Builds the deployment's kernel, with the Ollama provider as its model source.
 pub fn assemble(settings: &RuntimeSettings, model: ModelId) -> Result<Assembled> {
     let (builder, broker) = builder(settings, model)?;
@@ -231,4 +293,71 @@ pub async fn first_available_model(settings: &RuntimeSettings) -> Result<ModelId
 
     kernel.shutdown().await?;
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::ExecSet;
+    use aik_core::ErrorKind;
+
+    /// Settings rooted at a real directory, since the tool canonicalises its workspace.
+    fn settings(directory: &std::path::Path, exec: ExecSet, programs: &[&str]) -> RuntimeSettings {
+        let mut settings = RuntimeSettings::new(directory);
+        settings.exec = exec;
+        settings.exec_settings = ExecSettings {
+            programs: programs.iter().map(|name| (*name).to_owned()).collect(),
+            ..ExecSettings::default()
+        };
+        settings
+    }
+
+    #[test]
+    fn execution_enabled_with_no_programs_fails_at_startup() {
+        // The failure mode this rules out is a deployment that looks enabled, registers a tool
+        // the model is told about, and refuses every call it makes.
+        let directory = tempfile::tempdir().unwrap();
+        let error = exec_tool(&settings(directory.path(), ExecSet::Unconfined, &[])).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(
+            format!("{error}").contains("agent.exec.programs"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_tool_works_in_the_deployment_s_own_confinement_root() {
+        // Not a second directory: a program that could write where the filesystem tools cannot
+        // read would be two different ideas of where this agent works.
+        let directory = tempfile::tempdir().unwrap();
+        let tool = exec_tool(&settings(directory.path(), ExecSet::Unconfined, &["git"])).unwrap();
+
+        assert_eq!(tool.workspace(), directory.path().canonicalize().unwrap());
+        assert_eq!(tool.programs().collect::<Vec<_>>(), ["git"]);
+        assert!(!tool.sandbox().is_enforcing());
+    }
+
+    #[test]
+    fn an_allowlist_entry_that_is_not_a_program_name_fails_at_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = exec_tool(&settings(
+            directory.path(),
+            ExecSet::Unconfined,
+            &["/bin/sh"],
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Config);
+    }
+
+    #[test]
+    fn a_deployment_that_runs_nothing_never_reaches_the_tool_at_all() {
+        let directory = tempfile::tempdir().unwrap();
+        let off = settings(directory.path(), ExecSet::Off, &["git"]);
+
+        assert!(!off.exec.is_enabled());
+        // And asking for it anyway is answered rather than panicked on.
+        assert_eq!(exec_tool(&off).unwrap_err().kind(), ErrorKind::Config);
+    }
 }

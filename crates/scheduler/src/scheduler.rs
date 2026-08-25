@@ -49,7 +49,9 @@ use crate::store::JobStore;
 ///
 /// An hour is short enough that a reminder does not arrive from another working day, and long
 /// enough that a reboot, an update or a laptop lid does not silently swallow the morning's
-/// work. See [`recover`] for why there is a window at all.
+/// work. There is a window at all because a process that was not running cannot fire anything:
+/// on startup the schedule is read back and firings whose time has passed are caught up, and
+/// this bounds how far back that reaches.
 pub const DEFAULT_CATCH_UP_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// How long the driver waits after failing to record a firing before trying again.

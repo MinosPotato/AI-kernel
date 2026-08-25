@@ -202,9 +202,9 @@
 //! memory and context stores so the three cannot answer the same question differently.
 //!
 //! A firing runs as [`RUN_PRINCIPAL`] acting on behalf of the owner — the system, doing
-//! something for someone. See [`crate::owner`] for what that buys and what it deliberately
-//! does not: delegation does not compound, so a job scheduled by an agent that was itself
-//! acting for a user can act for the agent and not for the user.
+//! something for someone. What that buys, and what it deliberately does not: delegation does
+//! not compound, so a job scheduled by an agent that was itself acting for a user can act for
+//! the agent and not for the user.
 //!
 //! # What this deliberately does not do
 //!

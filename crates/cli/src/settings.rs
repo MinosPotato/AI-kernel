@@ -4,7 +4,7 @@
 //! Configuration comes from the kernel's own [`Config`] mechanism rather than a
 //! frontend-specific format: a file, then the environment, then whatever the command line
 //! overrode. Nothing here interprets a policy — the document is layered in as configuration
-//! and read by [`RuleBasedPolicyEngine`](aik_policy::RuleBasedPolicyEngine), which is the
+//! and read by `aik-policy`'s `RuleBasedPolicyEngine`, which is the
 //! only thing that decides what it means.
 //!
 //! # Two halves, deliberately separated
@@ -21,7 +21,7 @@
 //! that, because it does not live there.
 //!
 //! What this module still decides is what a terminal alone decides: which host process to
-//! talk to (see [`resolve_socket`]), whether a job handler is wired here (never), and where
+//! talk to, whether a job handler is wired here (never), and where
 //! durable state comes from when this run is a client of a host rather than a host itself.
 //! Every other key is read once, in [`aik_runtime::settings`], from a section neither
 //! frontend owns.
@@ -43,7 +43,8 @@ use crate::args::Options;
 /// What is left in it is genuinely a terminal's: which host process to talk to, if any.
 /// Everything that describes the *deployment* — the agent, the user, the root, the model, the
 /// prompt — lives in [`aik_runtime::AGENT_SECTION`], and `deny_unknown_fields` on
-/// [`FileSettings`] is what turns a configuration still naming `cli.agent` into an error
+/// `deny_unknown_fields` on this section's own settings is what turns a configuration still
+/// naming `cli.agent` into an error
 /// rather than a value silently resolved from somewhere else.
 pub const SECTION: &str = "cli";
 
@@ -135,6 +136,7 @@ impl Settings {
             model: options.model.clone(),
             tools: options.tools(),
             memory: options.memory(),
+            exec: options.exec(),
             // A terminal is not a host process. It keeps the same durable schedule as one —
             // the same jobs, the same owners — and deliberately runs none of it: see
             // [`JobExecution`]. A conversation interrupted by a job firing at 3am is not a

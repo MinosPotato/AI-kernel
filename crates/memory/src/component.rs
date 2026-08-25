@@ -23,7 +23,7 @@ pub const DEFAULT_COMPONENT_ID: &str = "memory.store";
 
 /// How often the background sweep looks for expired records, when none is configured.
 ///
-/// Expiration is already enforced on every read — see [`crate::expiry`] — so this interval
+/// Expiration is already enforced on every read, so this interval
 /// only decides how promptly space is reclaimed, not how promptly a caller stops seeing an
 /// expired record. A minute is frequent enough that a database's dead weight never grows far
 /// past what expired since the last sweep, without running a write transaction so often that

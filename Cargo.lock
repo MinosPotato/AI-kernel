@@ -175,6 +175,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-exec"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-policy",
+ "aik-tools",
+ "async-trait",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "aik-fs"
 version = "0.1.0"
 dependencies = [
@@ -200,6 +216,7 @@ dependencies = [
  "aik-context",
  "aik-core",
  "aik-daemon",
+ "aik-exec",
  "aik-fs",
  "aik-memory",
  "aik-policy",
@@ -290,6 +307,7 @@ dependencies = [
  "aik-audit",
  "aik-context",
  "aik-core",
+ "aik-exec",
  "aik-fs",
  "aik-memory",
  "aik-ollama",
