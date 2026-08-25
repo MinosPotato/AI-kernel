@@ -17,6 +17,12 @@
       "ollama": {
         "endpoint": "http://localhost:11434",
         "request_timeout_ms": 120000
+      },
+
+      "anthropic": {
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "max_output_tokens": 4096,
+        "request_timeout_ms": 300000
       }
     },
 

@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use aik_core::{Error, Result};
-use aik_runtime::{ExecSet, MemorySet};
+use aik_runtime::{ExecSet, MemorySet, Provider};
 
 /// The program name used in help and error messages.
 pub const PROGRAM: &str = "aikd";
@@ -26,6 +26,8 @@ pub struct Options {
     pub socket: Option<PathBuf>,
     /// The model every turn is sent to, overriding configuration.
     pub model: Option<String>,
+    /// The provider that model is asked for, overriding configuration.
+    pub provider: Option<Provider>,
     /// The agent's identity, overriding configuration.
     pub agent: Option<String>,
     /// The user's identity, overriding configuration.
@@ -75,6 +77,9 @@ pub const HELP: &str = concat!(
     "                         $XDG_RUNTIME_DIR/aik/aikd.sock]\n",
     "    -m, --model <ID>     model to use; defaults to configuration, then to the\n",
     "                         first model the provider reports\n",
+    "        --provider <P>   where that model comes from: ollama (a local server),\n",
+    "                         anthropic (the Messages API; needs an API key in\n",
+    "                         $ANTHROPIC_API_KEY) [default: ollama]\n",
     "    -a, --agent <ID>     the agent's identity, as policy sees it [default: assistant]\n",
     "    -u, --user <ID>      the user's identity, as policy sees it [default: user]\n",
     "    -r, --root <DIR>     directory the filesystem tools are confined to\n",
@@ -143,6 +148,12 @@ where
             "-V" | "--version" => return Ok(Invocation::Version),
             "-s" | "--socket" => options.socket = Some(PathBuf::from(value(&flag)?)),
             "-m" | "--model" => options.model = Some(value(&flag)?),
+            "--provider" => {
+                options.provider = Some(
+                    Provider::parse(&value(&flag)?)
+                        .map_err(|error| usage(format!("`--provider` is wrong: {error}")))?,
+                );
+            }
             "-a" | "--agent" => options.agent = Some(value(&flag)?),
             "-u" | "--user" => options.user = Some(value(&flag)?),
             "-r" | "--root" => options.root = Some(PathBuf::from(value(&flag)?)),
@@ -254,6 +265,23 @@ mod tests {
             Invocation::Serve(options) => *options,
             other => panic!("expected options, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_provider_is_parsed_before_anything_is_assembled() {
+        assert_eq!(serve(&[]).provider, None);
+        assert_eq!(
+            serve(&["--provider", "anthropic"]).provider,
+            Some(Provider::Anthropic)
+        );
+
+        let error = parse(
+            ["--provider", "openai"]
+                .iter()
+                .map(|argument| (*argument).to_owned()),
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("ollama, anthropic"), "{error}");
     }
 
     #[test]

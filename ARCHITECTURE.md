@@ -33,6 +33,7 @@ AI-kernel/
 │  ├─ api/      → aik-api      : domain contracts for downstream subsystems
 │  ├─ aik/      → aik          : thin facade re-exporting both
 │  ├─ ollama/   → aik-ollama   : a ModelProvider, talking to a local Ollama server
+│  ├─ anthropic/→ aik-anthropic: a ModelProvider, talking to the Anthropic Messages API
 │  ├─ tools/    → aik-tools    : the reference ToolRegistry (authorization-gated)
 │  ├─ policy/   → aik-policy   : a deterministic, configuration-driven PolicyEngine
 │  ├─ fs/       → aik-fs       : filesystem Tools, confined to a configured root
@@ -55,7 +56,9 @@ reasoned about without any opinion at all about agents or models, and `aik-api` 
 implemented, allowed to churn while `aik-core` stays stable.
 
 Every other crate is a concrete implementation of one or more `aik-api` contracts, built in
-dependency order: `aik-ollama` implements `ModelProvider`; `aik-policy` implements
+dependency order: `aik-ollama` implements `ModelProvider`, and `aik-anthropic` implements it a
+second time — over HTTPS, against a service, which is what makes the contract a contract rather
+than a description of Ollama, and what makes this the one crate holding a credential; `aik-policy` implements
 `PolicyEngine`; `aik-tools` is the reference `ToolRegistry`, gating every call through
 whichever `PolicyEngine` and `ApprovalSink` (`aik-approval`) it is given; `aik-fs` is the
 first `Tool` implementation, and the first code in the workspace that touches the host

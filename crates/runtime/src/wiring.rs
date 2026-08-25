@@ -55,6 +55,7 @@
 use std::sync::Arc;
 
 use aik_agent::AgentComponent;
+use aik_anthropic::AnthropicComponent;
 use aik_api::model::{ModelId, ModelProvider};
 use aik_api::permission::ApprovalSink;
 use aik_approval::{ApprovalBroker, ApprovalComponent};
@@ -72,7 +73,7 @@ use aik_tools::ToolsComponent;
 
 use crate::jobs::AgentJobComponent;
 use crate::settings::{
-    ExecSet, ExecSettings, JobExecution, MemorySet, RuntimeSettings, Storage, ToolSet,
+    ExecSet, ExecSettings, JobExecution, MemorySet, Provider, RuntimeSettings, Storage, ToolSet,
 };
 
 /// The configuration path the policy document is read from.
@@ -260,11 +261,24 @@ fn exec_tool(settings: &RuntimeSettings) -> Result<ExecTool> {
     Ok(tool)
 }
 
-/// Builds the deployment's kernel, with the Ollama provider as its model source.
+/// Builds the deployment's kernel, with the configured provider as its model source.
 pub fn assemble(settings: &RuntimeSettings, model: ModelId) -> Result<Assembled> {
     let (builder, broker) = builder(settings, model)?;
-    let kernel = builder.component(OllamaComponent::new()).build()?;
+    let kernel = provider_component(builder, settings.provider).build()?;
     Ok(Assembled { kernel, broker })
+}
+
+/// Registers the one provider this deployment chose.
+///
+/// One provider, not both. Registering the second as a non-default would leave a kernel
+/// holding a credential and an outbound connection nothing was configured to use, and a
+/// deployment that meant to keep every conversation on this machine would be one
+/// `service_named` call away from not doing that.
+fn provider_component(builder: KernelBuilder, provider: Provider) -> KernelBuilder {
+    match provider {
+        Provider::Ollama => builder.component(OllamaComponent::new()),
+        Provider::Anthropic => builder.component(AnthropicComponent::new()),
+    }
 }
 
 /// Starts a throwaway kernel holding only the model provider, to ask it what it serves.
@@ -273,10 +287,11 @@ pub fn assemble(settings: &RuntimeSettings, model: ModelId) -> Result<Assembled>
 /// component takes it as fixed settings, deliberately, so that nothing during a run can
 /// change which model answers.
 pub async fn first_available_model(settings: &RuntimeSettings) -> Result<ModelId> {
-    let kernel = Kernel::builder()
-        .config(settings.config.clone())
-        .component(OllamaComponent::new())
-        .build()?;
+    let kernel = provider_component(
+        Kernel::builder().config(settings.config.clone()),
+        settings.provider,
+    )
+    .build()?;
     kernel.start().await?;
 
     let found = async {

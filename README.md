@@ -20,6 +20,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-api`](crates/api) | Contracts for future subsystems. Traits and types only, no implementations |
 | [`aik`](crates/aik) | Facade re-exporting both |
 | [`aik-ollama`](crates/ollama) | A `ModelProvider` backed by a local or remote Ollama server |
+| [`aik-anthropic`](crates/anthropic) | A `ModelProvider` backed by the Anthropic Messages API, credential and all |
 | [`aik-tools`](crates/tools) | The authorization-gated `ToolRegistry` implementation |
 | [`aik-policy`](crates/policy) | A deterministic, configuration-driven `PolicyEngine` |
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
@@ -173,6 +174,50 @@ Nothing about offering a tool authorizes it. A call arriving from a model is a r
 it goes through `ToolRegistry::invoke` — policy, resource checks, approval, audit — exactly
 like a call from anywhere else. Ollama reports a `tools` capability per model; one without
 it will answer in prose, which is a model's choice rather than a provider failure.
+
+## Talking to a hosted model
+
+[`aik-anthropic`](crates/anthropic) is the second `ModelProvider`, and the first that leaves
+the machine: it speaks the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages),
+with streaming, tool calling, cancellation, deadlines and bounded retries. Everything above it
+is unchanged — the agent loop, the tool registry, the transcript all resolve `dyn
+ModelProvider` and cannot tell which one they got — which is what a second implementation is
+for: a contract with one implementation is a description of that implementation.
+
+Two shapes differ from Ollama's and are resolved inside the crate. Instructions are hoisted
+out of the conversation into the API's top-level `system` field, and tool results become
+`tool_result` blocks on a user turn, because the API has neither a `system` nor a `tool` role.
+And a streamed tool call arrives in fragments — an id and a name first, then its arguments as
+partial JSON — so the fragments are reassembled and a call is only emitted once it parses.
+Arguments that never parse are an error rather than an empty call: a tool invoked with `{}`
+because its arguments were lost is a tool invoked with the wrong arguments.
+
+Select it per deployment, with the model to go with it:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+aik --provider anthropic -m claude-sonnet-4-5 "what is a kernel?"
+```
+
+### Where a credential may live
+
+This is the first secret in the workspace, so the rules are enforced by code rather than
+written down as a practice:
+
+- **Configuration says where the key is, never what it is.** `api_key_env` (default
+  `ANTHROPIC_API_KEY`) or `api_key_file`. A section carrying `api_key` — or four other
+  spellings — fails at startup with a message saying where a key belongs instead. The kernel's
+  `Config` is a JSON tree that is cloned, merged and `Debug`-printed throughout the process,
+  so anything in it is effectively public to the process.
+- **The key cannot be printed.** `ApiKey` has no `Display` and no `Serialize`, its `Debug` is
+  `ApiKey(<redacted>)`, and the only reader is crate-private. Its header is marked sensitive,
+  so the HTTP stack will not log it either.
+- **The transport is checked before the key is sent.** A non-`https` endpoint is refused
+  unless it is loopback, redirects are never followed, and a key file other users can read is
+  a startup failure rather than a warning.
+
+A missing or malformed key stops the kernel from starting, rather than being discovered on the
+first turn somebody types.
 
 ## Authorizing and touching real files
 
@@ -519,6 +564,19 @@ let config = Config::builder()
 
 Components read their own section, `components.<id>`, via `ctx.settings()`.
 
+The Anthropic provider's section is `components.model.anthropic` — the dots in its component
+id nest — and holds locations and limits, never the key itself:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `api_key_env` | `ANTHROPIC_API_KEY` | The environment variable the key is read from |
+| `api_key_file` | none | A file holding the key; wins over the variable, must be mode `600` |
+| `endpoint` | `https://api.anthropic.com` | Must be `https` unless it is loopback |
+| `api_version` | `2023-06-01` | The `anthropic-version` header |
+| `max_output_tokens` | 4096 | The `max_tokens` a request does not set itself |
+| `max_retries` | 2 | Retries for rate limiting and 5xx, never past the deadline |
+| `request_timeout_ms` | 300000 | Ceiling on one request, unless the caller's deadline is shorter |
+
 Kernel settings:
 
 | Key | Default | Meaning |
@@ -533,6 +591,8 @@ a host process over one database cannot describe two different assistants:
 |---|---|---|
 | `agent.agent` / `agent.user` | `assistant` / `user` | The identities policy and the audit trail see |
 | `agent.root` | the working directory | The confinement root, for files and for programs |
+| `agent.provider` | `ollama` | Which model provider answers: `ollama` or `anthropic` |
+| `agent.model` | the provider's first model | The model every turn is sent to |
 | `agent.exec.programs` | none | The bare program names `aik-exec` will run |
 | `agent.exec.writable` | `false` | Whether a program may write to the root |
 | `agent.exec.network` | `false` | Whether a program has a network |
@@ -579,6 +639,12 @@ things that were next have since been built the same way, *on* the kernel rather
 an OS-level sandbox — the first capability here whose subject is arbitrary host code rather
 than a request the implementation carries out itself, and therefore the first one where a
 cooperative check was not enough and an enforcement boundary was required.
+
+`aik-anthropic` is the newest of these, and the first to send anything off the machine: a
+second `ModelProvider` behind the same contract, which is what keeps the contract from being a
+description of Ollama, and the first credential in the workspace — held in a type that cannot
+print it, resolved from a location configuration names rather than from configuration itself,
+and refused outright over a transport that is not `https`.
 
 What is genuinely not built yet: semantic memory (`aik-memory` has no `Embedder` behind it),
 context summarisation, and any platform integration at all. `aik-scheduler` now defines a

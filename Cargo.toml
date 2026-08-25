@@ -5,6 +5,7 @@ members = [
     "crates/api",
     "crates/aik",
     "crates/ollama",
+    "crates/anthropic",
     "crates/tools",
     "crates/policy",
     "crates/fs",
@@ -50,6 +51,7 @@ aik-ipc = { version = "0.1.0", path = "crates/ipc" }
 aik-daemon = { version = "0.1.0", path = "crates/daemon" }
 aik-cli = { version = "0.1.0", path = "crates/cli" }
 aik-ollama = { version = "0.1.0", path = "crates/ollama" }
+aik-anthropic = { version = "0.1.0", path = "crates/anthropic" }
 
 async-trait = "0.1"
 futures-core = "0.3"

@@ -21,7 +21,7 @@ pub const PROGRAM: &str = "aik";
 /// which capability exists at all — and the host process makes exactly the same two. A
 /// second definition would be a second thing to keep in step, and the drift would show up as
 /// a tool present in one frontend and absent in the other.
-pub use aik_runtime::{ExecSet, MemorySet, ToolSet};
+pub use aik_runtime::{ExecSet, MemorySet, Provider, ToolSet};
 
 /// What the user asked for on the command line.
 ///
@@ -40,6 +40,8 @@ pub struct Options {
     pub session: Option<SessionId>,
     /// The model to send every turn to, overriding configuration.
     pub model: Option<String>,
+    /// The provider that model is asked for, overriding configuration.
+    pub provider: Option<Provider>,
     /// The agent's identity, overriding configuration.
     pub agent: Option<String>,
     /// The user's identity, overriding configuration.
@@ -161,6 +163,9 @@ pub const HELP: &str = concat!(
     "OPTIONS:\n",
     "    -m, --model <ID>     model to use; defaults to configuration, then to the\n",
     "                         first model the provider reports\n",
+    "        --provider <P>   where that model comes from: ollama (a local server),\n",
+    "                         anthropic (the Messages API; needs an API key in\n",
+    "                         $ANTHROPIC_API_KEY) [default: ollama]\n",
     "    -a, --agent <ID>     the agent's identity, as policy sees it [default: assistant]\n",
     "    -u, --user <ID>      the user's identity, as policy sees it [default: user]\n",
     "    -r, --root <DIR>     directory the filesystem tools are confined to\n",
@@ -315,6 +320,13 @@ where
             "-h" | "--help" => return Ok(Invocation::Help),
             "-V" | "--version" => return Ok(Invocation::Version),
             "-m" | "--model" => options.model = Some(value(&flag)?),
+            "--provider" => {
+                let raw = value(&flag)?;
+                options.provider = Some(
+                    Provider::parse(&raw)
+                        .map_err(|error| usage(format!("`--provider` is wrong: {error}")))?,
+                );
+            }
             "-a" | "--agent" => options.agent = Some(value(&flag)?),
             "-u" | "--user" => options.user = Some(value(&flag)?),
             "-r" | "--root" => options.root = Some(PathBuf::from(value(&flag)?)),
@@ -401,6 +413,7 @@ where
             ("--policy", options.policy.is_some()),
             ("--root", options.root.is_some()),
             ("--model", options.model.is_some()),
+            ("--provider", options.provider.is_some()),
             ("--agent", options.agent.is_some()),
             ("--user", options.user.is_some()),
             ("--record", options.record.is_some()),
@@ -807,6 +820,30 @@ mod tests {
             format!("{error}").contains("off, sandboxed, unconfined"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_provider_is_parsed_before_anything_is_assembled() {
+        assert_eq!(options(&[]).provider, None);
+        assert_eq!(
+            options(&["--provider", "anthropic"]).provider,
+            Some(Provider::Anthropic)
+        );
+        assert_eq!(
+            options(&["--provider=ollama"]).provider,
+            Some(Provider::Ollama)
+        );
+
+        let error = parse(["--provider", "openai"]).unwrap_err();
+        assert!(format!("{error}").contains("ollama, anthropic"), "{error}");
+    }
+
+    #[test]
+    fn a_client_cannot_choose_the_hosts_provider() {
+        // The host is already talking to one. Accepting the flag here would read as though
+        // this connection had changed that.
+        let error = parse(["--socket", "/tmp/aik.sock", "--provider", "anthropic"]).unwrap_err();
+        assert!(format!("{error}").contains("--provider"), "{error}");
     }
 
     #[test]
