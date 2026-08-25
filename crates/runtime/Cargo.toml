@@ -18,6 +18,7 @@ aik-approval.workspace = true
 aik-audit.workspace = true
 aik-context.workspace = true
 aik-core.workspace = true
+aik-exec.workspace = true
 aik-fs.workspace = true
 aik-memory.workspace = true
 aik-ollama.workspace = true

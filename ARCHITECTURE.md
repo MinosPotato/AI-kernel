@@ -36,6 +36,7 @@ AI-kernel/
 │  ├─ tools/    → aik-tools    : the reference ToolRegistry (authorization-gated)
 │  ├─ policy/   → aik-policy   : a deterministic, configuration-driven PolicyEngine
 │  ├─ fs/       → aik-fs       : filesystem Tools, confined to a configured root
+│  ├─ exec/     → aik-exec     : running allowlisted programs behind an OS-level sandbox
 │  ├─ approval/ → aik-approval : a human-in-the-loop ApprovalSink
 │  ├─ context/  → aik-context  : a durable transcript and budgeted model windows
 │  ├─ store/    → aik-store    : the shared redb database backing context and memory
@@ -58,7 +59,9 @@ dependency order: `aik-ollama` implements `ModelProvider`; `aik-policy` implemen
 `PolicyEngine`; `aik-tools` is the reference `ToolRegistry`, gating every call through
 whichever `PolicyEngine` and `ApprovalSink` (`aik-approval`) it is given; `aik-fs` is the
 first `Tool` implementation, and the first code in the workspace that touches the host
-filesystem; `aik-context` implements `ContextStore`; `aik-scheduler` implements `Scheduler`, running
+filesystem; `aik-exec` is the first whose subject is host code rather than a request it
+carries out itself, and so the first that needs an enforcement boundary — namespaces — rather
+than a check it makes on itself; `aik-context` implements `ContextStore`; `aik-scheduler` implements `Scheduler`, running
 unattended work against the same shared database; `aik-agent` composes a `ModelProvider`,
 a `ToolRegistry` and a `ContextStore` into a request/response loop; `aik-runtime` is the one
 thing that assembles a real kernel out of all of them; `aik-daemon` is the long-lived process
@@ -173,7 +176,7 @@ every "Implemented by" column below is a separate crate.
 |--------------|------------------------------------------------------------------------|----------------|
 | `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     | — (a plain value type, not a trait) |
 | `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (`ModelProvider`; no `Embedder` yet) |
-| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` (`Tool`) |
+| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
 | `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query is `Unsupported`) |
 | `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               | `aik-policy` (`PolicyEngine`), `aik-approval` (`ApprovalSink`) |

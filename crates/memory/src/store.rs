@@ -21,9 +21,9 @@ use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
 ///   with respect to any concurrent reader: a query never observes half of a replacement.
 /// * **Owned records.** The principal that stores a record is the only one that may read,
 ///   replace or delete it, apart from principals acting explicitly on its behalf — see
-///   [`crate::owner`].
+///   the ownership rules.
 /// * **Exact retrieval.** [`MemoryStore::get`] and [`MemoryStore::delete`] address a record
-///   by id and do not apply the expiry filter below — see [`crate::expiry`] for why.
+///   by id and do not apply the expiry filter below.
 /// * **Live-only queries.** [`MemoryStore::query`] never returns a record whose `expires_at`
 ///   is at or before the store's clock, whether or not the periodic sweep has reached it yet.
 ///

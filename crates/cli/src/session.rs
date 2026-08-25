@@ -12,7 +12,7 @@
 //! Every turn runs under a context carrying [`Settings::principal`], which is the *agent*
 //! acting on behalf of the user. That is the identity policy sees, the identity audit events
 //! record, and the identity that owns the transcript in the
-//! [`ContextStore`](aik_api::context::ContextStore).
+//! [`aik_api::context::ContextStore`].
 //!
 //! # Session lifecycle, and where the decisions are not
 //!

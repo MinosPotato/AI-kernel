@@ -45,7 +45,7 @@ pub(crate) fn is_live(expires_at: Option<Timestamp>, now: Timestamp) -> bool {
 /// with work someone is waiting for, so it is deliberately not one transaction however much
 /// has expired. Batching bounds three things at once: the memory one sweep allocates, how
 /// long it holds the write slot, and how much work is still in flight when the kernel is
-/// asked to stop — see [`spawn_expiry_task`].
+/// asked to stop.
 ///
 /// Large enough that a routine sweep is a single batch; small enough that a backlog of
 /// millions does not become one transaction, one allocation, or one shutdown that misses its
@@ -56,7 +56,7 @@ pub const DEFAULT_SWEEP_BATCH: usize = 1_024;
 ///
 /// Implemented by both stores, not folded into
 /// [`MemoryStore`](aik_api::memory::MemoryStore) itself: sweeping is housekeeping, not
-/// retrieval, and keeping it a separate trait is what lets [`spawn_expiry_task`] drive it
+/// retrieval, and keeping it a separate trait is what lets the background sweep drive it
 /// through a plain `Arc<dyn ExpirySweeper>` without the rest of the crate depending on which
 /// backend it is. It is public so tests — and anything else that wants reclamation on its
 /// own schedule rather than [`DEFAULT_EXPIRY_SWEEP_INTERVAL`](crate::DEFAULT_EXPIRY_SWEEP_INTERVAL) —
