@@ -82,6 +82,17 @@
 //! pending retry is not resumed, and a job is not a work queue. What survives is when the job
 //! fires, not any particular firing seeing itself through.
 //!
+//! ## Cron
+//!
+//! [`Trigger::Cron`](aik_api::scheduler::Trigger::Cron) is refused at scheduling time with
+//! [`Error::InvalidArgument`](aik_core::Error::InvalidArgument) unless it parses as five
+//! whitespace-separated fields — minute, hour, day-of-month, month, day-of-week — in the
+//! traditional `cron(5)` dialect (`*`, values, ranges, lists, steps; no field names). Fields
+//! are always evaluated in UTC, never the host's local time zone, so a schedule means the same
+//! instant wherever the kernel runs. When both day-of-month and day-of-week are restricted,
+//! a date matching *either* is enough to fire — the OR rule traditional cron has specified for
+//! decades, and expressions copied from elsewhere rely on it.
+//!
 //! ## At-most-once
 //!
 //! A firing is claimed by writing the advanced schedule **before** the handler is called. A
@@ -208,12 +219,6 @@
 //!
 //! # What this deliberately does not do
 //!
-//! * **No cron.** [`Trigger::Cron`](aik_api::scheduler::Trigger::Cron) is refused at
-//!   scheduling time with [`Error::Unsupported`](aik_core::Error::Unsupported) — which is what
-//!   the contract asks of a scheduler that cannot parse an expression. Defining a dialect
-//!   means picking between incompatible conventions and carrying a parser for the choice;
-//!   `Every` covers the periodic case, and the calendar case should be designed when something
-//!   needs a calendar.
 //! * **No distribution.** One process, one schedule. The lock redb takes on the database file
 //!   is what enforces it, and it is why none of the leasing machinery a distributed scheduler
 //!   needs appears here.
@@ -226,6 +231,7 @@
 //!   about a job that keeps failing is the caller's judgement, not the scheduler's.
 
 mod component;
+mod cron;
 mod events;
 mod owner;
 mod persistent;

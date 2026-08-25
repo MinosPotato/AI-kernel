@@ -82,16 +82,17 @@ pub(crate) fn validate(spec: &JobSpec, persistence: bool) -> Result<()> {
             )))
         }
         // Rejected at scheduling time rather than at fire time, which is what the contract
-        // asks of a scheduler that cannot parse an expression -- and this one cannot parse
-        // any, because no cron dialect is defined here. Defining one means choosing between
-        // several incompatible conventions and carrying a parser for it; `Every` covers the
-        // periodic case, and the choice is better made when something actually needs a
-        // calendar rather than an interval.
-        Trigger::Cron { expression } => Err(Error::Unsupported(format!(
-            "job `{}` uses the cron expression `{expression}`, but this scheduler defines no \
-             cron dialect; use an `every` trigger",
-            spec.id
-        ))),
+        // asks of a scheduler that cannot parse an expression. See `crate::cron` for the
+        // dialect this scheduler defines.
+        Trigger::Cron { expression } => crate::cron::CronSchedule::parse(expression)
+            .map(|_| ())
+            .map_err(|reason| {
+                Error::InvalidArgument(format!(
+                    "job `{}` uses the cron expression `{expression}`, which this scheduler's \
+                     dialect rejects: {reason}",
+                    spec.id
+                ))
+            }),
         _ => Ok(()),
     }
 }
@@ -107,9 +108,12 @@ pub(crate) fn first_run(trigger: &Trigger, now: Timestamp) -> Option<Timestamp> 
         Trigger::At { timestamp } => Some(*timestamp),
         Trigger::After { delay } => Some(now.saturating_add(*delay)),
         Trigger::Every { interval } => Some(now.saturating_add(*interval)),
-        // Refused by `validate` long before this is reached; `None` keeps the arithmetic
-        // total rather than adding a panic that could only fire if validation were bypassed.
-        Trigger::Cron { .. } => None,
+        // `validate` already proved this expression parses; a failure here would mean that
+        // guarantee broke, and `None` keeps the arithmetic total rather than adding a panic
+        // for a case that should be unreachable.
+        Trigger::Cron { expression } => crate::cron::CronSchedule::parse(expression)
+            .ok()
+            .and_then(|schedule| schedule.next_after(now)),
         Trigger::OnEvent { .. } => None,
     }
 }
@@ -131,8 +135,14 @@ pub(crate) fn next_run(
 ) -> Option<Timestamp> {
     match trigger {
         Trigger::Every { interval } => Some(next_occurrence(fired_for, *interval, now)),
-        Trigger::At { .. } | Trigger::After { .. } => None,
-        Trigger::Cron { .. } | Trigger::OnEvent { .. } => None,
+        // Unlike `Every`, a cron occurrence is not an offset from the last one — it is
+        // whatever the calendar says next, so there is nothing to anchor on `fired_for` for.
+        // Asking for the next occurrence strictly after `now` is what already keeps a missed
+        // backlog from being delivered all at once, for free.
+        Trigger::Cron { expression } => crate::cron::CronSchedule::parse(expression)
+            .ok()
+            .and_then(|schedule| schedule.next_after(now)),
+        Trigger::At { .. } | Trigger::After { .. } | Trigger::OnEvent { .. } => None,
     }
 }
 
@@ -237,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn cron_is_refused_at_scheduling_time_by_both_schedulers() {
+    fn a_valid_cron_expression_is_accepted_by_both_schedulers() {
         let spec = JobSpec::new(
             "j",
             Trigger::Cron {
@@ -246,10 +256,52 @@ mod tests {
             "h",
         );
         for persistence in [false, true] {
+            validate(&spec, persistence).expect("a well-formed expression parses");
+        }
+    }
+
+    #[test]
+    fn a_malformed_cron_expression_is_refused_at_scheduling_time() {
+        let spec = JobSpec::new(
+            "j",
+            Trigger::Cron {
+                expression: "not a cron expression".into(),
+            },
+            "h",
+        );
+        for persistence in [false, true] {
             let error = validate(&spec, persistence).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
             assert!(error.to_string().contains("cron"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_cron_trigger_first_runs_at_its_next_matching_occurrence() {
+        let expression = "30 2 * * *".to_string();
+        let now = at(0); // the Unix epoch: 1970-01-01T00:00:00Z
+        let expected = crate::cron::CronSchedule::parse(&expression)
+            .unwrap()
+            .next_after(now)
+            .unwrap();
+        assert_eq!(
+            first_run(&Trigger::Cron { expression }, now),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_cron_trigger_recurs_from_the_next_occurrence_after_now_not_after_fired_for() {
+        let expression = "0 * * * *".to_string(); // the top of every hour
+        let trigger = Trigger::Cron { expression };
+        // The job was due at the epoch, but a lot of time passed before this call — `now` is
+        // 10 hours later and lands exactly on an hour boundary. The next occurrence must come
+        // from `now`, not be counted forward from `fired_for`, and must be strictly after
+        // `now` even though `now` itself matches the expression.
+        let fired_for = at(0);
+        let now = at(10 * 60 * 60 * 1_000);
+        let one_hour_after_now = at(11 * 60 * 60 * 1_000);
+        assert_eq!(next_run(&trigger, fired_for, now), Some(one_hour_after_now));
     }
 
     #[test]

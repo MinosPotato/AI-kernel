@@ -580,9 +580,10 @@ an OS-level sandbox — the first capability here whose subject is arbitrary hos
 than a request the implementation carries out itself, and therefore the first one where a
 cooperative check was not enough and an enforcement boundary was required.
 
-What is genuinely not built yet: cron triggers (`aik-scheduler` refuses them rather than
-accepting a schedule it cannot keep), semantic memory (`aik-memory` has no `Embedder` behind
-it), context summarisation, and any platform integration at all.
+What is genuinely not built yet: semantic memory (`aik-memory` has no `Embedder` behind it),
+context summarisation, and any platform integration at all. `aik-scheduler` now defines a
+cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an
+expression that does not parse in it, not the concept.
 
 The full pipeline — filesystem confinement, policy evaluation, human approval, tool exposure
 narrowing, verbose auditing, and the CLI's own error and session handling — has been manually
