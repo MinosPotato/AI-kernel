@@ -1,0 +1,34 @@
+[package]
+name = "aik-anthropic"
+description = "Anthropic model provider for the AI kernel: a ModelProvider component talking to the Messages API over HTTPS, with its credential kept out of the configuration tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aik-core.workspace = true
+aik-api.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+futures-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+wiremock.workspace = true

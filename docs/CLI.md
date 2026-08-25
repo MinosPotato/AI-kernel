@@ -72,6 +72,35 @@ surfaces as whatever Ollama returns, typically an HTTP 404:
 aik: Ollama returned HTTP 404 Not Found
 ```
 
+## Selecting a provider
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+aik --provider anthropic -m claude-sonnet-4-5 "what is in src?"
+```
+
+`--provider` takes `ollama` (the default: a local server, no credential) or `anthropic` (the
+Messages API, which needs a key). Like the model, it can be set in a config file
+(`agent.provider`) or as `AIK_AGENT__PROVIDER`, and the command line wins over both; it lives
+in `agent` for the same reason the model does, since one database answered by two different
+services is the same problem as one answered by two different models. `--provider` is refused
+alongside `--socket`: a client assembles nothing, so what it reaches is the host's provider and
+not this command's.
+
+The key is never read from configuration. `components.model.anthropic.api_key_env` names the
+variable it comes from (default `ANTHROPIC_API_KEY`), or `api_key_file` names a file holding
+it, which must not be readable by other users. Writing the key into the configuration tree is
+refused at startup rather than accepted:
+
+```
+aik: component `model.anthropic` failed during init
+```
+
+with a cause explaining that a key belongs in `api_key_env` or `api_key_file`. A missing key,
+a malformed one, a key file at mode `644`, and a non-`https` endpoint that is not loopback all
+stop the process the same way — before a session exists, rather than on the first turn typed
+into one.
+
 ## Interactive mode vs. one-shot mode
 
 ```bash

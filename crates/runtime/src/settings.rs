@@ -60,6 +60,57 @@ pub const DEFAULT_AGENT: &str = "assistant";
 /// means the same thing on every machine it is copied to.
 pub const DEFAULT_USER: &str = "user";
 
+/// Which model provider a deployment talks to.
+///
+/// One choice, made once, for the whole deployment — like the model itself and for the same
+/// reason: two frontends over one database that resolved different providers would produce
+/// one transcript answered by two different services, and the difference would look like the
+/// assistant changing its mind rather than like a configuration mistake.
+///
+/// The default is [`Provider::Ollama`], which is the only one that needs no credential and
+/// no network beyond this machine. Choosing [`Provider::Anthropic`] is choosing to send the
+/// conversation — and whatever the filesystem tools have read into it — to a third party, so
+/// it is never the default and is always something a deployment wrote down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Provider {
+    /// A local or self-hosted Ollama server.
+    #[default]
+    Ollama,
+    /// The Anthropic Messages API, which needs an API key. See
+    /// [`aik_anthropic`](../aik_anthropic/index.html) for where that key may and may not
+    /// live.
+    Anthropic,
+}
+
+impl Provider {
+    /// Parses a provider name, or explains what the accepted ones are.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "ollama" => Ok(Self::Ollama),
+            "anthropic" => Ok(Self::Anthropic),
+            other => Err(Error::InvalidArgument(format!(
+                "provider takes one of ollama, anthropic; got `{other}`"
+            ))),
+        }
+    }
+
+    /// The provider's name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    /// The component id that publishes this provider's `dyn ModelProvider`.
+    pub fn component_id(self) -> ComponentId {
+        ComponentId::new(match self {
+            Self::Ollama => aik_ollama::DEFAULT_COMPONENT_ID,
+            Self::Anthropic => aik_anthropic::DEFAULT_COMPONENT_ID,
+        })
+    }
+}
+
 /// Which filesystem tools a deployment registers.
 ///
 /// A tool that is not registered cannot be reached at all, whatever policy says, so this is
@@ -359,6 +410,7 @@ struct AgentSection {
     user: Option<String>,
     root: Option<PathBuf>,
     model: Option<String>,
+    provider: Option<String>,
     system_prompt: Option<String>,
     exec: ExecSettings,
 }
@@ -507,6 +559,8 @@ pub struct Deployment {
     pub root: Option<PathBuf>,
     /// The model every turn is sent to, overriding `agent.model`.
     pub model: Option<String>,
+    /// The provider that model is asked for, overriding `agent.provider`.
+    pub provider: Option<Provider>,
     /// Which filesystem tools to register.
     pub tools: ToolSet,
     /// Which memory tools to register.
@@ -541,6 +595,11 @@ impl Deployment {
             .collect();
 
         let section = AgentSection::read(&config)?;
+        let provider = match (self.provider, section.provider.as_deref()) {
+            (Some(provider), _) => provider,
+            (None, Some(name)) => Provider::parse(name)?,
+            (None, None) => Provider::default(),
+        };
 
         let storage = match &self.storage {
             StorageChoice::None => Storage::Ephemeral,
@@ -574,7 +633,8 @@ impl Deployment {
                 .filter(|model| non_blank(model))
                 .map(ModelId::new),
             config,
-            model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
+            provider,
+            model_component: provider.component_id(),
         })
     }
 }
@@ -647,6 +707,12 @@ pub struct RuntimeSettings {
     pub model: Option<ModelId>,
     /// The whole configuration tree, handed to the kernel.
     pub config: Config,
+    /// Which provider serves that model.
+    ///
+    /// Decides which provider component [`assemble`](crate::wiring::assemble) registers.
+    /// [`model_component`](RuntimeSettings::model_component) names what the agent depends on,
+    /// and the two agree unless a caller deliberately points the second at a stub.
+    pub provider: Provider,
     /// The component expected to publish `dyn ModelProvider`.
     ///
     /// Configurable so that the wiring can be exercised against a stub provider without a
@@ -676,7 +742,8 @@ impl RuntimeSettings {
             system_prompt: None,
             model: None,
             config: Config::default(),
-            model_component: ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID),
+            provider: Provider::default(),
+            model_component: Provider::default().component_id(),
         }
     }
 
@@ -752,6 +819,83 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    /// A deployment that opens no database, so these tests do not depend on `HOME`.
+    fn deployment() -> Deployment {
+        Deployment {
+            storage: StorageChoice::None,
+            ..Deployment::default()
+        }
+    }
+
+    #[test]
+    fn the_provider_defaults_to_the_one_that_needs_no_credential() {
+        let settings = deployment()
+            .resolve(Config::default(), env(&[]))
+            .expect("defaults resolve");
+
+        assert_eq!(settings.provider, Provider::Ollama);
+        assert_eq!(
+            settings.model_component,
+            ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID)
+        );
+    }
+
+    #[test]
+    fn the_deployments_section_can_choose_a_hosted_provider() {
+        let config = Config::builder()
+            .layer(json!({ "agent": { "provider": "anthropic" } }))
+            .build();
+
+        let settings = deployment()
+            .resolve(config, env(&[]))
+            .expect("a named provider resolves");
+
+        assert_eq!(settings.provider, Provider::Anthropic);
+        // And the agent depends on the component that actually publishes it.
+        assert_eq!(
+            settings.model_component,
+            ComponentId::new(aik_anthropic::DEFAULT_COMPONENT_ID)
+        );
+    }
+
+    #[test]
+    fn the_environment_layer_reaches_the_provider_like_any_other_setting() {
+        let config = load_config(None, None, env(&[("AIK_AGENT__PROVIDER", "anthropic")]))
+            .expect("a valid layer");
+
+        let settings = deployment().resolve(config, env(&[])).expect("resolves");
+
+        assert_eq!(settings.provider, Provider::Anthropic);
+    }
+
+    #[test]
+    fn a_flag_outranks_the_configuration_file() {
+        let config = Config::builder()
+            .layer(json!({ "agent": { "provider": "anthropic" } }))
+            .build();
+        let chosen = Deployment {
+            provider: Some(Provider::Ollama),
+            ..deployment()
+        };
+
+        let settings = chosen.resolve(config, env(&[])).expect("resolves");
+
+        assert_eq!(settings.provider, Provider::Ollama);
+    }
+
+    #[test]
+    fn a_provider_nobody_implements_fails_at_startup() {
+        let config = Config::builder()
+            .layer(json!({ "agent": { "provider": "openai" } }))
+            .build();
+
+        let error = deployment()
+            .resolve(config, env(&[]))
+            .expect_err("an unknown provider is a mistake");
+
+        assert!(format!("{error}").contains("ollama, anthropic"), "{error}");
     }
 
     #[test]

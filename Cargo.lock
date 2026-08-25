@@ -43,6 +43,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-anthropic"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "futures",
+ "futures-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "aik-api"
 version = "0.1.0"
 dependencies = [
@@ -302,6 +324,7 @@ name = "aik-runtime"
 version = "0.1.0"
 dependencies = [
  "aik-agent",
+ "aik-anthropic",
  "aik-api",
  "aik-approval",
  "aik-audit",
