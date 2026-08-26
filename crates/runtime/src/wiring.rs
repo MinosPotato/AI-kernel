@@ -176,21 +176,41 @@ pub fn builder(
         .component(ApprovalComponent::new(broker.clone()))
         .component(tools);
 
+    // Whether the record store ranks by meaning, and through which component. Resolved
+    // before either storage arm because it applies to both: the two backends differ in what
+    // outlives a restart and in nothing else, and a semantic search that worked on only one
+    // of them would be exactly the drift they are kept identical to avoid.
+    let embedder = embedder_choice(settings)?;
+
     // One decision, applied to all four: see [`Storage`]. Both arms publish the same
     // capabilities under the same component ids, so nothing downstream — the agent, the
     // memory tools, the registry — can tell which one it got except by outliving a restart.
     let builder = match &settings.storage {
-        Storage::Ephemeral => builder
-            .component(ContextComponent::new())
-            .component(MemoryComponent::new())
-            .component(SchedulerComponent::new())
-            .component(AuditComponent::new()),
-        Storage::Persistent(_) => builder
-            .component(StoreComponent::new())
-            .component(RedbContextComponent::new())
-            .component(RedbMemoryComponent::new())
-            .component(RedbSchedulerComponent::new())
-            .component(RedbAuditComponent::new()),
+        Storage::Ephemeral => {
+            let memory = MemoryComponent::new();
+            let memory = match &embedder {
+                Some((component, model)) => memory.with_embedder(component.clone(), model.clone()),
+                None => memory,
+            };
+            builder
+                .component(ContextComponent::new())
+                .component(memory)
+                .component(SchedulerComponent::new())
+                .component(AuditComponent::new())
+        }
+        Storage::Persistent(_) => {
+            let memory = RedbMemoryComponent::new();
+            let memory = match &embedder {
+                Some((component, model)) => memory.with_embedder(component.clone(), model.clone()),
+                None => memory,
+            };
+            builder
+                .component(StoreComponent::new())
+                .component(RedbContextComponent::new())
+                .component(memory)
+                .component(RedbSchedulerComponent::new())
+                .component(RedbAuditComponent::new())
+        }
     };
 
     // Registered only when it has something to bind. With no memory tools exposed, the
@@ -209,6 +229,32 @@ pub fn builder(
     };
 
     Ok((builder.component(agent), broker))
+}
+
+/// Which component embeds, and with which model, or `None` for a store that does not rank
+/// by meaning.
+///
+/// Refuses rather than degrades in the one case where the two settings disagree: a
+/// deployment that named an embedding model but chose a provider with no embeddings endpoint
+/// has written down something the system cannot do, and starting anyway would give it a
+/// memory that silently never searches. The message names the provider that does have one,
+/// because that is the actual fix.
+fn embedder_choice(settings: &RuntimeSettings) -> Result<Option<(ComponentId, ModelId)>> {
+    let Some(model) = &settings.embedding_model else {
+        return Ok(None);
+    };
+    let component = settings.provider.embedder_component_id().ok_or_else(|| {
+        Error::config(
+            "agent.embedding_model",
+            format!(
+                "provider `{}` serves no embeddings, so `{model}` cannot be used to search \
+                 memories by meaning; either clear `agent.embedding_model` or use the ollama \
+                 provider, which does",
+                settings.provider.as_str()
+            ),
+        )
+    })?;
+    Ok(Some((component, model.clone())))
 }
 
 /// Builds the process-execution tool this deployment asked for.
@@ -374,5 +420,59 @@ mod tests {
         assert!(!off.exec.is_enabled());
         // And asking for it anyway is answered rather than panicked on.
         assert_eq!(exec_tool(&off).unwrap_err().kind(), ErrorKind::Config);
+    }
+
+    #[test]
+    fn no_embedding_model_means_no_embedder_and_no_new_dependency() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = RuntimeSettings::new(directory.path());
+        assert!(embedder_choice(&settings).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_embedding_model_points_the_store_at_the_providers_own_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.provider = Provider::Ollama;
+        settings.embedding_model = Some(ModelId::new("nomic-embed-text"));
+
+        let (component, model) = embedder_choice(&settings).unwrap().expect("a choice");
+        assert_eq!(component, Provider::Ollama.component_id());
+        assert_eq!(model, ModelId::new("nomic-embed-text"));
+    }
+
+    #[test]
+    fn asking_a_provider_with_no_embeddings_to_embed_fails_at_startup() {
+        // The failure mode this rules out is a deployment that configured semantic memory,
+        // started fine, and searched nothing for the rest of its life.
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.provider = Provider::Anthropic;
+        settings.model_component = Provider::Anthropic.component_id();
+        settings.embedding_model = Some(ModelId::new("nomic-embed-text"));
+
+        let error = embedder_choice(&settings).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(format!("{error}").contains("ollama"), "{error}");
+    }
+
+    /// The two backends must be indistinguishable here too: whichever one a deployment gets,
+    /// a configured embedding model has to reach it.
+    #[test]
+    fn both_storage_backends_carry_the_embedding_model_into_the_kernel() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.embedding_model = Some(ModelId::new("nomic-embed-text"));
+
+        for storage in [
+            Storage::Ephemeral,
+            Storage::Persistent(directory.path().join("aik.redb")),
+        ] {
+            settings.storage = storage;
+            // Building is the assertion: the memory component declares the embedder
+            // component as a dependency, and the kernel refuses to build when a declared
+            // dependency is not registered.
+            assemble(&settings, ModelId::new("llama3.2")).expect("the kernel wires up");
+        }
     }
 }

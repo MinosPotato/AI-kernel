@@ -16,8 +16,8 @@ use aik_api::agent::{Agent, AgentRequest, AgentUpdate};
 use aik_api::execution::ExecutionContext;
 use aik_api::memory::MemoryStore;
 use aik_api::model::{
-    CompletionChunk, CompletionRequest, CompletionResponse, ContentPart, FinishReason, Message,
-    ModelDescriptor, ModelProvider, Role,
+    CompletionChunk, CompletionRequest, CompletionResponse, ContentPart, Embedder, FinishReason,
+    Message, ModelDescriptor, ModelId, ModelProvider, Role,
 };
 use aik_api::permission::PolicyEngine;
 use aik_api::tool::{ToolCall, ToolName, ToolOutcome};
@@ -148,7 +148,43 @@ impl ModelProvider for ScriptedModel {
     }
 }
 
-/// Publishes the scripted model as the kernel's `dyn ModelProvider`.
+/// The words [`ScriptedModel`]'s embedder gives a dimension to.
+const KEYWORDS: [&str; 4] = ["tea", "coffee", "rust", "cat"];
+
+/// The embedding model name the fixture configures.
+pub const STUB_EMBEDDING_MODEL: &str = "stub-embed";
+
+#[async_trait]
+impl Embedder for ScriptedModel {
+    /// Deterministic keyword counting, plus a constant dimension so that text mentioning no
+    /// keyword still has a direction rather than being incomparable.
+    ///
+    /// Not scripted like the completions are: what a suite asserts about a semantic recall
+    /// is that the *store* ranked and that the registry let the call through, and a
+    /// hand-written vector per turn would only move the arithmetic into the test.
+    async fn embed(
+        &self,
+        _model: &ModelId,
+        inputs: &[String],
+        _cx: &ExecutionContext,
+    ) -> Result<Vec<Vec<f32>>> {
+        Ok(inputs
+            .iter()
+            .map(|input| {
+                let lowered = input.to_lowercase();
+                let mut vector: Vec<f32> = KEYWORDS
+                    .iter()
+                    .map(|keyword| lowered.matches(keyword).count() as f32)
+                    .collect();
+                vector.push(1.0);
+                vector
+            })
+            .collect())
+    }
+}
+
+/// Publishes the scripted model as the kernel's `dyn ModelProvider`, and as its
+/// `dyn Embedder` where the fixture asked for one.
 #[derive(Debug)]
 struct StubModelComponent {
     model: Arc<ScriptedModel>,
@@ -161,6 +197,7 @@ impl Component for StubModelComponent {
     }
 
     async fn init(&self, ctx: &ComponentContext) -> Result<()> {
+        ctx.provide_default::<dyn Embedder>(self.model.clone())?;
         ctx.provide_default::<dyn ModelProvider>(self.model.clone())
     }
 }
@@ -181,6 +218,7 @@ pub struct MemoryAgentKernel {
     clock: Arc<ManualClock>,
     backend: Backend,
     rules: Value,
+    semantic: bool,
     directory: Option<TempDir>,
     path: Option<PathBuf>,
 }
@@ -210,8 +248,19 @@ pub fn policy(rules: &Value) -> Arc<dyn PolicyEngine> {
 }
 
 impl Backend {
+    /// Starts a kernel wired for this backend, with `rules` as its policy, and with the
+    /// memory store configured to embed — so `memory.query` offers the model a `text`
+    /// search.
+    pub async fn open_semantic_agent(self, rules: Value) -> MemoryAgentKernel {
+        self.start_agent(rules, true).await
+    }
+
     /// Starts a kernel wired for this backend, with `rules` as its policy.
     pub async fn open_agent(self, rules: Value) -> MemoryAgentKernel {
+        self.start_agent(rules, false).await
+    }
+
+    async fn start_agent(self, rules: Value, semantic: bool) -> MemoryAgentKernel {
         let clock = Arc::new(ManualClock::new(Timestamp::EPOCH));
         let (directory, path) = match self {
             Self::Memory => (None, None),
@@ -222,13 +271,22 @@ impl Backend {
             }
         };
         let model = ScriptedModel::new();
-        let kernel = start(self, &rules, model.clone(), clock.clone(), path.as_deref()).await;
+        let kernel = start(
+            self,
+            &rules,
+            model.clone(),
+            clock.clone(),
+            path.as_deref(),
+            semantic,
+        )
+        .await;
         MemoryAgentKernel {
             kernel: Some(kernel),
             model,
             clock,
             backend: self,
             rules,
+            semantic,
             directory,
             path,
         }
@@ -308,6 +366,7 @@ impl MemoryAgentKernel {
                 self.model.clone(),
                 self.clock.clone(),
                 self.path.as_deref(),
+                self.semantic,
             )
             .await,
         );
@@ -329,6 +388,7 @@ async fn start(
     model: Arc<ScriptedModel>,
     clock: Arc<ManualClock>,
     path: Option<&std::path::Path>,
+    semantic: bool,
 ) -> Kernel {
     let memory_tools = MemoryToolsComponent::new();
     let tools = ToolsComponent::new()
@@ -340,11 +400,25 @@ async fn start(
 
     let builder = Kernel::builder().clock(clock);
     let builder = match backend {
-        Backend::Memory => builder.component(MemoryComponent::new()),
-        Backend::Redb => builder
-            .config(store_config(path.expect("a durable backend has a path")))
-            .component(StoreComponent::new())
-            .component(RedbMemoryComponent::new()),
+        Backend::Memory => {
+            let memory = MemoryComponent::new();
+            builder.component(if semantic {
+                memory.with_embedder("model.stub", STUB_EMBEDDING_MODEL)
+            } else {
+                memory
+            })
+        }
+        Backend::Redb => {
+            let memory = RedbMemoryComponent::new();
+            builder
+                .config(store_config(path.expect("a durable backend has a path")))
+                .component(StoreComponent::new())
+                .component(if semantic {
+                    memory.with_embedder("model.stub", STUB_EMBEDDING_MODEL)
+                } else {
+                    memory
+                })
+        }
     };
 
     let kernel = builder

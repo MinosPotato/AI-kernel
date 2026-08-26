@@ -1088,10 +1088,17 @@ These are documented, deliberate properties of the current implementation, not d
   restart in the shared database, and `/new` still starts a fresh session id every run; there
   is no `--session <ID>` to reattach to a previous conversation. What survives is readable and
   owned, not automatically reopened.
-- **No summarisation or semantic memory.** Context management is purely mechanical (elision and
-  eviction under a byte-heuristic token count); nothing invents or compresses text. Memory
-  retrieval is exact — by id, by kind, by metadata equality — and a query asking for semantic
-  ranking gets `Unsupported` rather than a result that quietly ignored the request.
+- **No summarisation.** Context management is purely mechanical (elision and eviction under a
+  byte-heuristic token count); nothing invents or compresses text.
+- **Semantic memory is off unless configured.** With no `agent.embedding_model` (or
+  `--embedding-model`), memory retrieval is exact — by id, by kind, by metadata equality — and
+  a query asking for semantic ranking gets `Unsupported` rather than a result that quietly
+  ignored the request. Configured, `memory.query` gains a `text` argument and ranks by cosine
+  similarity; the ranking is a scan over the records the exact filters already narrowed to,
+  with no approximate-nearest-neighbour index behind it, and changing the embedding model
+  later leaves every record stored under the old one out of semantic results. It needs the
+  `ollama` provider: the Anthropic Messages API serves no embeddings, and naming an embedding
+  model alongside it fails at startup rather than starting a memory that never searches.
 - **Nothing schedules anything by default.** The scheduler is wired and its persistent jobs
   survive a restart, but the frontend registers no job handlers and offers no tool for
   scheduling, so a stock `aik` has an empty schedule. Handlers are contributed by components,

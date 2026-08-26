@@ -40,6 +40,8 @@ pub struct Options {
     pub session: Option<SessionId>,
     /// The model to send every turn to, overriding configuration.
     pub model: Option<String>,
+    /// The model memories are embedded with, overriding configuration.
+    pub embedding_model: Option<String>,
     /// The provider that model is asked for, overriding configuration.
     pub provider: Option<Provider>,
     /// The agent's identity, overriding configuration.
@@ -85,6 +87,7 @@ pub struct Options {
     ///
     /// Every option that would describe an assembly or an identity — `--write`,
     /// `--no-tools`, `--memory`, `--db`, `--ephemeral`, `--policy`, `--root`, `--model`,
+    /// `--embedding-model`,
     /// `--agent`, `--user` — is refused alongside it rather than silently ignored, and so is
     /// `--record`, which records events a client never sees. Accepting any of them would
     /// suggest this run could narrow what the host serves, or choose who it acts as. It can
@@ -163,6 +166,10 @@ pub const HELP: &str = concat!(
     "OPTIONS:\n",
     "    -m, --model <ID>     model to use; defaults to configuration, then to the\n",
     "                         first model the provider reports\n",
+    "        --embedding-model <ID>\n",
+    "                         embed memories with this model, so `memory.query` can\n",
+    "                         search by meaning; needs the ollama provider\n",
+    "                         [default: none, and search stays exact]\n",
     "        --provider <P>   where that model comes from: ollama (a local server),\n",
     "                         anthropic (the Messages API; needs an API key in\n",
     "                         $ANTHROPIC_API_KEY) [default: ollama]\n",
@@ -320,6 +327,7 @@ where
             "-h" | "--help" => return Ok(Invocation::Help),
             "-V" | "--version" => return Ok(Invocation::Version),
             "-m" | "--model" => options.model = Some(value(&flag)?),
+            "--embedding-model" => options.embedding_model = Some(value(&flag)?),
             "--provider" => {
                 let raw = value(&flag)?;
                 options.provider = Some(
@@ -413,6 +421,7 @@ where
             ("--policy", options.policy.is_some()),
             ("--root", options.root.is_some()),
             ("--model", options.model.is_some()),
+            ("--embedding-model", options.embedding_model.is_some()),
             ("--provider", options.provider.is_some()),
             ("--agent", options.agent.is_some()),
             ("--user", options.user.is_some()),

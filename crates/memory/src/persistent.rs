@@ -51,7 +51,10 @@
 use std::sync::Arc;
 
 use aik_api::execution::ExecutionContext;
-use aik_api::memory::{MemoryId, MemoryKind, MemoryMatch, MemoryQuery, MemoryRecord, MemoryStore};
+use aik_api::memory::{
+    MemoryCapabilities, MemoryId, MemoryKind, MemoryMatch, MemoryQuery, MemoryRecord, MemoryStore,
+};
+use aik_api::model::{Embedder, ModelId};
 use aik_api::permission::{Principal, PrincipalId};
 use aik_core::clock::{SharedClock, SystemClock, Timestamp};
 use aik_core::{Error, Result};
@@ -65,7 +68,8 @@ use serde_json::{Map, Value};
 
 use crate::expiry::{DEFAULT_SWEEP_BATCH, ExpirySweeper, is_live};
 use crate::owner::authorize;
-use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
+use crate::query::{QueryMode, matches_metadata, rank_for, requested_kinds, resolve_mode};
+use crate::semantic::{SemanticIndex, embedding_text};
 
 /// One row per record, keyed by id.
 const RECORDS: TableDefinition<'static, u128, &[u8]> = TableDefinition::new("mem.records");
@@ -140,6 +144,7 @@ pub struct RedbMemoryStore {
     db: Arc<Db>,
     clock: SharedClock,
     sweep_batch: usize,
+    semantic: Option<SemanticIndex>,
 }
 
 impl std::fmt::Debug for RedbMemoryStore {
@@ -147,6 +152,7 @@ impl std::fmt::Debug for RedbMemoryStore {
         f.debug_struct("RedbMemoryStore")
             .field("path", &self.db.path())
             .field("sweep_batch", &self.sweep_batch)
+            .field("semantic", &self.semantic)
             .finish()
     }
 }
@@ -162,6 +168,7 @@ impl RedbMemoryStore {
             db,
             clock: Arc::new(SystemClock),
             sweep_batch: DEFAULT_SWEEP_BATCH,
+            semantic: None,
         })
     }
 
@@ -195,6 +202,28 @@ impl RedbMemoryStore {
         self
     }
 
+    /// Embeds records on write and query text on read, using `model` through `embedder`.
+    ///
+    /// Turning this on changes three things:
+    ///
+    /// * A [`MemoryStore::put`] of a record that carries no embedding calls the model first,
+    ///   and **fails if the model is unreachable** rather than storing a record no search
+    ///   will ever find. A durable store is exactly where that matters: an unembedded record
+    ///   stays invisible to every future query, long after whatever was wrong is fixed.
+    /// * A record that already carries an embedding is stored as it is, so re-importing
+    ///   vectors, or embedding elsewhere, does not silently pay for the model twice.
+    /// * [`MemoryQuery::text`] becomes answerable, which is what
+    ///   [`MemoryCapabilities::semantic_text`] then reports.
+    ///
+    /// Records written before an embedding model was configured keep no vector and so are
+    /// absent from semantic results. Nothing back-fills them: re-embedding a store is a
+    /// migration with its own cost, not something a constructor should start.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>, model: impl Into<ModelId>) -> Self {
+        self.semantic = Some(SemanticIndex::new(embedder, model.into()));
+        self
+    }
+
     /// The database this store writes to.
     pub fn db(&self) -> &Arc<Db> {
         &self.db
@@ -203,7 +232,16 @@ impl RedbMemoryStore {
 
 #[async_trait]
 impl MemoryStore for RedbMemoryStore {
-    async fn put(&self, record: MemoryRecord, cx: &ExecutionContext) -> Result<()> {
+    async fn put(&self, mut record: MemoryRecord, cx: &ExecutionContext) -> Result<()> {
+        // Before the write slot is queued for, not after: embedding is a model call, and
+        // holding the single writer while one runs would serialise every other write behind
+        // it.
+        if let Some(index) = &self.semantic
+            && record.embedding.is_none()
+        {
+            record.embedding = Some(index.embed(&embedding_text(&record.content), cx).await?);
+        }
+
         let db = self.db.clone();
         let principal = cx.principal_or_system();
         let _queued = self.db.writes().lock().await;
@@ -234,16 +272,20 @@ impl MemoryStore for RedbMemoryStore {
     }
 
     async fn query(&self, query: &MemoryQuery, cx: &ExecutionContext) -> Result<Vec<MemoryMatch>> {
-        reject_unsupported(query)?;
+        let mode = resolve_mode(query, self.semantic.as_ref(), cx).await?;
         let db = self.db.clone();
         let principal = cx.principal_or_system();
         let query = query.clone();
         let now = self.clock.now();
         let joined = tokio::task::spawn_blocking(move || {
-            query_blocking(db.database(), &query, now, &principal)
+            query_blocking(db.database(), &query, &mode, now, &principal)
         })
         .await;
         finish(joined, "querying memory records")
+    }
+
+    fn capabilities(&self) -> MemoryCapabilities {
+        MemoryCapabilities::new(self.semantic.is_some())
     }
 }
 
@@ -484,6 +526,7 @@ fn delete_blocking(db: &Database, id: MemoryId, principal: &Principal) -> Result
 fn query_blocking(
     db: &Database,
     query: &MemoryQuery,
+    mode: &QueryMode,
     now: Timestamp,
     principal: &Principal,
 ) -> Result<Vec<MemoryMatch>> {
@@ -557,7 +600,7 @@ fn query_blocking(
         .filter(|record| matches_metadata(record, &query.metadata))
         .collect();
 
-    Ok(rank(candidates, query.limit))
+    Ok(rank_for(mode, candidates, query.limit))
 }
 
 /// The owners `principal` may read records of: itself, and whoever it acts on behalf of.

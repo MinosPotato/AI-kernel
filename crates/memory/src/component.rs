@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use aik_api::memory::MemoryStore;
+use aik_api::model::{Embedder, ModelId};
 use aik_core::prelude::*;
 use aik_store::Db;
 
@@ -30,6 +31,19 @@ pub const DEFAULT_COMPONENT_ID: &str = "memory.store";
 /// it competes with real traffic.
 pub const DEFAULT_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Which component supplies embeddings, and which model it is asked for.
+///
+/// The component is named rather than resolved as the registry's default `dyn Embedder`,
+/// for the same reason [`MemoryToolsComponent`](crate::MemoryToolsComponent) names the store
+/// it binds to: a named dependency is one the kernel can *order*, so the provider is started
+/// before the store that calls it, whatever order the two were added in. A default resolved
+/// during `init` would depend on that order instead.
+#[derive(Debug, Clone)]
+struct EmbedderChoice {
+    component: ComponentId,
+    model: ModelId,
+}
+
 /// Registers an [`InMemoryMemoryStore`] as a kernel component.
 ///
 /// ```
@@ -44,6 +58,7 @@ pub struct MemoryComponent {
     id: ComponentId,
     default: bool,
     expiry_interval: Duration,
+    embedder: Option<EmbedderChoice>,
     store: OnceLock<Arc<InMemoryMemoryStore>>,
 }
 
@@ -53,6 +68,7 @@ impl std::fmt::Debug for MemoryComponent {
             .field("id", &self.id)
             .field("default", &self.default)
             .field("expiry_interval", &self.expiry_interval)
+            .field("embedder", &self.embedder)
             .finish()
     }
 }
@@ -71,6 +87,7 @@ impl MemoryComponent {
             id: ComponentId::new(DEFAULT_COMPONENT_ID),
             default: true,
             expiry_interval: DEFAULT_EXPIRY_SWEEP_INTERVAL,
+            embedder: None,
             store: OnceLock::new(),
         }
     }
@@ -95,17 +112,46 @@ impl MemoryComponent {
         self.expiry_interval = interval;
         self
     }
+
+    /// Turns on semantic search, embedding with `model` through the `dyn Embedder` published
+    /// by `component`.
+    ///
+    /// The component becomes a declared dependency, so a kernel missing it fails to build
+    /// rather than starting a store that cannot embed. See
+    /// [`RedbMemoryStore::with_embedder`](crate::RedbMemoryStore::with_embedder) for what
+    /// this changes about writes.
+    #[must_use]
+    pub fn with_embedder(
+        mut self,
+        component: impl Into<ComponentId>,
+        model: impl Into<ModelId>,
+    ) -> Self {
+        self.embedder = Some(EmbedderChoice {
+            component: component.into(),
+            model: model.into(),
+        });
+        self
+    }
 }
 
 #[async_trait]
 impl Component for MemoryComponent {
     fn descriptor(&self) -> ComponentDescriptor {
-        ComponentDescriptor::new(self.id.clone())
-            .described("in-memory record store with a periodic expiry sweep")
+        let descriptor = ComponentDescriptor::new(self.id.clone())
+            .described("in-memory record store with a periodic expiry sweep");
+        match &self.embedder {
+            Some(choice) => descriptor.requires(choice.component.clone()),
+            None => descriptor,
+        }
     }
 
     async fn init(&self, ctx: &ComponentContext) -> Result<()> {
-        let store = Arc::new(InMemoryMemoryStore::new().with_clock(ctx.clock().clone()));
+        let mut store = InMemoryMemoryStore::new().with_clock(ctx.clock().clone());
+        if let Some(choice) = &self.embedder {
+            let embedder = ctx.service_named::<dyn Embedder>(&choice.component)?;
+            store = store.with_embedder(embedder, choice.model.clone());
+        }
+        let store = Arc::new(store);
         // Set before publishing: `start` looks the concrete store up here to drive the
         // sweep, and must never find the slot empty for a component that finished `init`.
         self.store
@@ -156,6 +202,7 @@ pub struct RedbMemoryComponent {
     database: ComponentId,
     default: bool,
     expiry_interval: Duration,
+    embedder: Option<EmbedderChoice>,
     store: OnceLock<Arc<RedbMemoryStore>>,
 }
 
@@ -166,6 +213,7 @@ impl std::fmt::Debug for RedbMemoryComponent {
             .field("database", &self.database)
             .field("default", &self.default)
             .field("expiry_interval", &self.expiry_interval)
+            .field("embedder", &self.embedder)
             .finish()
     }
 }
@@ -185,6 +233,7 @@ impl RedbMemoryComponent {
             database: ComponentId::new(aik_store::DEFAULT_COMPONENT_ID),
             default: true,
             expiry_interval: DEFAULT_EXPIRY_SWEEP_INTERVAL,
+            embedder: None,
             store: OnceLock::new(),
         }
     }
@@ -216,19 +265,47 @@ impl RedbMemoryComponent {
         self.expiry_interval = interval;
         self
     }
+
+    /// Turns on semantic search, embedding with `model` through the `dyn Embedder` published
+    /// by `component`.
+    ///
+    /// See [`MemoryComponent::with_embedder`], and
+    /// [`RedbMemoryStore::with_embedder`](crate::RedbMemoryStore::with_embedder) for what it
+    /// changes about writes and about records written before it was turned on.
+    #[must_use]
+    pub fn with_embedder(
+        mut self,
+        component: impl Into<ComponentId>,
+        model: impl Into<ModelId>,
+    ) -> Self {
+        self.embedder = Some(EmbedderChoice {
+            component: component.into(),
+            model: model.into(),
+        });
+        self
+    }
 }
 
 #[async_trait]
 impl Component for RedbMemoryComponent {
     fn descriptor(&self) -> ComponentDescriptor {
-        ComponentDescriptor::new(self.id.clone())
+        let descriptor = ComponentDescriptor::new(self.id.clone())
             .described("persistent record store with a periodic expiry sweep")
-            .requires(self.database.clone())
+            .requires(self.database.clone());
+        match &self.embedder {
+            Some(choice) => descriptor.requires(choice.component.clone()),
+            None => descriptor,
+        }
     }
 
     async fn init(&self, ctx: &ComponentContext) -> Result<()> {
         let db = ctx.service_named::<Db>(&self.database)?;
-        let store = Arc::new(RedbMemoryStore::new(db)?.with_clock(ctx.clock().clone()));
+        let mut store = RedbMemoryStore::new(db)?.with_clock(ctx.clock().clone());
+        if let Some(choice) = &self.embedder {
+            let embedder = ctx.service_named::<dyn Embedder>(&choice.component)?;
+            store = store.with_embedder(embedder, choice.model.clone());
+        }
+        let store = Arc::new(store);
         self.store
             .set(store.clone())
             .expect("init runs at most once per component");

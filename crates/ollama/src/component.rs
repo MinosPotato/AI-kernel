@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use aik_api::model::ModelProvider;
+use aik_api::model::{Embedder, ModelProvider};
 use aik_core::prelude::*;
 
 use crate::provider::OllamaProvider;
@@ -11,7 +11,8 @@ use crate::settings::OllamaSettings;
 /// The component id used when none is given explicitly.
 pub const DEFAULT_COMPONENT_ID: &str = "model.ollama";
 
-/// Registers an [`OllamaProvider`] as a kernel component.
+/// Registers an [`OllamaProvider`] as a kernel component, under both `dyn ModelProvider`
+/// and `dyn Embedder`.
 ///
 /// Settings are read from this component's own configuration section — `components.<id>`,
 /// see [`ComponentContext::settings`] — and deserialised as [`OllamaSettings`]. With no
@@ -78,9 +79,16 @@ impl Component for OllamaComponent {
         let settings: OllamaSettings = ctx.settings().get_or_default("")?;
         let provider = Arc::new(OllamaProvider::new(settings, ctx.clock().clone()));
 
+        // The same server answers both, so one instance is published under both
+        // capabilities rather than two instances holding two connection pools onto it.
+        // Whoever wants embeddings resolves `dyn Embedder`; nothing forces a consumer of
+        // one capability to know about the other.
+        let embedder: Arc<dyn Embedder> = provider.clone();
         if self.default {
+            ctx.provide_default::<dyn Embedder>(embedder)?;
             ctx.provide_default::<dyn ModelProvider>(provider)
         } else {
+            ctx.provide::<dyn Embedder>(embedder)?;
             ctx.provide::<dyn ModelProvider>(provider)
         }
     }

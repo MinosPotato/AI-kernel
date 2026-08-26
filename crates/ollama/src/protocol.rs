@@ -123,6 +123,20 @@ pub(crate) struct TagModel {
     pub(crate) name: String,
 }
 
+/// One `/api/embed` request. Ollama accepts a single string or an array; always sending an
+/// array keeps one code path for both, and makes the response shape uniform too.
+#[derive(Debug, Serialize)]
+pub(crate) struct EmbedRequest<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) input: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EmbedResponse {
+    #[serde(default)]
+    pub(crate) embeddings: Vec<Vec<f32>>,
+}
+
 /// Builds an Ollama chat request from the kernel's provider-neutral request.
 ///
 /// Rejects content this provider cannot represent up front, with a clear
@@ -354,10 +368,88 @@ pub(crate) fn convert_tags(response: TagsResponse) -> Vec<ModelDescriptor> {
         .collect()
 }
 
+/// Converts an `/api/embed` response, checking that it answers the question that was asked.
+///
+/// A server that returns a different number of vectors than there were inputs, or a vector
+/// of a different width than the others, has broken the one property a caller cannot check
+/// for itself: which input each vector belongs to. Both are refused rather than returned,
+/// because a silently misaligned batch would put one memory's vector on another memory's
+/// record and stay wrong for as long as the record lives.
+pub(crate) fn convert_embeddings(response: EmbedResponse, inputs: usize) -> Result<Vec<Vec<f32>>> {
+    if response.embeddings.len() != inputs {
+        return Err(Error::wrap(
+            "decoding an Ollama embedding response",
+            OllamaApiError(format!(
+                "asked for {inputs} embeddings and got {}",
+                response.embeddings.len()
+            )),
+        ));
+    }
+    if let Some(first) = response.embeddings.first() {
+        if first.is_empty() {
+            return Err(Error::wrap(
+                "decoding an Ollama embedding response",
+                OllamaApiError("the server returned empty vectors".to_owned()),
+            ));
+        }
+        if let Some(other) = response
+            .embeddings
+            .iter()
+            .find(|embedding| embedding.len() != first.len())
+        {
+            return Err(Error::wrap(
+                "decoding an Ollama embedding response",
+                OllamaApiError(format!(
+                    "the server returned vectors of differing widths: {} and {}",
+                    first.len(),
+                    other.len()
+                )),
+            ));
+        }
+    }
+    Ok(response.embeddings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_embedding_batch_must_answer_every_input() {
+        let response = EmbedResponse {
+            embeddings: vec![vec![0.1, 0.2]],
+        };
+        let error = convert_embeddings(response, 2).expect_err("one vector for two inputs");
+        assert!(format!("{error}").contains("Ollama"), "{error}");
+    }
+
+    #[test]
+    fn embeddings_of_differing_widths_are_refused() {
+        let response = EmbedResponse {
+            embeddings: vec![vec![0.1, 0.2], vec![0.3]],
+        };
+        assert!(convert_embeddings(response, 2).is_err());
+    }
+
+    #[test]
+    fn empty_vectors_are_refused() {
+        let response = EmbedResponse {
+            embeddings: vec![vec![]],
+        };
+        assert!(convert_embeddings(response, 1).is_err());
+    }
+
+    #[test]
+    fn a_well_formed_batch_passes_through_in_order() {
+        let response = EmbedResponse {
+            embeddings: vec![vec![0.1, 0.2], vec![0.3, 0.4]],
+        };
+        assert_eq!(
+            convert_embeddings(response, 2).expect("well formed"),
+            vec![vec![0.1, 0.2], vec![0.3, 0.4]]
+        );
+    }
 
     #[test]
     fn text_only_messages_convert_cleanly() {

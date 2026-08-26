@@ -103,6 +103,7 @@ impl DaemonSettings {
             user: options.user.clone(),
             root: options.root.clone(),
             model: options.model.clone(),
+            embedding_model: options.embedding_model.clone(),
             provider: options.provider,
             tools: options.tools(),
             memory: options.memory(),

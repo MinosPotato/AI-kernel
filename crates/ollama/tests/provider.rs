@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::model::{
-    CompletionChunk, CompletionRequest, ContentPart, FinishReason, Message, ModelId, ModelProvider,
-    Role, ToolDefinition,
+    CompletionChunk, CompletionRequest, ContentPart, Embedder, FinishReason, Message, ModelId,
+    ModelProvider, Role, ToolDefinition,
 };
 use aik_api::permission::ActionId;
 use aik_api::tool::{ToolCall, ToolName, ToolSpec};
@@ -475,6 +475,130 @@ async fn an_execution_context_deadline_shorter_than_the_default_still_times_out(
 }
 
 // ---------------------------------------------------------------------------
+// embed()
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn embed_sends_a_batch_and_returns_one_vector_per_input() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .and(wiremock::matchers::body_json(json!({
+            "model": "nomic-embed-text",
+            "input": ["alice drinks tea", "bob drinks coffee"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "nomic-embed-text",
+            "embeddings": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        })))
+        .mount(&server)
+        .await;
+
+    let inputs = vec![
+        "alice drinks tea".to_owned(),
+        "bob drinks coffee".to_owned(),
+    ];
+    let vectors = provider_for(&server)
+        .embed(
+            &ModelId::new("nomic-embed-text"),
+            &inputs,
+            &ExecutionContext::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]);
+}
+
+#[tokio::test]
+async fn an_empty_batch_costs_no_request() {
+    // No mock is mounted, so any request at all would fail the call.
+    let server = MockServer::start().await;
+    let vectors = provider_for(&server)
+        .embed(
+            &ModelId::new("nomic-embed-text"),
+            &[],
+            &ExecutionContext::new(),
+        )
+        .await
+        .unwrap();
+    assert!(vectors.is_empty());
+}
+
+#[tokio::test]
+async fn a_batch_that_comes_back_misaligned_is_an_error_rather_than_a_guess() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": [[0.1, 0.2]]
+        })))
+        .mount(&server)
+        .await;
+
+    let inputs = vec!["one".to_owned(), "two".to_owned()];
+    let error = provider_for(&server)
+        .embed(
+            &ModelId::new("nomic-embed-text"),
+            &inputs,
+            &ExecutionContext::new(),
+        )
+        .await
+        .expect_err("two inputs, one vector");
+    assert!(format!("{error}").contains("embedding"), "{error}");
+}
+
+#[tokio::test]
+async fn embed_surfaces_a_server_error_carrying_ollamas_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "model 'ghost' not found"
+        })))
+        .mount(&server)
+        .await;
+
+    let inputs = vec!["one".to_owned()];
+    let error = provider_for(&server)
+        .embed(&ModelId::new("ghost"), &inputs, &ExecutionContext::new())
+        .await
+        .expect_err("no such model");
+    assert!(
+        std::error::Error::source(&error)
+            .expect("the server's own message")
+            .to_string()
+            .contains("model 'ghost' not found"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn embedding_respects_an_execution_context_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(30))
+                .set_body_json(json!({ "embeddings": [[0.1]] })),
+        )
+        .mount(&server)
+        .await;
+
+    let clock: SharedClock = Arc::new(ManualClock::new(Timestamp::from_millis(0)));
+    let provider = provider_with_clock(&server, clock);
+    let cx = ExecutionContext::new().with_deadline(Timestamp::from_millis(50));
+
+    let inputs = vec!["one".to_owned()];
+    let error = provider
+        .embed(&ModelId::new("nomic-embed-text"), &inputs, &cx)
+        .await
+        .expect_err("the deadline passes first");
+    assert!(matches!(error, Error::Timeout(_)), "{error}");
+}
+
+// ---------------------------------------------------------------------------
 // As a kernel component
 // ---------------------------------------------------------------------------
 
@@ -513,6 +637,13 @@ async fn the_component_registers_a_provider_resolvable_through_the_registry() {
         .expect("OllamaComponent should have registered the default ModelProvider");
     let models = provider.models().await.unwrap();
     assert_eq!(models[0].id, ModelId::new("llama3.2:latest"));
+
+    // The same component publishes the second capability, which is what a memory store
+    // configured for semantic search resolves.
+    kernel
+        .context()
+        .service::<dyn Embedder>()
+        .expect("OllamaComponent should have registered the default Embedder");
 
     kernel.shutdown().await.unwrap();
 }

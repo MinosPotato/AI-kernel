@@ -4,14 +4,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use aik_api::execution::ExecutionContext;
-use aik_api::memory::{MemoryId, MemoryMatch, MemoryQuery, MemoryRecord, MemoryStore};
+use aik_api::memory::{
+    MemoryCapabilities, MemoryId, MemoryMatch, MemoryQuery, MemoryRecord, MemoryStore,
+};
+use aik_api::model::{Embedder, ModelId};
 use aik_core::Result;
 use aik_core::clock::{SharedClock, SystemClock, Timestamp};
 use async_trait::async_trait;
 
 use crate::expiry::{ExpirySweeper, is_live};
 use crate::owner::authorize;
-use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
+use crate::query::{matches_metadata, rank_for, requested_kinds, resolve_mode};
+use crate::semantic::{SemanticIndex, embedding_text};
 
 /// A [`MemoryStore`] that keeps records in memory, in this process.
 ///
@@ -35,6 +39,7 @@ use crate::query::{matches_metadata, rank, reject_unsupported, requested_kinds};
 pub struct InMemoryMemoryStore {
     records: RwLock<HashMap<MemoryId, MemoryRecord>>,
     clock: SharedClock,
+    semantic: Option<SemanticIndex>,
 }
 
 impl std::fmt::Debug for InMemoryMemoryStore {
@@ -42,6 +47,7 @@ impl std::fmt::Debug for InMemoryMemoryStore {
         let records = self.records.read().expect("memory store lock poisoned");
         f.debug_struct("InMemoryMemoryStore")
             .field("records", &records.len())
+            .field("semantic", &self.semantic)
             .finish()
     }
 }
@@ -58,6 +64,7 @@ impl InMemoryMemoryStore {
         Self {
             records: RwLock::new(HashMap::new()),
             clock: Arc::new(SystemClock),
+            semantic: None,
         }
     }
 
@@ -68,11 +75,30 @@ impl InMemoryMemoryStore {
         self.clock = clock;
         self
     }
+
+    /// Embeds records on write and query text on read, using `model` through `embedder`.
+    ///
+    /// See [`RedbMemoryStore::with_embedder`](crate::RedbMemoryStore::with_embedder) for
+    /// what turning this on changes, including the write that now fails when the model is
+    /// unreachable.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>, model: impl Into<ModelId>) -> Self {
+        self.semantic = Some(SemanticIndex::new(embedder, model.into()));
+        self
+    }
 }
 
 #[async_trait]
 impl MemoryStore for InMemoryMemoryStore {
     async fn put(&self, mut record: MemoryRecord, cx: &ExecutionContext) -> Result<()> {
+        // Before the lock: embedding is a network call, and holding a store-wide write lock
+        // across one would stall every reader for as long as a model takes to answer.
+        if let Some(index) = &self.semantic
+            && record.embedding.is_none()
+        {
+            record.embedding = Some(index.embed(&embedding_text(&record.content), cx).await?);
+        }
+
         let principal = cx.principal_or_system();
         let mut records = self.records.write().expect("memory store lock poisoned");
 
@@ -111,7 +137,7 @@ impl MemoryStore for InMemoryMemoryStore {
     }
 
     async fn query(&self, query: &MemoryQuery, cx: &ExecutionContext) -> Result<Vec<MemoryMatch>> {
-        reject_unsupported(query)?;
+        let mode = resolve_mode(query, self.semantic.as_ref(), cx).await?;
         let kinds = requested_kinds(query);
         let now = self.clock.now();
         let principal = cx.principal_or_system();
@@ -126,7 +152,11 @@ impl MemoryStore for InMemoryMemoryStore {
             .cloned()
             .collect();
 
-        Ok(rank(candidates, query.limit))
+        Ok(rank_for(&mode, candidates, query.limit))
+    }
+
+    fn capabilities(&self) -> MemoryCapabilities {
+        MemoryCapabilities::new(self.semantic.is_some())
     }
 }
 
@@ -219,14 +249,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_fields_are_unsupported() {
+    async fn text_search_is_unsupported_without_an_embedding_model() {
         let store = InMemoryMemoryStore::new();
+        assert!(!store.capabilities().semantic_text);
         let query = MemoryQuery {
             text: Some("anything".into()),
             ..Default::default()
         };
         let error = store.query(&query, &cx()).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn a_precomputed_embedding_ranks_without_any_model() {
+        let store = InMemoryMemoryStore::new();
+        assert!(!store.capabilities().semantic_text);
+
+        let mut near = record("fact");
+        near.embedding = Some(vec![1.0, 0.0]);
+        let mut far = record("fact");
+        far.embedding = Some(vec![-1.0, 0.0]);
+        store.put(near.clone(), &cx()).await.unwrap();
+        store.put(far.clone(), &cx()).await.unwrap();
+
+        let matches = store
+            .query(
+                &MemoryQuery {
+                    embedding: Some(vec![1.0, 0.0]),
+                    ..Default::default()
+                },
+                &cx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matches[0].record.id, near.id);
+        assert_eq!(matches[0].score, Some(1.0));
+        assert_eq!(matches[1].record.id, far.id);
     }
 
     #[tokio::test]
