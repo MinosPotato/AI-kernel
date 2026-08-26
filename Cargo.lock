@@ -245,6 +245,7 @@ dependencies = [
  "aik-runtime",
  "aik-scheduler",
  "aik-store",
+ "aik-summary",
  "aik-tools",
  "async-trait",
  "futures",
@@ -337,6 +338,7 @@ dependencies = [
  "aik-policy",
  "aik-scheduler",
  "aik-store",
+ "aik-summary",
  "aik-tools",
  "async-trait",
  "futures",
@@ -374,6 +376,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "aik-summary"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-context",
+ "aik-core",
+ "async-trait",
+ "futures-core",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

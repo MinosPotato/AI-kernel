@@ -230,6 +230,7 @@ fn banner(settings: &Settings) {
         None => println!("  store:  none (--ephemeral: nothing is written to disk)"),
     }
     println!("  memory: {}", settings.runtime.memory.as_str());
+    println!("  summary: {}", settings.runtime.summary_notice());
     if !settings.runtime.has_system_prompt() {
         println!(
             "  prompt: none configured, so the agent is told nothing about what it can do.\n\

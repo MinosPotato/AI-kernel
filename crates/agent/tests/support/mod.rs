@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use aik_agent::{AgentLoop, AgentLoopSettings};
 use aik_api::agent::SessionId;
-use aik_api::context::{ContextBudget, ContextRecord, ContextStore};
+use aik_api::context::{
+    Compaction, ContextBudget, ContextCompactor, ContextEntry, ContextRecord, ContextStore,
+};
 use aik_api::execution::ExecutionContext;
 use aik_api::model::{
     CompletionChunk, CompletionRequest, CompletionResponse, ContentPart, FinishReason, Message,
@@ -491,6 +493,102 @@ impl ApprovalSink for FixedApprovals {
     }
 }
 
+// --- the compactor -----------------------------------------------------------------
+
+/// What a [`StubCompactor`] does when the loop asks it for room.
+#[derive(Clone)]
+pub enum Compacts {
+    /// Appends a recap and reclaims everything but the newest `keep` records.
+    Recapping { text: String, keep: usize },
+    /// Finds nothing worth doing.
+    Nothing,
+    /// Fails.
+    Failure(String),
+    /// Reports that the run was cancelled while it was working.
+    Cancelled,
+}
+
+/// A compactor that really compacts, and says when it was asked and what it saw.
+///
+/// Real rather than mocked for the same reason the rest of this module is: what the tests
+/// need to assert is what the *loop* did — when it asked, how often, and what the model was
+/// shown afterwards — and that is only visible if the store really changes underneath it.
+pub struct StubCompactor {
+    store: Arc<InMemoryContextStore>,
+    behaviour: Compacts,
+    /// How many records the session held at each call, in order.
+    seen: Mutex<Vec<usize>>,
+}
+
+impl std::fmt::Debug for StubCompactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StubCompactor")
+            .field("calls", &self.calls())
+            .finish_non_exhaustive()
+    }
+}
+
+impl StubCompactor {
+    pub fn new(store: Arc<InMemoryContextStore>, behaviour: Compacts) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            behaviour,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn calls(&self) -> usize {
+        self.seen.lock().expect("seen lock").len()
+    }
+
+    /// How many records the session held when the loop asked, per call.
+    pub fn seen(&self) -> Vec<usize> {
+        self.seen.lock().expect("seen lock").clone()
+    }
+}
+
+#[async_trait]
+impl ContextCompactor for StubCompactor {
+    async fn compact(
+        &self,
+        session: &SessionId,
+        _budget: &ContextBudget,
+        cx: &ExecutionContext,
+    ) -> Result<Compaction> {
+        let held = self
+            .store
+            .window(session, &ContextBudget::UNLIMITED, cx)
+            .await?
+            .records
+            .len();
+        self.seen.lock().expect("seen lock").push(held);
+
+        match &self.behaviour {
+            Compacts::Nothing => Ok(Compaction::NONE),
+            Compacts::Failure(reason) => Err(Error::other(reason.clone())),
+            Compacts::Cancelled => Err(Error::Cancelled),
+            Compacts::Recapping { text, keep } => {
+                let record = self
+                    .store
+                    .append(
+                        session,
+                        ContextEntry::new(Message::text(Role::User, text.clone())),
+                        cx,
+                    )
+                    .await?;
+                let removed = self.store.compact(session, *keep, cx).await?;
+                Ok(Compaction {
+                    summary: Some(record.id),
+                    summarised_records: removed,
+                    removed_records: removed,
+                    reclaimed_tokens: 0,
+                    summary_tokens: record.tokens,
+                })
+            }
+        }
+    }
+}
+
 // --- assembly ----------------------------------------------------------------------
 
 /// An agent loop wired to observable collaborators.
@@ -500,6 +598,8 @@ pub struct Harness {
     pub store: Arc<InMemoryContextStore>,
     pub events: EventBus,
     pub agent: AgentLoop,
+    /// The compactor the loop was given, if the test asked for one.
+    pub compactor: Option<Arc<StubCompactor>>,
     pub session: SessionId,
 }
 
@@ -521,6 +621,7 @@ pub struct HarnessBuilder {
     settings: AgentLoopSettings,
     allowed: Option<Vec<ToolName>>,
     clock: SharedClock,
+    compactor: Option<Compacts>,
 }
 
 impl std::fmt::Debug for HarnessBuilder {
@@ -574,6 +675,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// Wires a [`StubCompactor`] behaving this way into the loop.
+    #[must_use]
+    pub fn compactor(mut self, behaviour: Compacts) -> Self {
+        self.compactor = Some(behaviour);
+        self
+    }
+
     pub fn build(self) -> Harness {
         let events = EventBus::new(1_024, self.clock.clone());
         let policy = Arc::new(self.policy);
@@ -609,6 +717,12 @@ impl HarnessBuilder {
         if let Some(allowed) = self.allowed {
             agent = agent.with_tools(allowed);
         }
+        let compactor = self
+            .compactor
+            .map(|behaviour| StubCompactor::new(store.clone(), behaviour));
+        if let Some(compactor) = &compactor {
+            agent = agent.with_compactor(compactor.clone());
+        }
 
         Harness {
             model,
@@ -616,6 +730,7 @@ impl HarnessBuilder {
             store,
             events,
             agent,
+            compactor,
             session: SessionId::new(),
         }
     }
@@ -631,6 +746,27 @@ impl Harness {
             settings: AgentLoopSettings::new("test-model"),
             allowed: None,
             clock: Arc::new(SystemClock),
+            compactor: None,
+        }
+    }
+
+    /// Fills the session with `turns` ordinary user turns of `words` words each.
+    ///
+    /// A session that already has a history, which is the only kind that can overflow a
+    /// budget on the turn it is asked something.
+    pub async fn fill(&self, turns: usize, words: usize, cx: &ExecutionContext) {
+        for index in 0..turns {
+            self.store
+                .append(
+                    &self.session,
+                    ContextEntry::new(Message::text(
+                        Role::User,
+                        format!("turn {index}: {}", "conversation ".repeat(words)),
+                    )),
+                    cx,
+                )
+                .await
+                .expect("a session the caller owns");
         }
     }
 

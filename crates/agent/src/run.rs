@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aik_api::agent::{AgentResponse, AgentUpdate, SessionId};
-use aik_api::context::{ContextEntry, ContextStore, ContextUsage, TokenCounter};
+use aik_api::context::{
+    ContextCompactor, ContextEntry, ContextStore, ContextUsage, ContextWindow, TokenCounter,
+};
 use aik_api::execution::ExecutionContext;
 use aik_api::measurement::{RequestEstimate, RequestMeasured};
 use aik_api::model::{
@@ -54,6 +56,9 @@ pub(crate) struct Wiring {
     pub(crate) events: Option<(EventBus, ComponentId)>,
     /// The tool names this agent may use, or `None` for every tool the registry lists.
     pub(crate) allowed: Option<Vec<ToolName>>,
+    /// What the run asks for room when a window starts dropping records, if anything; see
+    /// [`crate::AgentLoop::with_compactor`].
+    pub(crate) compactor: Option<Arc<dyn ContextCompactor>>,
 }
 
 /// One conversation turn-taking session, advanced one action at a time.
@@ -82,6 +87,13 @@ pub(crate) struct Run {
 
     turns: usize,
     tool_calls: usize,
+    /// Whether the run will still ask for room.
+    ///
+    /// Turned off by a compactor that failed or that found nothing to do, so one round of
+    /// either costs one attempt and not one per turn. It never turns back on within a run:
+    /// what made compaction pointless or impossible this turn is not going to have changed
+    /// by the next one.
+    compacting: bool,
     usage: Usage,
     usage_reported: bool,
     /// The estimated cost of the caller's input, set once by [`Run::prepare`] and consumed
@@ -122,6 +134,7 @@ impl Run {
             running: None,
             turns: 0,
             tool_calls: 0,
+            compacting: true,
             usage: Usage::default(),
             usage_reported: false,
             current_input_tokens: None,
@@ -245,6 +258,20 @@ impl Run {
             }
         }
 
+        // Before the question is recorded rather than after, and this is the one place the
+        // order matters: a transcript is append-only, so a recap lands at the *end* of the
+        // session. Compacting first puts it behind the input it precedes; compacting later
+        // would leave the newest thing in the window being a summary of the oldest, with the
+        // user's actual question above it.
+        //
+        // The window assembled here is only ever assembled to ask whether the session is
+        // already losing records, which is why it is not assembled at all unless something
+        // could act on the answer.
+        if self.compactor().is_some() {
+            let dropped = self.window().await?.usage.dropped_records;
+            self.make_room(dropped).await?;
+        }
+
         let input = std::mem::take(&mut self.input);
         let user_message = Message {
             role: Role::User,
@@ -260,6 +287,71 @@ impl Run {
         Ok(())
     }
 
+    /// Assembles the model payload for this session under the run's budget.
+    fn window(&self) -> impl std::future::Future<Output = Result<ContextWindow>> + '_ {
+        self.wiring
+            .context
+            .window(&self.session, &self.wiring.settings.budget, &self.cx)
+    }
+
+    /// Asks the compactor to replace what the budget is about to evict, if there is one.
+    ///
+    /// Best-effort by design. What compaction buys is a model that remembers the substance
+    /// of turns it can no longer be shown; what it costs when it fails is nothing the run
+    /// had before it was wired in, since the window still assembles, still evicts oldest
+    /// first, and still says what it dropped. So a failure is logged and the run continues —
+    /// with one exception, made because it is not really an exception: a cancelled or
+    /// expired run has to stop whatever it was doing when it found out.
+    ///
+    /// Nothing here inspects, edits or even reads what the compactor wrote. The loop asks
+    /// for room; what fills it is the compactor's business and the store's.
+    async fn make_room(&mut self, dropped_records: usize) -> Result<bool> {
+        // Asked for only when the window is actually losing records: compaction costs a
+        // model call, and a session that fits its budget has nothing to gain from one.
+        if dropped_records == 0 {
+            return Ok(false);
+        }
+        let Some(compactor) = self.compactor() else {
+            return Ok(false);
+        };
+
+        match compactor
+            .compact(&self.session, &self.wiring.settings.budget, &self.cx)
+            .await
+        {
+            Ok(compaction) => {
+                if compaction.is_empty() {
+                    self.compacting = false;
+                    tracing::debug!(
+                        session = %self.session,
+                        "the session is over budget but has nothing left to compact"
+                    );
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::Cancelled | ErrorKind::Timeout) => {
+                Err(error)
+            }
+            Err(error) => {
+                self.compacting = false;
+                tracing::warn!(
+                    %error,
+                    session = %self.session,
+                    "could not compact the session; continuing on the shortened window"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// The compactor this run will still ask, if there is one and asking is still worth it.
+    fn compactor(&self) -> Option<Arc<dyn ContextCompactor>> {
+        self.compacting
+            .then(|| self.wiring.compactor.clone())
+            .flatten()
+    }
+
     /// Takes one model turn against a freshly assembled window.
     async fn turn(&mut self) -> Result<Vec<AgentUpdate>> {
         if self.turns >= self.wiring.settings.max_turns {
@@ -273,11 +365,14 @@ impl Run {
         // Recomputed every turn, from the transcript, under the run's budget. Nothing that
         // was elided or evicted here is lost: it stays in the store, addressable by record
         // id.
-        let window = self
-            .wiring
-            .context
-            .window(&self.session, &self.wiring.settings.budget, &self.cx)
-            .await?;
+        let mut window = self.window().await?;
+        // A second chance, for a window that overflowed during the run rather than before
+        // it: a few large tool results are enough to do it. At most one round per turn, and
+        // none at all once `make_room` has reported that asking is pointless — which is also
+        // why the window is only reassembled when something actually changed.
+        if self.make_room(window.usage.dropped_records).await? {
+            window = self.window().await?;
+        }
         let context_usage = window.usage;
 
         let tool_definitions: Vec<ToolDefinition> =

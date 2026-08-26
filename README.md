@@ -27,6 +27,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-exec`](crates/exec) | Running allowlisted programs behind an OS-level sandbox |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
 | [`aik-context`](crates/context) | An agent's transcript, and the budgeted model window derived from it |
+| [`aik-summary`](crates/summary) | Replacing a session's oldest turns with a model-written recap of them |
 | [`aik-store`](crates/store) | The one embedded database the durable subsystems share |
 | [`aik-memory`](crates/memory) | Records an agent keeps between conversations, and the tools onto them |
 | [`aik-scheduler`](crates/scheduler) | Time- and event-triggered jobs, persistent across restarts |
@@ -365,6 +366,42 @@ clock, not from the payload. A session is owned by the principal that created it
 `ContextStore` is not a `Tool` and must never be registered as one: there is no path from
 model output to it that does not go through trusted code deciding to record something.
 
+### When the budget is not enough
+
+Eviction is honest and it is still a loss: past some length, the model stops being told how
+the conversation started, and from its side that is indistinguishable from it never having
+happened. [`aik-summary`](crates/summary) is the answer to that, and it is deliberately *not*
+part of the store — replacing turns with a paragraph needs a model, which makes the operation
+fallible, costly and, since a transcript is full of tool output, an injection surface.
+
+So it is a separate capability behind its own contract, `ContextCompactor`, and the loop asks
+for it only when its own window says it is dropping records:
+
+```text
+window drops records ──▶ read the oldest turns ──▶ model writes a recap (no tools offered)
+                                                            │
+   the turns it covered ◀── ContextStore::compact ◀── appended back, unpinned
+```
+
+The order is the safety property. Nothing is removed until something has replaced it, so a
+model outage costs a call and no history. What comes back is treated as what it is — model
+output, from untrusted input:
+
+* the summarising call **offers no tools**, so nothing in a transcript can turn a
+  summarisation into an action;
+* the recap is **never pinned and never a system message**, so a model cannot make its own
+  words permanent or give them the authority of the deployment's own prompt;
+* the excerpt is bounded per part and in total, binary payloads are described rather than
+  carried, and its delimiter is neutralised wherever transcript content contains it;
+* the recap is marked with `aik.summary` and framed as a recap, because an append-only
+  transcript stores it as the *newest* record — so the loop compacts before it records the
+  next question, and the last thing in the window stays the thing being answered.
+
+It is on by default and costs nothing until a session actually overflows. `agent.summary`
+turns it off, points it at a cheaper model, or changes how much of the recent conversation
+survives a round; every round publishes a `ContextCompacted` event carrying counts and no
+content.
+
 ## Actually using it
 
 [`aik-cli`](crates/cli) is the frontend: a terminal that starts a kernel, holds one
@@ -594,6 +631,9 @@ a host process over one database cannot describe two different assistants:
 | `agent.provider` | `ollama` | Which model provider answers: `ollama` or `anthropic` |
 | `agent.model` | the provider's first model | The model every turn is sent to |
 | `agent.embedding_model` | none | Embed memories with this, so `memory.query` can search by meaning; needs the `ollama` provider |
+| `agent.summary.enabled` | `true` | Whether an overflowing session is compacted rather than silently shortened |
+| `agent.summary.model` | `agent.model` | The model that writes recaps; usually worth pointing at a smaller one |
+| `agent.summary.keep_recent` | 8 | How many recent records survive a round when no token budget bounds the window |
 | `agent.exec.programs` | none | The bare program names `aik-exec` will run |
 | `agent.exec.writable` | `false` | Whether a program may write to the root |
 | `agent.exec.network` | `false` | Whether a program has a network |
@@ -647,8 +687,8 @@ description of Ollama, and the first credential in the workspace — held in a t
 print it, resolved from a location configuration names rather than from configuration itself,
 and refused outright over a transport that is not `https`.
 
-Semantic memory is the newest of these, and the first capability assembled out of two
-subsystems rather than added to one: `aik-ollama` implements `Embedder` over `/api/embed`, and
+Semantic memory was the first capability assembled out of two subsystems rather than added
+to one: `aik-ollama` implements `Embedder` over `/api/embed`, and
 a memory store given one embeds every record it stores and every search it is handed, ranking
 by cosine similarity instead of by recency. Set `agent.embedding_model` — or pass
 `--embedding-model` — and `memory.query` gains a `text` argument the model can actually use;
@@ -658,9 +698,24 @@ the newest records, a write that cannot embed fails rather than storing a record
 will ever find, and a provider with no embeddings endpoint fails at startup rather than
 serving a memory that silently never searches.
 
-What is genuinely not built yet: context summarisation, and any platform integration at all.
-`aik-scheduler` now defines a cron dialect of its own — five-field, UTC, `cron(5)`-compatible
-— and refuses only an expression that does not parse in it, not the concept.
+Context summarisation is the newest of these, and the first capability that had to be built
+*beside* a subsystem rather than into it. `aik-context` deliberately cannot summarise —
+replacing turns with a paragraph needs a model, and a store that needed one would be a store
+that could fail, cost money and be talked into things. So `aik-summary` is its own crate
+behind its own contract, `ContextCompactor`: it reads the turns a window is about to drop,
+has a model write down what they amounted to, appends that back as an ordinary unpinned
+record, and only then asks the store to reclaim exactly what the recap covered. The agent
+loop gained one optional collaborator and no prompt of its own; a deployment with no
+compactor registered behaves exactly as it did before. The interesting parts are the
+refusals again: nothing is removed until something has replaced it, so a model outage costs a
+call and no history; the summarising call offers no tools, so a transcript cannot turn a
+summarisation into an action; and the recap is never pinned and never a system message, so a
+model cannot make its own words permanent or give them the authority of the deployment's own
+prompt.
+
+What is genuinely not built yet: any platform integration at all. `aik-scheduler` now defines
+a cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an
+expression that does not parse in it, not the concept.
 
 The full pipeline — filesystem confinement, policy evaluation, human approval, tool exposure
 narrowing, verbose auditing, and the CLI's own error and session handling — has been manually
@@ -669,8 +724,9 @@ exercised end to end against a real Ollama server, not only through the automate
 covered, the two bugs it found and fixed, and the token/context cost baseline it produced.
 `docs/CLI.md`'s [limitations sections](docs/CLI.md#other-known-limitations-not-bugs) separate
 what is a genuine defect from what is a documented, deliberate property of the current
-implementation (no summarisation, a heuristic token counter, an unclosed
-filesystem TOCTOU window bounded but not eliminated by handle-pinning). `aik-exec` documents
+implementation (a heuristic token counter, an unclosed filesystem TOCTOU window bounded but
+not eliminated by handle-pinning; the summarisation limitation recorded there has since been
+closed by `aik-summary`). `aik-exec` documents
 its own such property in the crate: it installs no seccomp filter, so a sandboxed child is
 separated from the host by namespaces and mount visibility rather than by a syscall policy,
 and the boundary is only as strong as the kernel's user-namespace implementation.

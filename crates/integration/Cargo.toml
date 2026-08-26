@@ -25,6 +25,7 @@ aik-store.workspace = true
 aik-context.workspace = true
 aik-memory.workspace = true
 aik-scheduler.workspace = true
+aik-summary.workspace = true
 aik-tools.workspace = true
 aik-exec.workspace = true
 aik-policy.workspace = true

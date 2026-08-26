@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use aik_api::agent::{Agent, AgentDescriptor, AgentId, AgentRequest, AgentResponse, AgentUpdate};
+use aik_api::context::ContextCompactor;
 use aik_api::context::{ContextStore, TokenCounter};
 use aik_api::execution::ExecutionContext;
 use aik_api::model::ModelProvider;
@@ -140,6 +141,9 @@ pub struct AgentLoop {
     /// Where [`RequestMeasured`](aik_api::measurement::RequestMeasured) is published;
     /// see [`AgentLoop::with_events`].
     events: Option<(EventBus, ComponentId)>,
+    /// What the loop asks for room when a window starts dropping records, if anything;
+    /// see [`AgentLoop::with_compactor`].
+    compactor: Option<Arc<dyn ContextCompactor>>,
 }
 
 impl std::fmt::Debug for AgentLoop {
@@ -150,6 +154,7 @@ impl std::fmt::Debug for AgentLoop {
             .field("max_turns", &self.settings.max_turns)
             .field("max_tool_calls", &self.settings.max_tool_calls)
             .field("tools", &self.allowed)
+            .field("compacts", &self.compactor.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -178,6 +183,7 @@ impl AgentLoop {
             allowed: None,
             counter: Arc::new(FallbackTokenCounter),
             events: None,
+            compactor: None,
         }
     }
 
@@ -237,6 +243,31 @@ impl AgentLoop {
         self
     }
 
+    /// Asks `compactor` for room whenever a window would otherwise drop records.
+    ///
+    /// Without one, an overflowing session behaves exactly as it always has: the budget
+    /// evicts the oldest records deterministically and the model is simply no longer told
+    /// about them. With one, the loop asks it to replace those records with a recap of them
+    /// *before* the turn is taken, so what the model loses is the wording rather than the
+    /// substance.
+    ///
+    /// The loop contributes the trigger and nothing else. It does not summarise, hold a
+    /// prompt, or decide what a recap should say — see
+    /// [`ContextCompactor`](aik_api::context::ContextCompactor), and
+    /// [`aik-summary`](../aik_summary/index.html) for the implementation this exists for.
+    ///
+    /// Compaction is best-effort, and deliberately so: a compactor that fails has cost the
+    /// run a model call, and failing the user's request over it would make an agent with
+    /// summarisation *less* reliable than one without. A failed or fruitless attempt is
+    /// logged, disables further attempts for the rest of the run, and leaves the run to
+    /// continue on the deterministically shortened window it already had. Cancellation and
+    /// deadlines are the exception — those end the run, because they mean the run is over.
+    #[must_use]
+    pub fn with_compactor(mut self, compactor: Arc<dyn ContextCompactor>) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
     /// Starts a run, deriving its execution context from the caller's.
     fn begin(&self, request: AgentRequest, cx: &ExecutionContext) -> Run {
         let session = request.session;
@@ -258,6 +289,7 @@ impl AgentLoop {
                 counter: self.counter.clone(),
                 events: self.events.clone(),
                 allowed: self.allowed.clone(),
+                compactor: self.compactor.clone(),
             },
             session,
             request.input,

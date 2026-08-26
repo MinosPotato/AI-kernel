@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aik_api::agent::{Agent, AgentId};
-use aik_api::context::{ContextStore, TokenCounter};
+use aik_api::context::{ContextCompactor, ContextStore, TokenCounter};
 use aik_api::model::ModelProvider;
 use aik_api::tool::{ToolName, ToolRegistry};
 use aik_core::prelude::*;
@@ -159,6 +159,13 @@ impl Component for AgentComponent {
         // otherwise need.
         if let Ok(counter) = ctx.service::<dyn TokenCounter>() {
             agent = agent.with_token_counter(counter);
+        }
+        // Optional in the same way and for a stronger reason: a deployment that registered
+        // no compactor has chosen the deterministic eviction the context store does on its
+        // own, which is what every deployment did before compaction existed. Requiring one
+        // here would turn a capability into a startup dependency.
+        if let Ok(compactor) = ctx.service::<dyn ContextCompactor>() {
+            agent = agent.with_compactor(compactor);
         }
         if let Some(description) = &self.description {
             agent = agent.described(description.clone());

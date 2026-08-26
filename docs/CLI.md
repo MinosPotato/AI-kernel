@@ -1088,8 +1088,14 @@ These are documented, deliberate properties of the current implementation, not d
   restart in the shared database, and `/new` still starts a fresh session id every run; there
   is no `--session <ID>` to reattach to a previous conversation. What survives is readable and
   owned, not automatically reopened.
-- **No summarisation.** Context management is purely mechanical (elision and eviction under a
-  byte-heuristic token count); nothing invents or compresses text.
+- **Summarisation is on, and it costs a model call.** A session that outgrows its budget is
+  compacted rather than silently shortened: the oldest turns are read, a model writes a recap
+  of them, the recap is appended as an ordinary unpinned record and only then are the turns it
+  covered reclaimed. The compaction itself is still bounded by the same byte-heuristic token
+  count, and a compaction that fails is logged and skipped for the rest of the run rather than
+  failing the request — so the worst case is the behaviour this line used to describe.
+  `agent.summary.enabled = false` restores it deliberately, and `agent.summary.model` points
+  the extra call at a cheaper model.
 - **Semantic memory is off unless configured.** With no `agent.embedding_model` (or
   `--embedding-model`), memory retrieval is exact — by id, by kind, by metadata equality — and
   a query asking for semantic ranking gets `Unsupported` rather than a result that quietly

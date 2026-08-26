@@ -227,6 +227,7 @@ fn banner(settings: &DaemonSettings, listener: &Listener) {
         None => println!("  store:  none (--ephemeral: nothing is written to disk)"),
     }
     println!("  memory: {}", settings.runtime.memory.as_str());
+    println!("  summary: {}", settings.runtime.summary_notice());
     println!("  socket: {}", listener.endpoint().socket().display());
     println!("  token:  {}", listener.endpoint().token().display());
     println!("  jobs:   scheduled work runs in this process");
