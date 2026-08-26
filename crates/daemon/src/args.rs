@@ -26,6 +26,8 @@ pub struct Options {
     pub socket: Option<PathBuf>,
     /// The model every turn is sent to, overriding configuration.
     pub model: Option<String>,
+    /// The model memories are embedded with, overriding configuration.
+    pub embedding_model: Option<String>,
     /// The provider that model is asked for, overriding configuration.
     pub provider: Option<Provider>,
     /// The agent's identity, overriding configuration.
@@ -77,6 +79,10 @@ pub const HELP: &str = concat!(
     "                         $XDG_RUNTIME_DIR/aik/aikd.sock]\n",
     "    -m, --model <ID>     model to use; defaults to configuration, then to the\n",
     "                         first model the provider reports\n",
+    "        --embedding-model <ID>\n",
+    "                         embed memories with this model, so `memory.query` can\n",
+    "                         search by meaning; needs the ollama provider\n",
+    "                         [default: none, and search stays exact]\n",
     "        --provider <P>   where that model comes from: ollama (a local server),\n",
     "                         anthropic (the Messages API; needs an API key in\n",
     "                         $ANTHROPIC_API_KEY) [default: ollama]\n",
@@ -148,6 +154,7 @@ where
             "-V" | "--version" => return Ok(Invocation::Version),
             "-s" | "--socket" => options.socket = Some(PathBuf::from(value(&flag)?)),
             "-m" | "--model" => options.model = Some(value(&flag)?),
+            "--embedding-model" => options.embedding_model = Some(value(&flag)?),
             "--provider" => {
                 options.provider = Some(
                     Provider::parse(&value(&flag)?)

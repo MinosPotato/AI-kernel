@@ -465,7 +465,94 @@ crate::both_backends!(
     neither_the_input_nor_the_arguments_can_choose_an_owner,
     policy_decides_which_memory_operations_happen_at_all,
     policy_can_scope_memory_to_a_kind,
+    an_agent_recalls_by_meaning_when_the_store_can,
+    a_semantic_recall_is_still_scoped_and_still_gated,
 );
+
+/// The whole semantic path, from a model asking for a search to a ranked answer: the tool
+/// offers `text` because the store can embed, the registry lets the call through, and the
+/// store ranks by meaning rather than by when things were written.
+async fn an_agent_recalls_by_meaning_when_the_store_can(backend: Backend) {
+    let kernel = backend.open_semantic_agent(allow_all_memory()).await;
+
+    for (index, content) in ["alice drinks tea", "bob drinks coffee"]
+        .into_iter()
+        .enumerate()
+    {
+        one_call(
+            &kernel,
+            "memory.put",
+            json!({ "kind": "fact", "content": content }),
+        );
+        let updates = kernel
+            .run(&format!("remember fact {index}"), &user("alice"))
+            .await
+            .expect("the run finishes");
+        assert!(!MemoryAgentKernel::outcome(&updates).is_error);
+    }
+
+    one_call(&kernel, "memory.query", json!({ "text": "tea" }));
+    let updates = kernel
+        .run("what do I drink?", &user("alice"))
+        .await
+        .expect("the run finishes");
+    let outcome = MemoryAgentKernel::outcome(&updates);
+    assert!(!outcome.is_error, "{outcome:?}");
+
+    assert_eq!(outcome.output["count"], json!(2));
+    // Stored first, so ranking by recency would have put it second.
+    assert_eq!(
+        outcome.output["records"][0]["content"],
+        json!("alice drinks tea")
+    );
+    let scores = outcome.output["scores"]
+        .as_array()
+        .expect("a semantic result carries a score per record");
+    assert!(
+        scores[0].as_f64().expect("a number") > scores[1].as_f64().expect("a number"),
+        "{scores:?}"
+    );
+
+    kernel.shutdown().await;
+}
+
+/// Similarity ranks what a caller may already see; it does not widen that, and it does not
+/// bypass the door. Both are properties of the path rather than of the store, so this is the
+/// only place they are observable together.
+async fn a_semantic_recall_is_still_scoped_and_still_gated(backend: Backend) {
+    let denied = json!([
+        { "action": "memory.put", "resource": "*", "effect": { "decision": "allow" } },
+        {
+            "action": "memory.query",
+            "resource": "*",
+            "effect": { "decision": "deny", "reason": "this agent may not recall" }
+        }
+    ]);
+    let kernel = backend.open_semantic_agent(denied).await;
+
+    one_call(
+        &kernel,
+        "memory.put",
+        json!({ "kind": "fact", "content": "alice drinks tea" }),
+    );
+    let updates = kernel
+        .run("remember that", &user("alice"))
+        .await
+        .expect("the run finishes");
+    assert!(!MemoryAgentKernel::outcome(&updates).is_error);
+
+    // Denied at the registry, before the store is reached at all.
+    one_call(&kernel, "memory.query", json!({ "text": "tea" }));
+    let updates = kernel
+        .run("what do I drink?", &user("alice"))
+        .await
+        .expect("the run finishes");
+    let outcome = MemoryAgentKernel::outcome(&updates);
+    assert!(outcome.is_error, "{outcome:?}");
+    assert_eq!(outcome.output["kind"], json!("permission"));
+
+    kernel.shutdown().await;
+}
 
 /// Durability is the one thing the two backends are supposed to disagree about, so it is
 /// asserted against each of them by name.

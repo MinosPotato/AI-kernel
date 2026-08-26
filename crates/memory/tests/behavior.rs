@@ -15,7 +15,9 @@ use aik_core::clock::Timestamp;
 use serde_json::json;
 
 mod support;
-use support::{Backend, user};
+use std::sync::Arc;
+
+use support::{Backend, BrokenEmbedder, KeywordEmbedder, user};
 
 crate::both_backends!(
     a_missing_id_is_none,
@@ -29,7 +31,17 @@ crate::both_backends!(
     query_filters_by_metadata_exactly,
     query_respects_the_limit,
     query_ranks_most_recent_first,
-    semantic_query_fields_are_all_unsupported,
+    text_search_is_unsupported_without_an_embedding_model,
+    min_score_without_anything_to_score_is_unsupported,
+    a_precomputed_embedding_ranks_without_an_embedding_model,
+    text_search_ranks_by_similarity,
+    min_score_drops_weak_matches,
+    an_unembedded_record_is_absent_from_a_semantic_result,
+    exact_filters_still_apply_to_a_semantic_query,
+    a_semantic_query_reports_a_score_and_an_exact_one_does_not,
+    a_caller_supplied_embedding_is_kept_rather_than_recomputed,
+    a_write_fails_when_the_embedding_model_is_unreachable,
+    capabilities_report_whether_text_search_is_available,
     an_expired_record_is_not_query_visible,
     get_and_delete_ignore_expiry,
     a_record_without_expiry_is_never_swept,
@@ -263,28 +275,282 @@ async fn query_ranks_most_recent_first(backend: Backend) {
     assert!(matches.iter().all(|m| m.score.is_none()));
 }
 
-async fn semantic_query_fields_are_all_unsupported(backend: Backend) {
+async fn text_search_is_unsupported_without_an_embedding_model(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
+
+    let query = MemoryQuery {
+        text: Some("anything".into()),
+        ..Default::default()
+    };
+    let error = store.query(&query, &user("alice")).await.unwrap_err();
+    // Not an empty result and not the most recent records: a store that cannot search says
+    // so, because either fallback would read as a memory that had forgotten.
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+}
+
+async fn min_score_without_anything_to_score_is_unsupported(backend: Backend) {
+    let fixture = backend.open();
+    let store = fixture.store();
+
+    let query = MemoryQuery {
+        min_score: Some(0.5),
+        ..Default::default()
+    };
+    let error = store.query(&query, &user("alice")).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+}
+
+/// Ranking a vector is arithmetic over what is already stored, so it needs no model at all.
+async fn a_precomputed_embedding_ranks_without_an_embedding_model(backend: Backend) {
     let fixture = backend.open();
     let store = fixture.store();
     let cx = user("alice");
 
-    for query in [
-        MemoryQuery {
-            text: Some("anything".into()),
-            ..Default::default()
-        },
-        MemoryQuery {
-            embedding: Some(vec![0.1, 0.2]),
-            ..Default::default()
-        },
-        MemoryQuery {
-            min_score: Some(0.5),
-            ..Default::default()
-        },
-    ] {
-        let error = store.query(&query, &cx).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
-    }
+    let mut near = record("fact", 1);
+    near.embedding = Some(vec![1.0, 0.0]);
+    let mut far = record("fact", 2);
+    far.embedding = Some(vec![-1.0, 0.0]);
+    store.put(near.clone(), &cx).await.unwrap();
+    store.put(far.clone(), &cx).await.unwrap();
+
+    let matches = store
+        .query(
+            &MemoryQuery {
+                embedding: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+            &cx,
+        )
+        .await
+        .unwrap();
+
+    let ids: Vec<_> = matches.iter().map(|matched| matched.record.id).collect();
+    assert_eq!(ids, vec![near.id, far.id]);
+    assert_eq!(matches[0].score, Some(1.0));
+    assert_eq!(matches[1].score, Some(-1.0));
+}
+
+async fn text_search_ranks_by_similarity(backend: Backend) {
+    let embedder = Arc::new(KeywordEmbedder::new());
+    let fixture = backend.embedding(embedder.clone());
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let tea = MemoryRecord::new("fact", json!("alice drinks tea"), Timestamp::from_millis(1));
+    let coffee = MemoryRecord::new(
+        "fact",
+        json!("bob drinks coffee"),
+        Timestamp::from_millis(2),
+    );
+    store.put(tea.clone(), &cx).await.unwrap();
+    store.put(coffee.clone(), &cx).await.unwrap();
+
+    let matches = store
+        .query(
+            &MemoryQuery {
+                text: Some("tea".into()),
+                ..Default::default()
+            },
+            &cx,
+        )
+        .await
+        .unwrap();
+
+    let ids: Vec<_> = matches.iter().map(|matched| matched.record.id).collect();
+    // The coffee record is *newer*, so this is also the assertion that similarity beat
+    // recency rather than agreeing with it by luck.
+    assert_eq!(ids, vec![tea.id, coffee.id]);
+    assert!(
+        matches[0].score.unwrap() > matches[1].score.unwrap(),
+        "{:?}",
+        matches.iter().map(|m| m.score).collect::<Vec<_>>()
+    );
+}
+
+async fn min_score_drops_weak_matches(backend: Backend) {
+    let fixture = backend.embedding(Arc::new(KeywordEmbedder::new()));
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let tea = MemoryRecord::new("fact", json!("alice drinks tea"), Timestamp::from_millis(1));
+    let coffee = MemoryRecord::new(
+        "fact",
+        json!("bob drinks coffee"),
+        Timestamp::from_millis(2),
+    );
+    store.put(tea.clone(), &cx).await.unwrap();
+    store.put(coffee.clone(), &cx).await.unwrap();
+
+    let matches = store
+        .query(
+            &MemoryQuery {
+                text: Some("tea".into()),
+                min_score: Some(0.99),
+                limit: Some(10),
+                ..Default::default()
+            },
+            &cx,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(matches.len(), 1, "{matches:?}");
+    assert_eq!(matches[0].record.id, tea.id);
+}
+
+/// A record nothing measured is not a weak match; it is not a match.
+async fn an_unembedded_record_is_absent_from_a_semantic_result(backend: Backend) {
+    let plain = backend.open();
+    let cx = user("alice");
+    let orphan = MemoryRecord::new("fact", json!("alice drinks tea"), Timestamp::from_millis(1));
+    plain.store().put(orphan.clone(), &cx).await.unwrap();
+
+    // The store the record was written through had no model, so nothing embedded it. Query
+    // it as a vector, which needs no model either.
+    let matches = plain
+        .store()
+        .query(
+            &MemoryQuery {
+                embedding: Some(KeywordEmbedder::vector("tea")),
+                ..Default::default()
+            },
+            &cx,
+        )
+        .await
+        .unwrap();
+    assert!(matches.is_empty(), "{matches:?}");
+
+    // And it is still there, and still findable the exact way.
+    assert!(plain.store().get(&orphan.id, &cx).await.unwrap().is_some());
+    assert_eq!(
+        plain
+            .store()
+            .query(&MemoryQuery::default(), &cx)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+async fn exact_filters_still_apply_to_a_semantic_query(backend: Backend) {
+    let fixture = backend.embedding(Arc::new(KeywordEmbedder::new()));
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let fact = MemoryRecord::new("fact", json!("alice drinks tea"), Timestamp::from_millis(1));
+    let mut preference = MemoryRecord::new(
+        "preference",
+        json!("alice drinks tea"),
+        Timestamp::from_millis(2),
+    );
+    preference
+        .metadata
+        .insert("source".to_owned(), json!("chat"));
+    store.put(fact.clone(), &cx).await.unwrap();
+    store.put(preference.clone(), &cx).await.unwrap();
+
+    let matches = store
+        .query(
+            &MemoryQuery {
+                kinds: vec![preference.kind.clone()],
+                text: Some("tea".into()),
+                ..Default::default()
+            },
+            &cx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].record.id, preference.id);
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("source".to_owned(), json!("chat"));
+    let matches = store
+        .query(
+            &MemoryQuery {
+                metadata,
+                text: Some("tea".into()),
+                ..Default::default()
+            },
+            &cx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].record.id, preference.id);
+}
+
+async fn a_semantic_query_reports_a_score_and_an_exact_one_does_not(backend: Backend) {
+    let fixture = backend.embedding(Arc::new(KeywordEmbedder::new()));
+    let store = fixture.store();
+    let cx = user("alice");
+    store
+        .put(
+            MemoryRecord::new("fact", json!("alice drinks tea"), Timestamp::from_millis(1)),
+            &cx,
+        )
+        .await
+        .unwrap();
+
+    let exact = store.query(&MemoryQuery::default(), &cx).await.unwrap();
+    assert_eq!(exact[0].score, None);
+
+    let semantic = store
+        .query(
+            &MemoryQuery {
+                text: Some("tea".into()),
+                ..Default::default()
+            },
+            &cx,
+        )
+        .await
+        .unwrap();
+    assert!(semantic[0].score.is_some());
+}
+
+async fn a_caller_supplied_embedding_is_kept_rather_than_recomputed(backend: Backend) {
+    let embedder = Arc::new(KeywordEmbedder::new());
+    let fixture = backend.embedding(embedder.clone());
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let mut record = record("fact", 1);
+    record.embedding = Some(vec![0.25, 0.75]);
+    store.put(record.clone(), &cx).await.unwrap();
+
+    assert_eq!(embedder.calls(), 0, "nothing needed embedding");
+    assert_eq!(
+        store.get(&record.id, &cx).await.unwrap().unwrap().embedding,
+        Some(vec![0.25, 0.75])
+    );
+}
+
+/// A record stored without a vector would be invisible to every future search, so the write
+/// fails instead — visibly, now, rather than silently for the life of the record.
+async fn a_write_fails_when_the_embedding_model_is_unreachable(backend: Backend) {
+    let fixture = backend.embedding(Arc::new(BrokenEmbedder));
+    let store = fixture.store();
+    let cx = user("alice");
+
+    let record = record("fact", 1);
+    assert!(store.put(record.clone(), &cx).await.is_err());
+    assert!(
+        store.get(&record.id, &cx).await.unwrap().is_none(),
+        "a refused write must leave nothing behind"
+    );
+}
+
+async fn capabilities_report_whether_text_search_is_available(backend: Backend) {
+    assert!(!backend.open().store().capabilities().semantic_text);
+    assert!(
+        backend
+            .embedding(Arc::new(KeywordEmbedder::new()))
+            .store()
+            .capabilities()
+            .semantic_text
+    );
 }
 
 async fn an_expired_record_is_not_query_visible(backend: Backend) {

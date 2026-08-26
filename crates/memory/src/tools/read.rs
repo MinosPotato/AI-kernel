@@ -32,6 +32,13 @@ pub const DEFAULT_QUERY_PERMISSION: &str = "memory.query";
 /// How many records one [`MemoryQueryTool`] call returns when it does not say.
 pub const DEFAULT_RESULTS: usize = 10;
 
+/// The longest search text [`MemoryQueryTool`] advertises.
+///
+/// A search string is embedded, which costs a model call proportional to its length; a
+/// bound here keeps one over-long query from turning recall into a second inference. It is
+/// generous compared to any real question and small compared to a record.
+pub const MAX_QUERY_TEXT_LENGTH: usize = 1_024;
+
 /// The most records one [`MemoryQueryTool`] call will ever return, whatever it asks for.
 ///
 /// Recall feeds straight back into a model's context, which is the scarcest resource in the
@@ -41,11 +48,11 @@ pub const DEFAULT_MAX_RESULTS: usize = 50;
 
 /// Arguments accepted by [`MemoryQueryTool`].
 ///
-/// `deny_unknown_fields` also does the work of refusing the parts of
-/// [`MemoryQuery`] no store implements yet: a model that asks for `text`, `embedding` or
-/// `min_score` is told those are not arguments of this tool, rather than having the request
-/// travel to the store to come back as
-/// [`Error::Unsupported`](aik_core::Error::Unsupported).
+/// `deny_unknown_fields` refuses everything this tool deliberately does not offer — an
+/// `owner`, and [`MemoryQuery::embedding`], which is a vector no model has and no model
+/// should be asked to produce as JSON. `text` and `min_score` parse here whatever the store
+/// can do, and are refused with a reason when it cannot; the schema is what stops a model
+/// from asking in the first place.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueryInput {
@@ -55,6 +62,10 @@ struct QueryInput {
     metadata: Map<String, Value>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    min_score: Option<f32>,
 }
 
 /// Fetches one memory by id.
@@ -181,9 +192,15 @@ impl Tool for MemoryGetTool {
 /// [`MemoryPutTool`](super::MemoryPutTool) has none: there is nothing to select, and the
 /// scope is not the caller's to choose.
 ///
-/// Matching is exact: the named kinds, and metadata keys that are present and equal.
-/// Ranking is most recent first. Neither store ranks by meaning — see the crate
-/// documentation — so this tool does not offer a search string that would only be ignored.
+/// Kinds and metadata always match exactly. What `text` adds, where the bound store has an
+/// embedding model, is *ranking*: the exact filters still decide which records are eligible,
+/// and similarity decides the order among them and which of them clear `min_score`.
+///
+/// Whether `text` is offered at all is decided by the store, not by this tool: a tool bound
+/// to a store that reports no
+/// [`MemoryCapabilities::semantic_text`](aik_api::memory::MemoryCapabilities::semantic_text)
+/// leaves both arguments out of its schema and refuses them if asked anyway, so a model is
+/// never shown a search it would only be told it cannot have.
 pub struct MemoryQueryTool {
     name: ToolName,
     action: ActionId,
@@ -252,6 +269,68 @@ impl MemoryQueryTool {
         })
     }
 
+    /// Whether the bound store can rank by meaning.
+    ///
+    /// An unbound tool answers `false`: [`Tool::spec`] is called while the registry is being
+    /// built, before this tool's component has bound anything, and a schema is not the place
+    /// to raise a wiring error. Advertising the smaller set until the store is known is the
+    /// conservative direction — it withholds a capability rather than promising one — and by
+    /// the time a model sees a catalogue, the binding is long since filled.
+    fn semantic(&self) -> bool {
+        self.binding
+            .store()
+            .map(|store| store.capabilities().semantic_text)
+            .unwrap_or(false)
+    }
+
+    /// Validates the semantic arguments, then refuses them if the bound store cannot honour
+    /// them.
+    ///
+    /// Shape first, capability second, deliberately: an argument that is malformed is
+    /// malformed whatever the store can do, and checking capability first would report a
+    /// missing embedding model to a caller whose real mistake was a `min_score` of 4.
+    fn check_semantic(&self, input: &QueryInput) -> Result<()> {
+        if let Some(text) = &input.text {
+            if text.trim().is_empty() {
+                return Err(Error::InvalidArgument(
+                    "`text` is empty; omit it to list by kind and metadata instead".to_owned(),
+                ));
+            }
+            // Enforced here and not only advertised in the schema: a schema is what a model
+            // is told, and the arguments are whatever actually arrived. Without this, one
+            // call could hand the embedding model an arbitrarily long input.
+            if text.len() > MAX_QUERY_TEXT_LENGTH {
+                return Err(Error::InvalidArgument(format!(
+                    "`text` must be at most {MAX_QUERY_TEXT_LENGTH} bytes, got {}",
+                    text.len()
+                )));
+            }
+        }
+        if let Some(minimum) = input.min_score {
+            if input.text.is_none() {
+                return Err(Error::InvalidArgument(
+                    "`min_score` filters similarity scores, so it needs a `text` to score \
+                     against"
+                        .to_owned(),
+                ));
+            }
+            if !(-1.0..=1.0).contains(&minimum) {
+                return Err(Error::InvalidArgument(format!(
+                    "`min_score` is a cosine similarity and must be between -1 and 1; got \
+                     {minimum}"
+                )));
+            }
+        }
+        if (input.text.is_some() || input.min_score.is_some()) && !self.semantic() {
+            return Err(Error::InvalidArgument(format!(
+                "`{}` has no `text` or `min_score` argument: the memory store it is bound to \
+                 has no embedding model, so it cannot search by meaning",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     /// The kinds asked for, validated and deduplicated.
     fn kinds(input: &QueryInput) -> Result<Vec<MemoryKind>> {
         let mut kinds = input
@@ -279,32 +358,64 @@ impl MemoryQueryTool {
 #[async_trait]
 impl Tool for MemoryQueryTool {
     fn spec(&self) -> ToolSpec {
+        let semantic = self.semantic();
+        let description = if semantic {
+            "Searches your stored memories. Give `text` to find the memories that mean the \
+             most similar thing, best match first; omit it to list the most recent instead. \
+             Filter either kind of search by `kinds` and by exact `metadata` values. Only \
+             your own memories are searched."
+        } else {
+            "Searches your stored memories, most recent first. Filter by `kinds` and by \
+             exact `metadata` values; omit both to see the most recent of everything you \
+             remember. Only your own memories are searched. Matching is exact, not semantic."
+        };
+
+        let mut properties = json!({
+            "kinds": {
+                "type": "array",
+                "items": { "type": "string", "maxLength": super::MAX_KIND_LENGTH },
+                "description": "Kinds to restrict the search to. Omit for all kinds."
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Metadata keys that must be present and exactly equal."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": self.max_results,
+                "description": "Maximum records to return."
+            }
+        });
+        if semantic {
+            let properties = properties.as_object_mut().expect("an object literal");
+            properties.insert(
+                "text".to_owned(),
+                json!({
+                    "type": "string",
+                    "maxLength": MAX_QUERY_TEXT_LENGTH,
+                    "description": "What to search for. Results are ordered by how close \
+                                    their meaning is to this."
+                }),
+            );
+            properties.insert(
+                "min_score".to_owned(),
+                json!({
+                    "type": "number",
+                    "minimum": -1,
+                    "maximum": 1,
+                    "description": "Drop results less similar than this. Needs `text`. \
+                                    1 is identical, 0 is unrelated."
+                }),
+            );
+        }
+
         ToolSpec {
             name: self.name.clone(),
-            description: "Searches your stored memories, most recent first. Filter by `kinds` \
-                          and by exact `metadata` values; omit both to see the most recent of \
-                          everything you remember. Only your own memories are searched. \
-                          Matching is exact, not semantic."
-                .to_owned(),
+            description: description.to_owned(),
             input_schema: json!({
                 "type": "object",
-                "properties": {
-                    "kinds": {
-                        "type": "array",
-                        "items": { "type": "string", "maxLength": super::MAX_KIND_LENGTH },
-                        "description": "Kinds to restrict the search to. Omit for all kinds."
-                    },
-                    "metadata": {
-                        "type": "object",
-                        "description": "Metadata keys that must be present and exactly equal."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": self.max_results,
-                        "description": "Maximum records to return."
-                    }
-                },
+                "properties": properties,
                 "additionalProperties": false
             }),
             output_schema: Some(json!({
@@ -312,7 +423,13 @@ impl Tool for MemoryQueryTool {
                 "properties": {
                     "count": { "type": "integer" },
                     "limit": { "type": "integer" },
-                    "records": { "type": "array", "items": record_schema() }
+                    "records": { "type": "array", "items": record_schema() },
+                    "scores": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "description": "Similarity of each record, in the same order. \
+                                        Present only for a `text` search."
+                    }
                 },
                 "required": ["count", "limit", "records"],
                 "additionalProperties": false
@@ -351,6 +468,7 @@ impl Tool for MemoryQueryTool {
         cx: &ExecutionContext,
     ) -> Result<ToolOutcome> {
         let input = self.parse(arguments)?;
+        self.check_semantic(&input)?;
         let kinds = Self::kinds(&input)?;
         let limit = self.limit(input.limit)?;
         let store = self.binding.store()?;
@@ -360,9 +478,12 @@ impl Tool for MemoryQueryTool {
             kinds,
             metadata: input.metadata,
             limit: Some(limit),
-            // Left unset deliberately: these tools expose no semantic search, so there is
-            // nothing a caller could have put here. See `QueryInput`.
-            ..MemoryQuery::default()
+            text: input.text,
+            min_score: input.min_score,
+            // Never set from an argument: `embedding` is a raw vector, which is not something
+            // a model has, and accepting one would let a caller search a space the store
+            // never agreed to. See `QueryInput`.
+            embedding: None,
         };
         let matches = store.query(&query, cx).await?;
         let records: Vec<Value> = matches
@@ -370,11 +491,26 @@ impl Tool for MemoryQueryTool {
             .map(|matched| render_record(&matched.record))
             .collect();
 
-        Ok(ToolOutcome::ok(json!({
+        let mut result = json!({
             "count": records.len(),
             "limit": limit,
             "records": records
-        })))
+        });
+        // Scores travel beside the records rather than inside them, because a score belongs
+        // to *this* search and not to the memory: rendering it into the record would make
+        // the same memory look different depending on how it was found.
+        if let Some(scores) = matches
+            .iter()
+            .map(|matched| matched.score)
+            .collect::<Option<Vec<f32>>>()
+        {
+            result
+                .as_object_mut()
+                .expect("an object literal")
+                .insert("scores".to_owned(), json!(scores));
+        }
+
+        Ok(ToolOutcome::ok(result))
     }
 }
 
@@ -424,18 +560,63 @@ mod tests {
     }
 
     #[test]
-    fn semantic_and_owner_arguments_are_refused_outright() {
+    fn a_raw_embedding_and_an_owner_never_parse() {
         let tool = query_tool();
         for arguments in [
-            json!({ "text": "what does alice like?" }),
             json!({ "embedding": [0.1, 0.2] }),
-            json!({ "min_score": 0.5 }),
             json!({ "owner": "alice" }),
             json!({ "principal": "alice" }),
         ] {
             assert!(
                 tool.parse(arguments.clone()).is_err(),
                 "{arguments} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbound_tool_advertises_and_accepts_no_semantic_search() {
+        let tool = query_tool();
+        let schema = tool.spec().input_schema;
+        let properties = schema["properties"].as_object().expect("an object");
+        assert!(!properties.contains_key("text"), "{schema}");
+        assert!(!properties.contains_key("min_score"), "{schema}");
+
+        let input = tool
+            .parse(json!({ "text": "what does alice like?" }))
+            .expect("it parses, and is refused with a reason");
+        let error = tool.check_semantic(&input).expect_err("no embedding model");
+        assert_eq!(error.kind(), aik_core::ErrorKind::InvalidArgument);
+    }
+
+    /// Each case names the phrase its *own* branch produces, so none of them can pass by
+    /// tripping the "no embedding model" refusal that also applies to this unbound tool.
+    #[test]
+    fn a_malformed_semantic_argument_is_refused_on_its_own_terms() {
+        let tool = query_tool();
+        for (arguments, expected) in [
+            (
+                json!({ "text": "tea", "min_score": 1.5 }),
+                "between -1 and 1",
+            ),
+            (
+                json!({ "text": "tea", "min_score": -2.0 }),
+                "between -1 and 1",
+            ),
+            (json!({ "min_score": 0.5 }), "needs a `text`"),
+            (json!({ "text": "   " }), "is empty"),
+            (
+                json!({ "text": "x".repeat(MAX_QUERY_TEXT_LENGTH + 1) }),
+                "at most",
+            ),
+        ] {
+            let input = tool.parse(arguments.clone()).expect("it parses");
+            let error = tool
+                .check_semantic(&input)
+                .expect_err("{arguments} should be refused");
+            assert!(
+                format!("{error}").contains(expected),
+                "{arguments}: expected `{expected}`, got `{error}`"
             );
         }
     }

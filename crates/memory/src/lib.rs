@@ -61,17 +61,58 @@
 //! property of the record, and housekeeping that could only reclaim the records of whoever
 //! happened to trigger it would leave everyone else's expired data on disk indefinitely.
 //!
+//! ## What an embedding model sees
+//!
+//! Configuring one changes where memory content goes. Every record's content is sent to the
+//! [`Embedder`](aik_api::model::Embedder) when it is stored, and every search text when it is
+//! run — so a store wired to a remote embedding service sends it everything anyone remembers,
+//! including whatever the filesystem tools read into a memory. With the workspace's only
+//! `Embedder` that means a local Ollama server by default, and it is a deployment's decision
+//! rather than this crate's: the store is *given* an embedder, and what is behind it is
+//! whatever the kernel published.
+//!
+//! Ownership is unaffected in both directions. Embedding happens before the owner is even
+//! consulted, so it cannot leak one principal's records to another; and similarity ranks the
+//! records a caller may already act for, never widening that set — a semantic query filters
+//! by owner exactly as an exact one does.
+//!
+//! # Searching by meaning
+//!
+//! Both stores rank by similarity, and both do it the same way, because the ranking lives in
+//! one place they share. What differs is only what a given store was *given*:
+//!
+//! * **A pre-computed vector always works.** A
+//!   [`MemoryQuery::embedding`](aik_api::memory::MemoryQuery::embedding) is compared against
+//!   the vectors on the records by cosine similarity, and
+//!   [`MemoryQuery::min_score`](aik_api::memory::MemoryQuery::min_score) drops what falls
+//!   below it. That is arithmetic over what is already stored, so it needs no model at all.
+//! * **Searching by text needs one.** A store built with
+//!   [`InMemoryMemoryStore::with_embedder`] or [`RedbMemoryStore::with_embedder`] embeds
+//!   every record it stores and every
+//!   [`MemoryQuery::text`](aik_api::memory::MemoryQuery::text) it is given. A store without
+//!   one answers text with [`Error::Unsupported`](aik_core::Error::Unsupported) — never with
+//!   the most recent records instead, which would read as a memory that had forgotten rather
+//!   than as one that cannot search — and says so in advance through
+//!   [`MemoryStore::capabilities`](aik_api::memory::MemoryStore::capabilities).
+//!
+//! Three consequences worth knowing before turning it on:
+//!
+//! * A write that cannot embed **fails**. Storing a record with no vector would make it
+//!   invisible to every future search, silently, for as long as it lives.
+//! * Records written before an embedding model was configured keep no vector, and are absent
+//!   from semantic results while remaining exactly retrievable. Nothing back-fills them:
+//!   re-embedding a store is a migration with its own cost.
+//! * Changing the embedding model invalidates every vector already stored. Similarity across
+//!   two models is not defined, so records embedded by the old one are skipped rather than
+//!   compared — see [`MemoryStore::query`](aik_api::memory::MemoryStore::query).
+//!
+//! There is no approximate-nearest-neighbour index behind any of this: a query scans the
+//! records the exact filters already narrowed it to. That is the right shape for a personal
+//! record store and the wrong one for a corpus, and it is the thing to change first if this
+//! ever holds enough records for the scan to show.
+//!
 //! # What this deliberately does not do
 //!
-//! * **It does not rank by meaning.** [`MemoryQuery`](aik_api::memory::MemoryQuery) can
-//!   carry search text or a pre-computed embedding, and [`MemoryRecord`](aik_api::memory::MemoryRecord) can carry one too,
-//!   but nothing here compares them. Semantic retrieval needs an
-//!   [`Embedder`](aik_api::model::Embedder) and an index built for approximate nearest
-//!   neighbours — real infrastructure with its own cost and failure modes, not something to
-//!   bolt on silently. A query that asks for it gets
-//!   [`Error::Unsupported`](aik_core::Error::Unsupported), never a result that quietly
-//!   ignored the request. What both stores answer today is exact: by id, by kind, by
-//!   metadata equality.
 //! * **It does not decide what is worth remembering.** That policy — what to write, when to
 //!   forget it early, how to reconcile two records about the same fact — belongs to whatever
 //!   calls [`MemoryStore::put`](aik_api::memory::MemoryStore::put), not to the store.
@@ -89,6 +130,7 @@ mod expiry;
 mod owner;
 mod persistent;
 mod query;
+mod semantic;
 mod store;
 pub mod tools;
 

@@ -109,6 +109,21 @@ impl Provider {
             Self::Anthropic => aik_anthropic::DEFAULT_COMPONENT_ID,
         })
     }
+
+    /// The component id that publishes this provider's `dyn Embedder`, where it has one.
+    ///
+    /// [`Provider::Anthropic`] has none: the Messages API serves completions and nothing
+    /// else, so there is no endpoint behind which an [`Embedder`](aik_api::model::Embedder)
+    /// could be implemented. A deployment on it can still remember and recall exactly — what
+    /// it cannot do is rank by meaning, and
+    /// [`assemble`](crate::wiring::assemble) says so rather than quietly leaving the setting
+    /// out.
+    pub fn embedder_component_id(self) -> Option<ComponentId> {
+        match self {
+            Self::Ollama => Some(ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID)),
+            Self::Anthropic => None,
+        }
+    }
 }
 
 /// Which filesystem tools a deployment registers.
@@ -410,6 +425,7 @@ struct AgentSection {
     user: Option<String>,
     root: Option<PathBuf>,
     model: Option<String>,
+    embedding_model: Option<String>,
     provider: Option<String>,
     system_prompt: Option<String>,
     exec: ExecSettings,
@@ -559,6 +575,8 @@ pub struct Deployment {
     pub root: Option<PathBuf>,
     /// The model every turn is sent to, overriding `agent.model`.
     pub model: Option<String>,
+    /// The model memories are embedded with, overriding `agent.embedding_model`.
+    pub embedding_model: Option<String>,
     /// The provider that model is asked for, overriding `agent.provider`.
     pub provider: Option<Provider>,
     /// Which filesystem tools to register.
@@ -630,6 +648,12 @@ impl Deployment {
                 .model
                 .clone()
                 .or(section.model)
+                .filter(|model| non_blank(model))
+                .map(ModelId::new),
+            embedding_model: self
+                .embedding_model
+                .clone()
+                .or(section.embedding_model)
                 .filter(|model| non_blank(model))
                 .map(ModelId::new),
             config,
@@ -705,6 +729,20 @@ pub struct RuntimeSettings {
     /// [`first_available_model`](crate::wiring::first_available_model), which needs a running
     /// provider and so cannot happen here.
     pub model: Option<ModelId>,
+    /// The model memories are embedded with, or `None` for no semantic memory.
+    ///
+    /// Setting it is what turns `memory.query`'s `text` argument on: the store embeds every
+    /// record it stores and every search it is given, and ranks by how close the two are.
+    /// It is deliberately a *separate* setting from [`RuntimeSettings::model`] rather than
+    /// being derived from it — an embedding model is a different model, usually a much
+    /// smaller one, and asking a chat model to embed produces either an error or a vector
+    /// nobody should be searching on.
+    ///
+    /// Unlike [`RuntimeSettings::model`] there is no resolution at startup for `None`: an
+    /// embedding model that a deployment did not choose is one whose vectors it would be
+    /// stuck with, because changing it later makes every record stored under the old one
+    /// unsearchable.
+    pub embedding_model: Option<ModelId>,
     /// The whole configuration tree, handed to the kernel.
     pub config: Config,
     /// Which provider serves that model.
@@ -741,6 +779,7 @@ impl RuntimeSettings {
             jobs: JobExecution::default(),
             system_prompt: None,
             model: None,
+            embedding_model: None,
             config: Config::default(),
             provider: Provider::default(),
             model_component: Provider::default().component_id(),

@@ -593,6 +593,7 @@ a host process over one database cannot describe two different assistants:
 | `agent.root` | the working directory | The confinement root, for files and for programs |
 | `agent.provider` | `ollama` | Which model provider answers: `ollama` or `anthropic` |
 | `agent.model` | the provider's first model | The model every turn is sent to |
+| `agent.embedding_model` | none | Embed memories with this, so `memory.query` can search by meaning; needs the `ollama` provider |
 | `agent.exec.programs` | none | The bare program names `aik-exec` will run |
 | `agent.exec.writable` | `false` | Whether a program may write to the root |
 | `agent.exec.network` | `false` | Whether a program has a network |
@@ -646,10 +647,20 @@ description of Ollama, and the first credential in the workspace — held in a t
 print it, resolved from a location configuration names rather than from configuration itself,
 and refused outright over a transport that is not `https`.
 
-What is genuinely not built yet: semantic memory (`aik-memory` has no `Embedder` behind it),
-context summarisation, and any platform integration at all. `aik-scheduler` now defines a
-cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an
-expression that does not parse in it, not the concept.
+Semantic memory is the newest of these, and the first capability assembled out of two
+subsystems rather than added to one: `aik-ollama` implements `Embedder` over `/api/embed`, and
+a memory store given one embeds every record it stores and every search it is handed, ranking
+by cosine similarity instead of by recency. Set `agent.embedding_model` — or pass
+`--embedding-model` — and `memory.query` gains a `text` argument the model can actually use;
+leave it unset and everything behaves exactly as before. The refusals are the interesting
+part: a store with no embedder answers `text` with `Unsupported` rather than quietly returning
+the newest records, a write that cannot embed fails rather than storing a record no search
+will ever find, and a provider with no embeddings endpoint fails at startup rather than
+serving a memory that silently never searches.
+
+What is genuinely not built yet: context summarisation, and any platform integration at all.
+`aik-scheduler` now defines a cron dialect of its own — five-field, UTC, `cron(5)`-compatible
+— and refuses only an expression that does not parse in it, not the concept.
 
 The full pipeline — filesystem confinement, policy evaluation, human approval, tool exposure
 narrowing, verbose auditing, and the CLI's own error and session handling — has been manually
@@ -658,7 +669,7 @@ exercised end to end against a real Ollama server, not only through the automate
 covered, the two bugs it found and fixed, and the token/context cost baseline it produced.
 `docs/CLI.md`'s [limitations sections](docs/CLI.md#other-known-limitations-not-bugs) separate
 what is a genuine defect from what is a documented, deliberate property of the current
-implementation (no summarisation, no semantic memory, a heuristic token counter, an unclosed
+implementation (no summarisation, a heuristic token counter, an unclosed
 filesystem TOCTOU window bounded but not eliminated by handle-pinning). `aik-exec` documents
 its own such property in the crate: it installs no seccomp filter, so a sandboxed child is
 separated from the host by namespaces and mount visibility rather than by a syscall policy,

@@ -1,8 +1,9 @@
 //! An Ollama model provider for the AI kernel.
 //!
-//! This crate is the first real implementation of an [`aik_api::model::ModelProvider`]. It
-//! exists to prove that the kernel architecture can host one cleanly — nothing about
-//! Ollama, HTTP, or its JSON wire format leaks outside this crate.
+//! This crate is the first real implementation of an [`aik_api::model::ModelProvider`], and
+//! the only implementation of [`aik_api::model::Embedder`]. It exists to prove that the
+//! kernel architecture can host one cleanly — nothing about Ollama, HTTP, or its JSON wire
+//! format leaks outside this crate.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -39,8 +40,8 @@
 //! | Module | Responsibility |
 //! |---|---|
 //! | [`settings`] | [`OllamaSettings`] — endpoint and timeout, read from kernel configuration |
-//! | [`provider`] | [`OllamaProvider`] — the `ModelProvider` implementation |
-//! | [`component`] | [`OllamaComponent`] — registers the provider into a kernel |
+//! | [`provider`] | [`OllamaProvider`] — the `ModelProvider` and `Embedder` implementation |
+//! | [`component`] | [`OllamaComponent`] — registers the provider into a kernel, under both |
 //! | `protocol` (private) | Ollama's JSON wire format and its translation to `aik_api::model` |
 //! | `deadline` (private) | Combines the configured timeout and a request's own deadline |
 //! | `stream` (private) | Parses Ollama's newline-delimited JSON stream |
@@ -74,6 +75,23 @@
 //! * **Not every model can call tools.** Ollama reports a `tools` capability per model, and
 //!   one without it answers in prose instead. That is a model's choice rather than a provider
 //!   failure, so nothing here treats it as an error.
+//!
+//! # Embeddings
+//!
+//! [`OllamaProvider`] also implements [`Embedder`](aik_api::model::Embedder), over
+//! `/api/embed`, which is what makes semantic memory possible in this workspace:
+//! [`aik_memory`](https://docs.rs/aik-memory) embeds a record when it stores it and a search
+//! when it runs one, through whichever `dyn Embedder` the kernel published.
+//! [`OllamaComponent`] publishes one instance under both capabilities, since one server
+//! answers both.
+//!
+//! An embedding model is a *different model* from a chat model — usually a much smaller one,
+//! `nomic-embed-text` or similar — and is named per call, so one provider serves both without
+//! any of that being configuration. Two properties are enforced here rather than assumed of
+//! the server: a batch comes back with one vector per input, in input order, and every vector
+//! in it is the same width. A response that breaks either is an error, because a misaligned
+//! batch would put one memory's vector on another memory's record and stay wrong for as long
+//! as the record lives.
 //!
 //! Ollama assembles tool calls server-side and emits them complete, so
 //! [`ModelProvider::stream`](aik_api::model::ModelProvider::stream) yields whole

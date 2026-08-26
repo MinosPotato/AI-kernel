@@ -9,7 +9,8 @@
 //! [`MemoryQuery`] supports lookup by kind, by metadata and by semantic similarity, since
 //! any real store will need all three; a backend that cannot do one of them should say so
 //! with [`Error::Unsupported`](aik_core::Error::Unsupported) rather than silently ignore
-//! it.
+//! it, and should report which ones it has through [`MemoryCapabilities`] so a caller can
+//! ask instead of finding out by being refused.
 //!
 //! # Records are owned
 //!
@@ -144,6 +145,35 @@ pub struct MemoryMatch {
     pub score: Option<f32>,
 }
 
+/// What a store can do beyond exact retrieval.
+///
+/// A caller that has to *ask* rather than try is one that can present the right options
+/// without spending a failed round trip discovering which ones exist — which is what the
+/// memory tools do with it, so a model is never offered a search it would only be refused.
+/// Everything not listed here is required of every store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MemoryCapabilities {
+    /// Whether [`MemoryQuery::text`] is honoured.
+    ///
+    /// Turning text into a vector needs an [`Embedder`](crate::model::Embedder), which is a
+    /// model and therefore something a store is *given* rather than something it has. A
+    /// store without one still ranks a [`MemoryQuery::embedding`] the caller computed
+    /// itself: that is arithmetic over what is already stored.
+    pub semantic_text: bool,
+}
+
+impl MemoryCapabilities {
+    /// Reports whether the store honours [`MemoryQuery::text`].
+    ///
+    /// A constructor rather than a struct literal, because the type is
+    /// `#[non_exhaustive]`: a store outside this crate must keep compiling when a capability
+    /// is added, and must get the conservative answer for the one it has never heard of.
+    pub fn new(semantic_text: bool) -> Self {
+        Self { semantic_text }
+    }
+}
+
 /// Somewhere memories live.
 ///
 /// # Ownership
@@ -182,5 +212,27 @@ pub trait MemoryStore: Send + Sync + 'static {
     /// Only records the caller may act for are considered. Another principal's records are
     /// absent from the results rather than an error, so a query cannot be used to discover
     /// that they exist.
+    ///
+    /// # Semantic queries
+    ///
+    /// A query carrying [`MemoryQuery::embedding`] or [`MemoryQuery::text`] asks for
+    /// similarity ranking, and [`MemoryMatch::score`] must then be populated for every
+    /// result. [`MemoryQuery::min_score`] drops results below it, and is
+    /// [`Error::Unsupported`](aik_core::Error::Unsupported) on a query that asks for no
+    /// score at all, because there would be nothing to compare it against.
+    ///
+    /// A store that does not report
+    /// [`MemoryCapabilities::semantic_text`] must refuse [`MemoryQuery::text`] with
+    /// [`Error::Unsupported`](aik_core::Error::Unsupported) rather than fall back to
+    /// returning the most recent records — a silent fallback would answer a question nobody
+    /// asked, and read as an empty memory rather than as a missing capability.
     async fn query(&self, query: &MemoryQuery, cx: &ExecutionContext) -> Result<Vec<MemoryMatch>>;
+
+    /// What this store can do beyond exact retrieval.
+    ///
+    /// Defaults to the minimum every store must implement, so adding a capability never
+    /// breaks an existing implementation.
+    fn capabilities(&self) -> MemoryCapabilities {
+        MemoryCapabilities::default()
+    }
 }

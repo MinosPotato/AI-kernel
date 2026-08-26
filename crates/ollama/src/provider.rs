@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::model::{
-    CompletionChunk, CompletionRequest, CompletionResponse, ModelDescriptor, ModelProvider,
+    CompletionChunk, CompletionRequest, CompletionResponse, Embedder, ModelDescriptor, ModelId,
+    ModelProvider,
 };
 use aik_core::Result;
 use aik_core::clock::SharedClock;
@@ -14,7 +15,8 @@ use futures_core::stream::BoxStream;
 use crate::deadline::{Deadline, race};
 use crate::http::{ensure_success, map_reqwest_error};
 use crate::protocol::{
-    ChatResponseLine, TagsResponse, build_chat_request, convert_response, convert_tags,
+    ChatResponseLine, EmbedRequest, EmbedResponse, TagsResponse, build_chat_request,
+    convert_embeddings, convert_response, convert_tags,
 };
 use crate::settings::OllamaSettings;
 use crate::stream::ndjson_chunks;
@@ -133,6 +135,52 @@ impl ModelProvider for OllamaProvider {
             cx.cancellation.clone(),
             deadline,
         )))
+    }
+}
+
+#[async_trait]
+impl Embedder for OllamaProvider {
+    /// Embeds a batch in one `/api/embed` call, under the same deadline and cancellation
+    /// rules as a completion.
+    ///
+    /// An empty batch is answered without a request: there is nothing to ask a server, and a
+    /// round trip that can only return an empty list is one a caller should not pay for.
+    /// Vectors come back in input order, which this verifies against the request rather than
+    /// assumes: a batch whose length or vector widths do not line up is an error, not a
+    /// guess about which input each vector belongs to.
+    async fn embed(
+        &self,
+        model: &ModelId,
+        inputs: &[String],
+        cx: &ExecutionContext,
+    ) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let deadline = self.deadline(cx);
+        let client = self.client.clone();
+        let url = self.url("api/embed");
+        let model = model.as_str().to_owned();
+        let inputs = inputs.to_vec();
+        let expected = inputs.len();
+
+        let attempt = async move {
+            let wire = EmbedRequest {
+                model: &model,
+                input: &inputs,
+            };
+            let response = client.post(url).json(&wire).send().await.map_err(|error| {
+                map_reqwest_error("sending an embedding request to Ollama", error)
+            })?;
+            let response = ensure_success(response).await?;
+            let body: EmbedResponse = response.json().await.map_err(|error| {
+                map_reqwest_error("decoding the Ollama embedding response", error)
+            })?;
+            convert_embeddings(body, expected)
+        };
+
+        race(attempt, &cx.cancellation, deadline).await
     }
 }
 

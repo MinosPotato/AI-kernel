@@ -14,11 +14,25 @@ mod support;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::memory::{MemoryId, MemoryQuery};
+use aik_api::tool::Tool;
 use aik_core::ErrorKind;
 use aik_core::clock::Timestamp;
 use serde_json::json;
 use std::time::Duration;
 use support::{Backend, ToolKernel, agent_for, invoke, output, user};
+
+/// The argument names a `memory.query` spec offers a model.
+fn offered_arguments(tool: &aik_memory::MemoryQueryTool) -> Vec<String> {
+    let schema = tool.spec().input_schema;
+    let mut names: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("an object schema")
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
 
 /// The id a `memory.put` outcome reported.
 fn stored_id(output: &serde_json::Value) -> MemoryId {
@@ -528,7 +542,142 @@ crate::both_backends!(
     recall_is_capped_however_much_it_asks_for,
     metadata_filters_match_exactly,
     a_call_whose_context_has_expired_touches_nothing,
+    without_an_embedding_model_no_search_is_offered_and_none_is_accepted,
+    with_an_embedding_model_a_search_is_offered_and_ranks_by_meaning,
+    a_search_still_obeys_the_kind_filter_and_the_result_cap,
+    a_score_floor_narrows_a_search,
+    a_search_scopes_to_the_caller_like_every_other_recall,
 );
+
+async fn without_an_embedding_model_no_search_is_offered_and_none_is_accepted(backend: Backend) {
+    let kernel = backend.open_tools().await;
+    let query = &kernel.tools().query;
+
+    assert_eq!(offered_arguments(query), ["kinds", "limit", "metadata"]);
+    assert!(
+        !query.spec().description.contains("similar"),
+        "a store that cannot search by meaning must not describe itself as able to"
+    );
+
+    remember(&kernel, "alice", "fact", json!("alice drinks tea")).await;
+    let error = invoke(query, json!({ "text": "tea" }), &user("alice"))
+        .await
+        .expect_err("the argument does not exist for this store");
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument, "{error}");
+
+    // And an ordinary recall still works, so the refusal is about the argument and not about
+    // the tool being broken.
+    let listed = output(query, json!({}), &user("alice")).await;
+    assert_eq!(listed["count"], 1);
+    assert!(listed.get("scores").is_none(), "{listed}");
+
+    kernel.shutdown().await;
+}
+
+async fn with_an_embedding_model_a_search_is_offered_and_ranks_by_meaning(backend: Backend) {
+    let kernel = backend.open_semantic_tools().await;
+    let query = &kernel.tools().query;
+
+    assert_eq!(
+        offered_arguments(query),
+        ["kinds", "limit", "metadata", "min_score", "text"]
+    );
+
+    let tea = remember(&kernel, "alice", "fact", json!("alice drinks tea")).await;
+    let coffee = remember(&kernel, "alice", "fact", json!("bob drinks coffee")).await;
+
+    let found = output(query, json!({ "text": "tea" }), &user("alice")).await;
+    assert_eq!(found["count"], 2);
+    let ids: Vec<&str> = found["records"]
+        .as_array()
+        .expect("an array of records")
+        .iter()
+        .map(|record| record["id"].as_str().expect("an id"))
+        .collect();
+    // Stored second, so ranking by recency would have put it first.
+    assert_eq!(ids, vec![tea.to_string(), coffee.to_string()]);
+
+    let scores = found["scores"].as_array().expect("a score per record");
+    assert_eq!(scores.len(), 2);
+    assert!(
+        scores[0].as_f64().expect("a number") > scores[1].as_f64().expect("a number"),
+        "{scores:?}"
+    );
+
+    kernel.shutdown().await;
+}
+
+async fn a_search_still_obeys_the_kind_filter_and_the_result_cap(backend: Backend) {
+    let kernel = backend.open_semantic_tools().await;
+    let query = &kernel.tools().query;
+
+    remember(&kernel, "alice", "fact", json!("alice drinks tea")).await;
+    let preference = remember(&kernel, "alice", "preference", json!("alice drinks tea")).await;
+
+    let found = output(
+        query,
+        json!({ "text": "tea", "kinds": ["preference"] }),
+        &user("alice"),
+    )
+    .await;
+    assert_eq!(found["count"], 1);
+    assert_eq!(found["records"][0]["id"], preference.to_string());
+
+    let capped = output(query, json!({ "text": "tea", "limit": 1 }), &user("alice")).await;
+    assert_eq!(capped["count"], 1);
+    assert_eq!(
+        capped["scores"]
+            .as_array()
+            .expect("a score per record")
+            .len(),
+        1,
+        "the scores must stay aligned with the records the limit kept"
+    );
+
+    kernel.shutdown().await;
+}
+
+async fn a_score_floor_narrows_a_search(backend: Backend) {
+    let kernel = backend.open_semantic_tools().await;
+    let query = &kernel.tools().query;
+
+    let tea = remember(&kernel, "alice", "fact", json!("alice drinks tea")).await;
+    remember(&kernel, "alice", "fact", json!("bob drinks coffee")).await;
+
+    let found = output(
+        query,
+        json!({ "text": "tea", "min_score": 0.99 }),
+        &user("alice"),
+    )
+    .await;
+    assert_eq!(found["count"], 1);
+    assert_eq!(found["records"][0]["id"], tea.to_string());
+
+    for arguments in [
+        json!({ "min_score": 0.5 }),
+        json!({ "text": "tea", "min_score": 4.0 }),
+    ] {
+        let error = invoke(query, arguments.clone(), &user("alice"))
+            .await
+            .expect_err("{arguments} should be refused");
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument, "{arguments}");
+    }
+
+    kernel.shutdown().await;
+}
+
+/// Similarity ranks; it does not widen. Another principal's memories are no more reachable
+/// through a search than through a listing.
+async fn a_search_scopes_to_the_caller_like_every_other_recall(backend: Backend) {
+    let kernel = backend.open_semantic_tools().await;
+    let query = &kernel.tools().query;
+
+    remember(&kernel, "alice", "fact", json!("alice drinks tea")).await;
+    let found = output(query, json!({ "text": "tea" }), &user("bob")).await;
+    assert_eq!(found["count"], 0, "{found}");
+
+    kernel.shutdown().await;
+}
 
 /// A restart is where the two backends are *supposed* to differ, so it is the one suite
 /// written against each of them explicitly rather than through the shared macro.

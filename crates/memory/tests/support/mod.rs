@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::memory::MemoryStore;
+use aik_api::model::{Embedder, ModelId};
 use aik_api::permission::{Principal, PrincipalKind};
 use aik_core::Clock;
 use aik_core::clock::{ManualClock, Timestamp};
@@ -32,6 +33,46 @@ impl Backend {
     /// Opens a store with a manual clock stopped at the epoch.
     pub(crate) fn open(self) -> Fixture {
         self.at(Timestamp::EPOCH)
+    }
+
+    /// Opens a store wired to `embedder`, so semantic behaviour is exercised on both
+    /// backends the same way every other behaviour is.
+    pub(crate) fn embedding(self, embedder: Arc<dyn Embedder>) -> Fixture {
+        let clock = Arc::new(ManualClock::new(Timestamp::EPOCH));
+        match self {
+            Self::Memory => {
+                let concrete = Arc::new(
+                    InMemoryMemoryStore::new()
+                        .with_clock(clock.clone())
+                        .with_embedder(embedder, TEST_EMBEDDING_MODEL),
+                );
+                Fixture {
+                    store: Some(concrete.clone()),
+                    sweeper: Some(concrete),
+                    clock,
+                    directory: None,
+                    path: None,
+                }
+            }
+            Self::Redb => {
+                let directory = tempfile::tempdir().expect("a temporary directory");
+                let path = directory.path().join("aik.redb");
+                let db = Arc::new(Db::open(&path).expect("the database opens"));
+                let concrete = Arc::new(
+                    RedbMemoryStore::new(db)
+                        .expect("the memory tables are created")
+                        .with_clock(clock.clone())
+                        .with_embedder(embedder, TEST_EMBEDDING_MODEL),
+                );
+                Fixture {
+                    store: Some(concrete.clone()),
+                    sweeper: Some(concrete),
+                    clock,
+                    directory: Some(directory),
+                    path: Some(path),
+                }
+            }
+        }
     }
 
     /// Opens a store with a manual clock stopped at `start`.
@@ -148,6 +189,79 @@ pub(crate) fn open_redb(
     (concrete.clone(), concrete)
 }
 
+/// The model name the test embedders answer to.
+pub(crate) const TEST_EMBEDDING_MODEL: &str = "test-embed";
+
+/// The words [`KeywordEmbedder`] gives a dimension to.
+const KEYWORDS: [&str; 4] = ["tea", "coffee", "rust", "cat"];
+
+/// A deterministic stand-in for a real embedding model.
+///
+/// One dimension per keyword, counting occurrences, plus a constant dimension so that text
+/// containing no keyword still has a direction — a zero vector is *incomparable* rather than
+/// dissimilar, and a fixture that produced them would be testing the wrong thing.
+///
+/// Deterministic on purpose: the same text embeds to the same vector in every run and on
+/// both backends, so a similarity assertion is an assertion about the store's ranking rather
+/// than about a model's mood.
+#[derive(Debug, Default)]
+pub(crate) struct KeywordEmbedder {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl KeywordEmbedder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many inputs it has been asked to embed, for tests about when a model is called.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The vector a given text embeds to, for building a query without a store.
+    pub(crate) fn vector(text: &str) -> Vec<f32> {
+        let lowered = text.to_lowercase();
+        let mut vector: Vec<f32> = KEYWORDS
+            .iter()
+            .map(|keyword| lowered.matches(keyword).count() as f32)
+            .collect();
+        vector.push(1.0);
+        vector
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for KeywordEmbedder {
+    async fn embed(
+        &self,
+        _model: &ModelId,
+        inputs: &[String],
+        _cx: &ExecutionContext,
+    ) -> aik_core::Result<Vec<Vec<f32>>> {
+        self.calls
+            .fetch_add(inputs.len(), std::sync::atomic::Ordering::Relaxed);
+        Ok(inputs.iter().map(|input| Self::vector(input)).collect())
+    }
+}
+
+/// An embedder that is always unreachable, for asserting what a store does when the model
+/// it depends on is down.
+#[derive(Debug, Default)]
+pub(crate) struct BrokenEmbedder;
+
+#[async_trait::async_trait]
+impl Embedder for BrokenEmbedder {
+    async fn embed(
+        &self,
+        _model: &ModelId,
+        _inputs: &[String],
+        _cx: &ExecutionContext,
+    ) -> aik_core::Result<Vec<Vec<f32>>> {
+        Err(aik_core::Error::other("the embedding model is unreachable"))
+    }
+}
+
 /// A context acting as a named user.
 pub(crate) fn user(id: &str) -> ExecutionContext {
     ExecutionContext::new().with_principal(Principal::new(id, PrincipalKind::User))
@@ -202,6 +316,7 @@ pub(crate) struct ToolKernel {
     tools: Option<Tools>,
     clock: Arc<ManualClock>,
     backend: Backend,
+    semantic: bool,
     directory: Option<TempDir>,
     path: Option<PathBuf>,
 }
@@ -224,9 +339,42 @@ pub(crate) struct Tools {
     pub(crate) delete: aik_memory::MemoryDeleteTool,
 }
 
+/// The component id [`TestEmbedderComponent`] publishes under.
+pub(crate) const TEST_EMBEDDER_COMPONENT: &str = "model.test-embedder";
+
+/// Publishes a [`KeywordEmbedder`] as a kernel component, the way a real provider component
+/// publishes a real one.
+///
+/// The memory component resolves its embedder *by component name*, so a fixture that handed
+/// the store an embedder directly would skip the very wiring the semantic path depends on.
+#[derive(Debug, Default)]
+pub(crate) struct TestEmbedderComponent;
+
+#[async_trait::async_trait]
+impl aik_core::Component for TestEmbedderComponent {
+    fn descriptor(&self) -> aik_core::ComponentDescriptor {
+        aik_core::ComponentDescriptor::new(aik_core::ComponentId::new(TEST_EMBEDDER_COMPONENT))
+            .described("a deterministic embedder for tests")
+    }
+
+    async fn init(&self, ctx: &aik_core::ComponentContext) -> aik_core::Result<()> {
+        ctx.provide::<dyn Embedder>(Arc::new(KeywordEmbedder::new()))
+    }
+}
+
 impl Backend {
+    /// Starts a kernel with this backend, an embedding model, and a manual clock stopped at
+    /// the epoch.
+    pub(crate) async fn open_semantic_tools(self) -> ToolKernel {
+        self.start_tools(true).await
+    }
+
     /// Starts a kernel with this backend and a manual clock stopped at the epoch.
     pub(crate) async fn open_tools(self) -> ToolKernel {
+        self.start_tools(false).await
+    }
+
+    async fn start_tools(self, semantic: bool) -> ToolKernel {
         let clock = Arc::new(ManualClock::new(Timestamp::EPOCH));
         let (directory, path) = match self {
             Self::Memory => (None, None),
@@ -236,12 +384,14 @@ impl Backend {
                 (Some(directory), Some(path))
             }
         };
-        let (kernel, tools) = start_tool_kernel(self, clock.clone(), path.as_deref()).await;
+        let (kernel, tools) =
+            start_tool_kernel(self, clock.clone(), path.as_deref(), semantic).await;
         ToolKernel {
             kernel: Some(kernel),
             tools: Some(tools),
             clock,
             backend: self,
+            semantic,
             directory,
             path,
         }
@@ -285,8 +435,13 @@ impl ToolKernel {
         // to open the very file it is restarting on.
         drop(kernel);
         drop(self.tools.take());
-        let (kernel, tools) =
-            start_tool_kernel(self.backend, self.clock.clone(), self.path.as_deref()).await;
+        let (kernel, tools) = start_tool_kernel(
+            self.backend,
+            self.clock.clone(),
+            self.path.as_deref(),
+            self.semantic,
+        )
+        .await;
         self.kernel = Some(kernel);
         self.tools = Some(tools);
     }
@@ -306,6 +461,7 @@ async fn start_tool_kernel(
     backend: Backend,
     clock: Arc<ManualClock>,
     path: Option<&Path>,
+    semantic: bool,
 ) -> (aik_core::Kernel, Tools) {
     use aik_core::prelude::*;
 
@@ -319,11 +475,30 @@ async fn start_tool_kernel(
 
     let builder = Kernel::builder().clock(clock);
     let builder = match backend {
-        Backend::Memory => builder.component(aik_memory::MemoryComponent::new()),
-        Backend::Redb => builder
-            .config(store_config(path.expect("a persistent backend has a path")))
-            .component(aik_store::StoreComponent::new())
-            .component(aik_memory::RedbMemoryComponent::new()),
+        Backend::Memory => {
+            let store = aik_memory::MemoryComponent::new();
+            builder.component(if semantic {
+                store.with_embedder(TEST_EMBEDDER_COMPONENT, TEST_EMBEDDING_MODEL)
+            } else {
+                store
+            })
+        }
+        Backend::Redb => {
+            let store = aik_memory::RedbMemoryComponent::new();
+            builder
+                .config(store_config(path.expect("a persistent backend has a path")))
+                .component(aik_store::StoreComponent::new())
+                .component(if semantic {
+                    store.with_embedder(TEST_EMBEDDER_COMPONENT, TEST_EMBEDDING_MODEL)
+                } else {
+                    store
+                })
+        }
+    };
+    let builder = if semantic {
+        builder.component(TestEmbedderComponent)
+    } else {
+        builder
     };
     let kernel = builder
         .component(component)

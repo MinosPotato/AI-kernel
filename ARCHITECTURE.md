@@ -41,7 +41,7 @@ AI-kernel/
 │  ├─ approval/ → aik-approval : a human-in-the-loop ApprovalSink
 │  ├─ context/  → aik-context  : a durable transcript and budgeted model windows
 │  ├─ store/    → aik-store    : the shared redb database backing context and memory
-│  ├─ memory/   → aik-memory   : a persistent record store, retrieved by kind and metadata
+│  ├─ memory/   → aik-memory   : a persistent record store, retrieved by kind, metadata or meaning
 │  ├─ scheduler/→ aik-scheduler: time- and event-triggered jobs, optionally durable
 │  ├─ agent/    → aik-agent    : the agent loop tying every capability above together
 │  ├─ runtime/  → aik-runtime  : system assembly — settings in, wired kernel out
@@ -178,10 +178,10 @@ every "Implemented by" column below is a separate crate.
 | Module       | Contract                                                              | Implemented by |
 |--------------|------------------------------------------------------------------------|----------------|
 | `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     | — (a plain value type, not a trait) |
-| `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (`ModelProvider`; no `Embedder` yet) |
+| `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (both), `aik-anthropic` (`ModelProvider`) |
 | `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
-| `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query is `Unsupported`) |
+| `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query needs an `Embedder`) |
 | `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               | `aik-policy` (`PolicyEngine`), `aik-approval` (`ApprovalSink`) |
 | `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) | `aik-scheduler` |
 | `agent`      | `Agent`, sessions, streaming updates                                   | `aik-agent` (`AgentLoop`) |
@@ -194,6 +194,13 @@ just a plan for one — `scheduler` gained an `ExecutionContext` on every method
 owner, precisely because building it showed that a schedule nobody owns cannot be isolated.
 `platform` remains a shape with no implementation yet, deliberately not built ahead of the
 evidence that would justify one.
+
+`Embedder` is the most recent of these to acquire an implementation, and it is worth noting
+what that cost: nothing in `aik-api` changed shape, because the contract already said what an
+embedder was. `aik-memory` gained an optional collaborator and `MemoryStore` gained a
+`capabilities()` method with a default, so a store that cannot rank by meaning still compiles
+and still says so — which is the same "refuse, never silently degrade" rule the rest of the
+contract layer is written to.
 
 ## What deliberately is not in the kernel
 
