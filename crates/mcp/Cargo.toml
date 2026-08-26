@@ -1,0 +1,28 @@
+[package]
+name = "aik-mcp"
+description = "A Model Context Protocol client for the AI kernel: external tool servers exposed as a ToolCatalog, behind the same policy and approval gate as native tools."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aik-core.workspace = true
+aik-api.workspace = true
+aik-exec.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util"] }
+tempfile.workspace = true
+aik-policy.workspace = true
+aik-tools.workspace = true

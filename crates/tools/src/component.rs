@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ApprovalSink, PolicyEngine};
-use aik_api::tool::{Tool, ToolRegistry};
+use aik_api::tool::{Tool, ToolCatalog, ToolRegistry};
 use aik_core::prelude::*;
 
 use crate::registry::InProcessToolRegistry;
@@ -31,6 +32,7 @@ pub struct ToolsComponent {
     id: ComponentId,
     default: bool,
     tools: Vec<Arc<dyn Tool>>,
+    catalogs: Vec<Arc<dyn ToolCatalog>>,
     policy: Option<Arc<dyn PolicyEngine>>,
     approvals: Option<Arc<dyn ApprovalSink>>,
 }
@@ -47,6 +49,7 @@ impl std::fmt::Debug for ToolsComponent {
             .field("id", &self.id)
             .field("default", &self.default)
             .field("tools", &names)
+            .field("catalogs", &self.catalogs.len())
             .field("policy_configured", &self.policy.is_some())
             .field("approvals_configured", &self.approvals.is_some())
             .finish()
@@ -70,6 +73,7 @@ impl ToolsComponent {
             id: ComponentId::new(DEFAULT_COMPONENT_ID),
             default: true,
             tools: Vec::new(),
+            catalogs: Vec::new(),
             policy: None,
             approvals: None,
         }
@@ -93,6 +97,29 @@ impl ToolsComponent {
     #[must_use]
     pub fn with_tool(mut self, tool: impl Tool) -> Self {
         self.tools.push(Arc::new(tool));
+        self
+    }
+
+    /// Adds every tool a catalogue offers.
+    ///
+    /// The tools a [`ToolCatalog`] contributes are discovered rather than written down —
+    /// an external server is asked, at `init`, what it serves — so they cannot be supplied
+    /// through [`ToolsComponent::with_tool`], which needs the value up front. What does not
+    /// change is when registration happens: the catalogue is drained once, during `init`,
+    /// before anything holds an `Arc<dyn ToolRegistry>`, so the set of tools is still frozen
+    /// by the time it is reachable. There is no path that adds a tool to a registry that is
+    /// already in use.
+    ///
+    /// A catalogue that cannot be listed is a startup failure, not an empty contribution. A
+    /// deployment that configured an external tool source and got none of it would be one
+    /// whose model quietly cannot do what the operator believes it can, and the kernel not
+    /// starting is the smaller problem. The same goes for a name collision: a catalogue
+    /// offering a tool that is already registered — under a native tool's name, or another
+    /// catalogue's — is refused by [`InProcessToolRegistry::register_arc`], so nothing can
+    /// shadow `fs.write`.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Arc<dyn ToolCatalog>) -> Self {
+        self.catalogs.push(catalog);
         self
     }
 
@@ -134,6 +161,24 @@ impl Component for ToolsComponent {
             registry.register_arc(tool.clone())?;
         }
 
+        // Catalogues after the tools this deployment wrote itself, so that a collision is
+        // always the catalogue's to lose: a native tool is never displaced by a discovered
+        // one, whichever order they were configured in.
+        //
+        // The context is a plain root one rather than anything a caller supplied, because
+        // there is no caller — this is the kernel starting up, acting as itself. Listing is
+        // not authorized in any case: knowing a tool exists is not being allowed to use it.
+        let cx = ExecutionContext::new();
+        for catalog in &self.catalogs {
+            for spec in catalog.list(&cx).await? {
+                let tool = catalog
+                    .get(&spec.name, &cx)
+                    .await?
+                    .ok_or_else(|| Error::not_found("tool", &spec.name))?;
+                registry.register_arc(Arc::from(tool))?;
+            }
+        }
+
         let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
         if self.default {
             ctx.provide_default::<dyn ToolRegistry>(registry)
@@ -162,12 +207,97 @@ mod tests {
         }
     }
 
+    /// A catalogue offering exactly the tools it was built from.
+    struct FixedCatalog(Vec<&'static str>);
+
+    #[async_trait]
+    impl ToolCatalog for FixedCatalog {
+        async fn list(&self, _cx: &ExecutionContext) -> Result<Vec<aik_api::tool::ToolSpec>> {
+            Ok(self
+                .0
+                .iter()
+                .map(|name| aik_api::tool::ToolSpec {
+                    name: aik_api::tool::ToolName::new(*name),
+                    description: "from a catalogue".into(),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                    output_schema: None,
+                    required_permissions: Vec::new(),
+                    read_only: false,
+                })
+                .collect())
+        }
+
+        async fn get(
+            &self,
+            name: &aik_api::tool::ToolName,
+            _cx: &ExecutionContext,
+        ) -> Result<Option<Box<dyn Tool>>> {
+            Ok(self
+                .0
+                .iter()
+                .find(|candidate| *name == aik_api::tool::ToolName::new(**candidate))
+                .map(|name| Box::new(crate::EchoTool::new().with_name(*name)) as Box<dyn Tool>))
+        }
+    }
+
     #[test]
     fn defaults_are_sensible() {
         let component = ToolsComponent::new();
         assert_eq!(component.id, ComponentId::new(DEFAULT_COMPONENT_ID));
         assert!(component.default);
         assert!(component.tools.is_empty());
+        assert!(component.catalogs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_catalogue_s_tools_are_registered_at_init() {
+        let kernel = Kernel::builder()
+            .component(
+                ToolsComponent::new()
+                    .with_catalog(Arc::new(FixedCatalog(vec!["remote.one", "remote.two"]))),
+            )
+            .build()
+            .unwrap();
+        kernel.start().await.unwrap();
+
+        let registry = kernel.context().service::<dyn ToolRegistry>().unwrap();
+        let names: Vec<String> = registry
+            .list(&ExecutionContext::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        assert_eq!(names, ["remote.one", "remote.two"]);
+
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_catalogue_cannot_shadow_a_tool_this_deployment_wrote() {
+        // The failure this rules out is an external server offering `kernel.echo` and being
+        // called wherever the native one would have been.
+        let error = Kernel::builder()
+            .component(
+                ToolsComponent::new()
+                    .with_tool(crate::EchoTool::new())
+                    .with_catalog(Arc::new(FixedCatalog(vec![crate::DEFAULT_NAME]))),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap_err();
+
+        // The kernel wraps a component's `init` failure, so the name is in the source chain
+        // rather than in the outermost message.
+        let mut chain = format!("{error}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            chain.push_str(&format!(": {cause}"));
+            source = std::error::Error::source(cause);
+        }
+        assert!(chain.contains(crate::DEFAULT_NAME), "{chain}");
     }
 
     #[test]

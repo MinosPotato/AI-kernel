@@ -13,6 +13,14 @@
 //! Only then is the name turned into an absolute path, by scanning a *configured* search
 //! path — never the process environment's `PATH`, which is inherited from whoever started
 //! the kernel and is therefore attacker-influenced in exactly the deployments that matter.
+//!
+//! # Why this module is public
+//!
+//! This crate is not the only one that starts host code from a configured name:
+//! [`aik-mcp`](../aik_mcp/index.html) starts a tool server the same way. Two copies of
+//! "which file does the name `uvx` mean?" would be two answers that agree today, and the
+//! first divergence anybody noticed would be one of them resolving on the inherited `PATH`.
+//! So there is one answer, here, and the other crate calls it.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -33,8 +41,8 @@ fn is_name_char(byte: u8) -> bool {
 ///
 /// Rejected: anything empty, anything containing a path separator or a NUL, `.` and `..`,
 /// a leading `-` (which every argument parser downstream would read as a flag rather than a
-/// program), and anything outside [`is_name_char`].
-pub(crate) fn validate_name(raw: &str) -> Result<&str> {
+/// program), and anything outside the accepted character set.
+pub fn validate_name(raw: &str) -> Result<&str> {
     let refuse = |why: &str| {
         Err(Error::InvalidArgument(format!(
             "`{raw}` is not a usable program name: {why}"
@@ -71,7 +79,7 @@ pub(crate) fn validate_name(raw: &str) -> Result<&str> {
 /// resolves to a symlink pointing outside the search path is *not* refused — `/usr/bin/vi`
 /// legitimately points wherever the distribution decided — because the allowlist, not the
 /// location, is what says whether this program may run.
-pub(crate) fn resolve(name: &str, search_path: &[PathBuf]) -> Result<PathBuf> {
+pub fn resolve(name: &str, search_path: &[PathBuf]) -> Result<PathBuf> {
     for directory in search_path {
         let candidate = directory.join(name);
         if !is_executable_file(&candidate) {
@@ -113,7 +121,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// was started, which is the one property a program allowlist must not have. An empty entry
 /// — what a stray `:` produces, and what a shell reads as "the current directory" — is
 /// dropped for the same reason.
-pub(crate) fn parse_search_path(raw: &str) -> Vec<PathBuf> {
+pub fn parse_search_path(raw: &str) -> Vec<PathBuf> {
     raw.split(':')
         .filter(|entry| !entry.is_empty())
         .map(PathBuf::from)

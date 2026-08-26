@@ -27,6 +27,7 @@ aik-memory.workspace = true
 aik-scheduler.workspace = true
 aik-summary.workspace = true
 aik-tools.workspace = true
+aik-mcp.workspace = true
 aik-exec.workspace = true
 aik-policy.workspace = true
 aik-fs.workspace = true

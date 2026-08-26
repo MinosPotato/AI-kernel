@@ -108,6 +108,7 @@ impl DaemonSettings {
             tools: options.tools(),
             memory: options.memory(),
             exec: options.exec(),
+            mcp: options.mcp(),
             // The whole reason this process exists: something has to actually run the
             // schedule, and it has to be something that is always there.
             jobs: JobExecution::Agent,

@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use aik_core::{Error, Result};
-use aik_runtime::{ExecSet, MemorySet, Provider};
+use aik_runtime::{ExecSet, McpSet, MemorySet, Provider};
 
 /// The program name used in help and error messages.
 pub const PROGRAM: &str = "aikd";
@@ -48,6 +48,8 @@ pub struct Options {
     pub memory: Option<MemorySet>,
     /// Whether to register the process-execution tool, and behind what.
     pub exec: Option<ExecSet>,
+    /// Whether to start the external MCP tool servers.
+    pub mcp: Option<McpSet>,
     /// Where the shared database lives.
     pub database: Option<PathBuf>,
     /// Whether to run with no database at all.
@@ -95,6 +97,8 @@ pub const HELP: &str = concat!(
     "        --write          also register the filesystem write tool\n",
     "        --no-tools       register no tools at all, memory included\n",
     "        --memory <MODE>  which memory tools to register: off, recall, remember, full\n",
+    "        --mcp <MODE>     start the servers in agent.mcp.servers and register what\n",
+    "                         they offer: off, on [default: off]\n",
     "        --exec <MODE>    run the programs in agent.exec.programs: off, sandboxed,\n",
     "                         unconfined (no sandbox — the allowlist is the only limit)\n",
     "                         [default: off]\n",
@@ -174,6 +178,12 @@ where
                         .map_err(|error| usage(format!("`--exec` is wrong: {error}")))?,
                 );
             }
+            "--mcp" => {
+                options.mcp = Some(
+                    McpSet::parse(&value(&flag)?)
+                        .map_err(|error| usage(format!("`--mcp` is wrong: {error}")))?,
+                );
+            }
             "--memory" => {
                 let raw = value(&flag)?;
                 options.memory = Some(
@@ -202,6 +212,12 @@ where
     if options.no_tools && options.exec.is_some() {
         return Err(usage(
             "`--no-tools` and `--exec` contradict each other".to_owned(),
+        ));
+    }
+
+    if options.no_tools && options.mcp.is_some() {
+        return Err(usage(
+            "`--no-tools` and `--mcp` contradict each other".to_owned(),
         ));
     }
     if options.ephemeral && options.database.is_some() {
@@ -242,6 +258,14 @@ impl Options {
             return ExecSet::Off;
         }
         self.exec.unwrap_or_default()
+    }
+
+    /// Whether these options ask for the external MCP tool servers. See [`Options::memory`].
+    pub fn mcp(&self) -> McpSet {
+        if self.no_tools {
+            return McpSet::Off;
+        }
+        self.mcp.unwrap_or_default()
     }
 }
 
@@ -311,6 +335,8 @@ mod tests {
     fn a_host_runs_no_programs_unless_asked_and_names_the_modes_it_takes() {
         assert_eq!(serve(&[]).exec(), ExecSet::Off);
         assert_eq!(serve(&["--exec", "sandboxed"]).exec(), ExecSet::Sandboxed);
+        assert_eq!(serve(&[]).mcp(), McpSet::Off);
+        assert_eq!(serve(&["--mcp", "on"]).mcp(), McpSet::On);
 
         let error = parse(["--exec", "sandbox"].iter().map(|a| (*a).to_owned())).unwrap_err();
         assert!(

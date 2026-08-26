@@ -58,12 +58,14 @@ use aik_agent::AgentComponent;
 use aik_anthropic::AnthropicComponent;
 use aik_api::model::{ModelId, ModelProvider};
 use aik_api::permission::ApprovalSink;
+use aik_api::tool::ToolCatalog;
 use aik_approval::{ApprovalBroker, ApprovalComponent};
 use aik_audit::{AuditComponent, RedbAuditComponent};
 use aik_context::{ContextComponent, RedbContextComponent};
 use aik_core::prelude::*;
 use aik_exec::{ExecTool, Sandbox};
 use aik_fs::{FsListTool, FsReadTool, FsWriteTool};
+use aik_mcp::{McpCatalog, McpClient, McpComponent};
 use aik_memory::{MemoryComponent, MemoryToolsComponent, RedbMemoryComponent};
 use aik_ollama::OllamaComponent;
 use aik_policy::RuleBasedPolicyEngine;
@@ -74,7 +76,8 @@ use aik_tools::ToolsComponent;
 
 use crate::jobs::AgentJobComponent;
 use crate::settings::{
-    ExecSet, ExecSettings, JobExecution, MemorySet, Provider, RuntimeSettings, Storage, ToolSet,
+    ExecSet, ExecSettings, JobExecution, MCP_SERVERS_PATH, MemorySet, Provider, RuntimeSettings,
+    Storage, ToolSet,
 };
 
 /// The configuration path the policy document is read from.
@@ -139,6 +142,16 @@ pub fn builder(
         tools = tools.with_tool(exec_tool(settings)?);
     }
 
+    // The same shape again, over tools this repository did not write. Every server's
+    // settings are checked here, at startup, so a malformed one names itself instead of
+    // surfacing as a tool that is mysteriously absent; the servers themselves are started
+    // lazily, on the first listing, because a host that is having a bad day should not stop
+    // a kernel that has other work.
+    let mcp = mcp_catalog(settings)?;
+    if let Some(catalog) = &mcp {
+        tools = tools.with_catalog(catalog.clone() as Arc<dyn ToolCatalog>);
+    }
+
     // The same limit again, over the record store. The tools are handed out by a component
     // that binds them to whichever `dyn MemoryStore` the kernel published, so the volatile
     // and the durable backend are wired identically and the frontend never has to know
@@ -193,6 +206,16 @@ pub fn builder(
         .config(settings.config.clone())
         .component(ApprovalComponent::new(broker.clone()))
         .component(tools);
+
+    // Registered for its shutdown, not for anything it provides: a tool server is a process
+    // this kernel started, and a kernel that exited leaving one running would be a kernel
+    // whose shutdown is not one. The catalogue itself is passed to the registry directly, for
+    // the same reason the policy engine is — component start-up order must not be what
+    // decides whether a deployment has these tools.
+    let builder = match &mcp {
+        Some(catalog) => builder.component(McpComponent::new(catalog.clone())),
+        None => builder,
+    };
 
     // Whether the record store ranks by meaning, and through which component. Resolved
     // before either storage arm because it applies to both: the two backends differ in what
@@ -278,6 +301,41 @@ fn embedder_choice(settings: &RuntimeSettings) -> Result<Option<(ComponentId, Mo
         )
     })?;
     Ok(Some((component, model.clone())))
+}
+
+/// Builds the catalogue of external tool servers this deployment asked for, if any.
+///
+/// `None` covers both ways of having none — a run that did not ask, and a deployment that
+/// describes no servers — because they produce the same system and neither is a failure. A
+/// run that *did* ask and found nothing described is the one case that is: it is a command
+/// line that says the agent has external tools and a configuration that gives it none, and
+/// the operator should hear about that at startup rather than from a model that cannot do
+/// what they expected.
+fn mcp_catalog(settings: &RuntimeSettings) -> Result<Option<Arc<McpCatalog>>> {
+    if !settings.mcp.is_enabled() {
+        return Ok(None);
+    }
+
+    if settings.mcp_settings.servers.is_empty() {
+        return Err(Error::config(
+            MCP_SERVERS_PATH,
+            "external tool servers were enabled but none are described; name the servers this \
+             deployment runs, or leave them off",
+        ));
+    }
+
+    let clients = settings
+        .mcp_settings
+        .servers
+        .iter()
+        .map(|server| {
+            server
+                .resolve_at(&settings.root, MCP_SERVERS_PATH)
+                .map(|resolved| Arc::new(McpClient::new(resolved)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(Arc::new(McpCatalog::new(clients)?)))
 }
 
 /// Builds the process-execution tool this deployment asked for.
@@ -498,6 +556,67 @@ mod tests {
         let ids = registered(&settings);
         assert!(
             !ids.contains(&ComponentId::new(aik_summary::DEFAULT_COMPONENT_ID)),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_did_not_ask_for_external_tools_starts_no_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = RuntimeSettings::new(directory.path());
+        assert!(mcp_catalog(&settings).unwrap().is_none());
+    }
+
+    #[test]
+    fn asking_for_external_tools_with_none_described_fails_at_startup() {
+        // The failure this rules out is a command line that says the agent has external
+        // tools and a configuration that gives it none.
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.mcp = crate::settings::McpSet::On;
+
+        let error = mcp_catalog(&settings).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(format!("{error}").contains(MCP_SERVERS_PATH), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_server_names_the_setting_that_is_wrong() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.mcp = crate::settings::McpSet::On;
+        settings.mcp_settings.servers = vec![aik_mcp::ServerSettings {
+            label: "files".into(),
+            command: "/usr/bin/server".into(),
+            ..aik_mcp::ServerSettings::default()
+        }];
+
+        let error = mcp_catalog(&settings).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(
+            format!("{error}").contains("agent.mcp.servers[files].command"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_described_server_is_wired_but_not_started() {
+        // Building the catalogue must not touch the host: a kernel that spawned every tool
+        // server before it finished assembling would fail to start over a program that is
+        // temporarily missing.
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.model_component = ComponentId::new("model.stub");
+        settings.mcp = crate::settings::McpSet::On;
+        settings.mcp_settings.servers = vec![aik_mcp::ServerSettings {
+            label: "files".into(),
+            command: "definitely-not-installed".into(),
+            ..aik_mcp::ServerSettings::default()
+        }];
+
+        let ids = registered(&settings);
+        assert!(
+            ids.contains(&ComponentId::new(aik_mcp::DEFAULT_COMPONENT_ID)),
             "{ids:?}"
         );
     }

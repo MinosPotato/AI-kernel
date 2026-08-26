@@ -21,7 +21,7 @@ pub const PROGRAM: &str = "aik";
 /// which capability exists at all — and the host process makes exactly the same two. A
 /// second definition would be a second thing to keep in step, and the drift would show up as
 /// a tool present in one frontend and absent in the other.
-pub use aik_runtime::{ExecSet, MemorySet, Provider, ToolSet};
+pub use aik_runtime::{ExecSet, McpSet, MemorySet, Provider, ToolSet};
 
 /// What the user asked for on the command line.
 ///
@@ -64,6 +64,11 @@ pub struct Options {
     /// An `Option` for the same reason as [`Options::memory`]: `--exec` alongside
     /// `--no-tools` is a contradiction to be rejected rather than a race between two switches.
     pub exec: Option<ExecSet>,
+    /// Whether to start the external MCP tool servers, or `None` to take the default.
+    ///
+    /// An `Option` for the same reason as [`Options::exec`]: `--mcp` alongside `--no-tools`
+    /// is a contradiction to be rejected rather than a race between two switches.
+    pub mcp: Option<McpSet>,
     /// Which memory tools to register, or `None` to take the default.
     ///
     /// An `Option` rather than a bare [`MemorySet`] so that `--memory` combined with
@@ -113,6 +118,17 @@ impl Options {
         match self.no_tools {
             true => ExecSet::Off,
             false => self.exec.unwrap_or_default(),
+        }
+    }
+
+    /// Whether these options ask for the external MCP tool servers.
+    ///
+    /// `--no-tools` covers this one too, for the reason it covers execution and memory: it
+    /// means no tools at all, and it has to keep meaning that as tools are added.
+    pub fn mcp(&self) -> McpSet {
+        match self.no_tools {
+            true => McpSet::Off,
+            false => self.mcp.unwrap_or_default(),
         }
     }
 
@@ -184,6 +200,8 @@ pub const HELP: &str = concat!(
     "        --exec <MODE>    run programs from agent.exec.programs: off, sandboxed (in a\n",
     "                         namespace sandbox), unconfined (no sandbox at all — the\n",
     "                         allowlist is then the only limit) [default: off]\n",
+    "        --mcp <MODE>     start the external tool servers in agent.mcp.servers and\n",
+    "                         register what they offer: off, on [default: off]\n",
     "        --memory <MODE>  which memory tools to register: off, recall (get, query),\n",
     "                         remember (recall plus put), full (also delete)\n",
     "                         [default: remember]\n",
@@ -215,6 +233,16 @@ pub const HELP: &str = concat!(
     "    of arguments — and policy is asked about both the program and the whole command.\n",
     "    `--exec unconfined` runs them with no sandbox, as your account, seeing everything\n",
     "    you can see; the allowlist is then the entire boundary.\n",
+    "\n",
+    "EXTERNAL TOOL SERVERS:\n",
+    "    `--mcp on` starts the Model Context Protocol servers named in agent.mcp.servers\n",
+    "    and registers their tools as mcp.<server>.<tool>. Each is a program you chose,\n",
+    "    started with an environment built from nothing but agent.mcp.servers[].env — it\n",
+    "    inherits none of yours — and every call it serves goes through the same policy\n",
+    "    and approval gate as a filesystem call, against the resource mcp:<server>/<tool>.\n",
+    "    A server is not sandboxed: it runs as your account. It also cannot ask anything\n",
+    "    of this process — no sampling from your model, no view of your filesystem roots —\n",
+    "    and nothing it says about itself makes its tools auto-approvable.\n",
     "\n",
     "APPROVALS:\n",
     "    An interactive session answers `require_approval` from the terminal. A one-shot\n",
@@ -350,6 +378,14 @@ where
                     ))
                 })?);
             }
+            "--mcp" => {
+                let raw = value(&flag)?;
+                options.mcp = Some(McpSet::parse(&raw).map_err(|error| {
+                    usage(format!(
+                        "`--mcp` takes one of off, on; got `{raw}` ({error})"
+                    ))
+                })?);
+            }
             "--memory" => {
                 let raw = value(&flag)?;
                 options.memory = Some(MemorySet::parse(&raw).map_err(|error| {
@@ -389,6 +425,12 @@ where
         ));
     }
 
+    if options.no_tools && options.mcp.is_some() {
+        return Err(usage(
+            "`--no-tools` and `--mcp` contradict each other".to_owned(),
+        ));
+    }
+
     if options.ephemeral && options.database.is_some() {
         return Err(usage(
             "`--ephemeral` and `--db` contradict each other".to_owned(),
@@ -416,6 +458,7 @@ where
             ("--no-tools", options.no_tools),
             ("--memory", options.memory.is_some()),
             ("--exec", options.exec.is_some()),
+            ("--mcp", options.mcp.is_some()),
             ("--db", options.database.is_some()),
             ("--ephemeral", options.ephemeral),
             ("--policy", options.policy.is_some()),
@@ -806,6 +849,31 @@ mod tests {
             options(&["--write", "--memory", "full"]).exec(),
             ExecSet::Off
         );
+    }
+
+    #[test]
+    fn no_external_tool_server_starts_unless_a_run_asks_for_one() {
+        assert_eq!(options(&[]).mcp(), McpSet::Off);
+        assert_eq!(options(&["--write", "--memory", "full"]).mcp(), McpSet::Off);
+    }
+
+    #[test]
+    fn every_mcp_mode_is_selectable_by_name() {
+        for (name, expected) in [("off", McpSet::Off), ("on", McpSet::On)] {
+            assert_eq!(options(&["--mcp", name]).mcp(), expected);
+        }
+    }
+
+    #[test]
+    fn an_unknown_mcp_mode_is_rejected_rather_than_taken_as_the_default() {
+        let error = parse(["--mcp", "yes"]).unwrap_err();
+        assert!(format!("{error}").contains("off, on"), "{error}");
+    }
+
+    #[test]
+    fn no_tools_means_no_external_tool_servers_either() {
+        assert!(parse(["--no-tools", "--mcp", "on"]).is_err());
+        assert_eq!(options(&["--no-tools"]).mcp(), McpSet::Off);
     }
 
     #[test]

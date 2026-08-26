@@ -67,7 +67,7 @@
 
 mod command_line;
 pub mod limits;
-mod program;
+pub mod program;
 mod runner;
 pub mod sandbox;
 mod tool;
