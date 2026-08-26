@@ -35,6 +35,7 @@ AI-kernel/
 │  ├─ ollama/   → aik-ollama   : a ModelProvider, talking to a local Ollama server
 │  ├─ anthropic/→ aik-anthropic: a ModelProvider, talking to the Anthropic Messages API
 │  ├─ tools/    → aik-tools    : the reference ToolRegistry (authorization-gated)
+│  ├─ mcp/      → aik-mcp      : a ToolCatalog over external Model Context Protocol servers
 │  ├─ policy/   → aik-policy   : a deterministic, configuration-driven PolicyEngine
 │  ├─ fs/       → aik-fs       : filesystem Tools, confined to a configured root
 │  ├─ exec/     → aik-exec     : running allowlisted programs behind an OS-level sandbox
@@ -183,7 +184,7 @@ every "Implemented by" column below is a separate crate.
 |--------------|------------------------------------------------------------------------|----------------|
 | `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     | — (a plain value type, not a trait) |
 | `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (both), `aik-anthropic` (`ModelProvider`) |
-| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`) |
+| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`), `aik-mcp` (`ToolCatalog`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
 | `context`    | `ContextCompactor`: replacing evicted turns with a recap, rather than losing them | `aik-summary` |
 | `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query needs an `Embedder`) |
@@ -200,8 +201,17 @@ owner, precisely because building it showed that a schedule nobody owns cannot b
 `platform` remains a shape with no implementation yet, deliberately not built ahead of the
 evidence that would justify one.
 
-`ContextCompactor` is the most recent of these, and the only one added *because* an existing
-contract refused to grow. `ContextStore::compact` says, in the contract itself, that it will
+`ToolCatalog` is the most recent of these to gain an implementation, and it did so without
+gaining a method: it was written with an MCP server named in its documentation as the kind of
+thing that would implement it, and `aik-mcp` is that thing arriving. What the exercise found
+was not a missing method but a missing *seam*: nothing consumed a `ToolCatalog`, because
+`aik-tools` could only be handed tools that already existed as values. A catalogue's tools do
+not — they are discovered, asynchronously, from a program — so `ToolsComponent` gained a
+`with_catalog` that drains one during `init`, before anything holds an `Arc<dyn ToolRegistry>`.
+The guarantee the registry rests on is unchanged: the set of tools is still frozen by the time
+it is reachable, and there is still no path that adds a tool to a registry already in use.
+
+`ContextCompactor` is the only contract added *because* an existing one refused to grow. `ContextStore::compact` says, in the contract itself, that it will
 never summarise: it is deterministic, model-free and cannot fail interestingly, and a store
 that summarised would have to be all three of the opposite things. So the capability became a
 second trait in the same module rather than a method on the first, implemented by a crate

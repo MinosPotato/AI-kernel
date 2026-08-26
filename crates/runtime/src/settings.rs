@@ -270,6 +270,64 @@ pub struct ExecSettings {
     pub search_path: Option<String>,
 }
 
+/// Where a deployment writes down its MCP servers.
+pub const MCP_SERVERS_PATH: &str = "agent.mcp.servers";
+
+/// Whether external MCP tool servers are reachable in this run.
+///
+/// A frontend decision, like [`ExecSet`], and for the same reason: *which* servers a
+/// deployment has is written in configuration by an operator and cannot be widened from a
+/// command line, but whether this particular run starts any of them at all is something the
+/// person starting it gets to say. Off is the default, so a run that did not ask for
+/// external tools starts no third-party processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpSet {
+    /// No server is started and no MCP tool is registered.
+    #[default]
+    Off,
+    /// Every server in `agent.mcp.servers` is available.
+    On,
+}
+
+impl McpSet {
+    /// Reads a mode by name, or explains what the names are.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
+            other => Err(Error::InvalidArgument(format!(
+                "unknown MCP mode `{other}`; expected one of off, on"
+            ))),
+        }
+    }
+
+    /// The name this mode is written as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// Whether this run reaches external tool servers at all.
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// What a deployment says about external tool servers, read from `agent.mcp`.
+///
+/// Separate from [`McpSet`] for the same reason [`ExecSettings`] is separate from
+/// [`ExecSet`]: the mode is a per-run decision, and this is the deployment's standing
+/// description of *which* servers exist, what they may be given, and what each of their
+/// calls may cost. A frontend can decline to start them; it cannot add one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpSettings {
+    /// The servers this deployment runs. Empty means the capability cannot be registered.
+    pub servers: Vec<aik_mcp::ServerSettings>,
+}
+
 /// What a deployment says about compacting long sessions, read from `agent.summary`.
 ///
 /// Compaction is the one capability here that is *on* unless a deployment says otherwise,
@@ -479,6 +537,7 @@ struct AgentSection {
     provider: Option<String>,
     system_prompt: Option<String>,
     exec: ExecSettings,
+    mcp: McpSettings,
     summary: SummarySettings,
 }
 
@@ -636,6 +695,8 @@ pub struct Deployment {
     pub memory: MemorySet,
     /// Whether programs may be run, and behind what.
     pub exec: ExecSet,
+    /// Whether external MCP tool servers are started.
+    pub mcp: McpSet,
     /// Whether scheduled work runs in this process.
     pub jobs: JobExecution,
     /// Where durable state goes, if anywhere.
@@ -692,6 +753,8 @@ impl Deployment {
             memory: self.memory,
             exec: self.exec,
             exec_settings: section.exec,
+            mcp: self.mcp,
+            mcp_settings: section.mcp,
             summary: section.summary,
             storage,
             jobs: self.jobs,
@@ -766,6 +829,10 @@ pub struct RuntimeSettings {
     pub exec: ExecSet,
     /// Which programs may be run, and how, read from `agent.exec`.
     pub exec_settings: ExecSettings,
+    /// Whether external MCP tool servers are started in this run.
+    pub mcp: McpSet,
+    /// The servers this deployment describes, whatever this run does with them.
+    pub mcp_settings: McpSettings,
     /// Whether long sessions are compacted, and with what, read from `agent.summary`.
     pub summary: SummarySettings,
     /// Where the durable subsystems keep what they hold, if anywhere.
@@ -829,6 +896,8 @@ impl RuntimeSettings {
             memory: MemorySet::default(),
             exec: ExecSet::default(),
             exec_settings: ExecSettings::default(),
+            mcp: McpSet::default(),
+            mcp_settings: McpSettings::default(),
             summary: SummarySettings::default(),
             storage: Storage::Ephemeral,
             jobs: JobExecution::default(),

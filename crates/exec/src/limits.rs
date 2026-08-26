@@ -101,7 +101,7 @@ type Resource = libc::c_int;
 /// and `setsid` are plain syscalls, and nothing between them allocates, takes a lock, or
 /// touches memory shared with the parent.
 #[cfg(unix)]
-pub(crate) fn apply(limits: &Limits) -> std::io::Result<()> {
+pub fn apply(limits: &Limits) -> std::io::Result<()> {
     // Errors are reported rather than ignored: a limit that silently failed to apply is a
     // limit a deployment believes it has. `pre_exec` turns this `Err` into a spawn failure,
     // so the call fails closed instead of running unbounded.
@@ -165,7 +165,7 @@ fn set(resource: Resource, value: Option<u64>) -> std::io::Result<()> {
 /// the whole tree the child started. A group that has already exited is not an error — the
 /// race between a timeout firing and a process finishing on its own is expected and common.
 #[cfg(unix)]
-pub(crate) fn kill_group(pid: u32) {
+pub fn kill_group(pid: u32) {
     // SAFETY: `kill` with a negative pid signals a process group and cannot affect memory.
     // An `ESRCH` from a group that is already gone is the expected race, not a failure.
     unsafe {
@@ -179,13 +179,13 @@ pub(crate) fn kill_group(pid: u32) {
 /// [`Runner`](crate::runner::Runner) does not exist off Unix. Present so the crate compiles
 /// everywhere the workspace does rather than being conditionally absent.
 #[cfg(not(unix))]
-pub(crate) fn apply(_limits: &Limits) -> std::io::Result<()> {
+pub fn apply(_limits: &Limits) -> std::io::Result<()> {
     Ok(())
 }
 
 /// The non-Unix stand-in for [`kill_group`]. See [`apply`].
 #[cfg(not(unix))]
-pub(crate) fn kill_group(_pid: u32) {}
+pub fn kill_group(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {

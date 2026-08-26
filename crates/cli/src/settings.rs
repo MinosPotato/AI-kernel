@@ -139,6 +139,7 @@ impl Settings {
             tools: options.tools(),
             memory: options.memory(),
             exec: options.exec(),
+            mcp: options.mcp(),
             // A terminal is not a host process. It keeps the same durable schedule as one —
             // the same jobs, the same owners — and deliberately runs none of it: see
             // [`JobExecution`]. A conversation interrupted by a job firing at 3am is not a

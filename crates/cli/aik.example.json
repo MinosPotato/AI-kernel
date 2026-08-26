@@ -250,6 +250,20 @@
           "decision": "require_approval",
           "prompt": "let the agent permanently forget this memory?"
         }
+      },
+
+      {
+        "description": "External MCP tool servers, registered only when the frontend was started with --mcp on. The capability is allowed and every individual tool is put to a human, because what a tool called `create_issue` or `run_query` does is decided by a program this repository did not write — and the description the model read was written by that same program. A deployment that knows a server names the tools it trusts, one `mcp:<server>/<tool>` rule at a time, above this one.",
+        "action": "mcp.invoke",
+        "effect": { "decision": "allow" }
+      },
+      {
+        "action": "mcp.invoke",
+        "resource": "*",
+        "effect": {
+          "decision": "require_approval",
+          "prompt": "let the agent call this external tool?"
+        }
       }
     ]
   }

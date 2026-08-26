@@ -7,6 +7,7 @@ members = [
     "crates/ollama",
     "crates/anthropic",
     "crates/tools",
+    "crates/mcp",
     "crates/policy",
     "crates/fs",
     "crates/exec",
@@ -37,6 +38,7 @@ authors = ["AI-kernel contributors"]
 aik-core = { version = "0.1.0", path = "crates/core" }
 aik-api = { version = "0.1.0", path = "crates/api" }
 aik-tools = { version = "0.1.0", path = "crates/tools" }
+aik-mcp = { version = "0.1.0", path = "crates/mcp" }
 aik-policy = { version = "0.1.0", path = "crates/policy" }
 aik-fs = { version = "0.1.0", path = "crates/fs" }
 aik-exec = { version = "0.1.0", path = "crates/exec" }

@@ -22,6 +22,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-ollama`](crates/ollama) | A `ModelProvider` backed by a local or remote Ollama server |
 | [`aik-anthropic`](crates/anthropic) | A `ModelProvider` backed by the Anthropic Messages API, credential and all |
 | [`aik-tools`](crates/tools) | The authorization-gated `ToolRegistry` implementation |
+| [`aik-mcp`](crates/mcp) | External Model Context Protocol tool servers, as one `ToolCatalog` |
 | [`aik-policy`](crates/policy) | A deterministic, configuration-driven `PolicyEngine` |
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
 | [`aik-exec`](crates/exec) | Running allowlisted programs behind an OS-level sandbox |
@@ -586,6 +587,77 @@ for `git commit -m fix` must not also match one argument that merely looks like 
 Resource patterns match by prefix with no word boundary, which is why every pattern above
 carries its separating space: `command/git*` would also match `gitk`.
 
+## Tools this repository did not write
+
+[`aik-mcp`](crates/mcp) connects to Model Context Protocol servers — the programs that expose
+a filesystem, an issue tracker, a database or an API as tools — and contributes what they
+offer as ordinary kernel tools, named `mcp.<server>.<tool>`.
+
+It is the second thing in the workspace that supplies tools and the first that supplies tools
+it did not write, which is the point: `aik-anthropic` exists so that `ModelProvider` is a
+contract rather than a description of Ollama, and this does the same for `ToolCatalog`.
+
+```json
+{ "agent": { "mcp": { "servers": [
+  { "label": "files",
+    "command": "mcp-server-filesystem",
+    "args": ["/home/user/project"],
+    "env": { "PATH": "/usr/bin:/bin" },
+    "tools": ["read_file", "list_directory"] }
+] } } }
+```
+
+```bash
+aik --mcp on
+```
+
+**Two trust boundaries, and they are not the same one.** A server is trusted code: it runs as
+your account, it is not sandboxed, and which servers exist is a configuration decision an
+operator makes — never a model, never a conversation. A server's *output* is not trusted at
+all, because in any deployment where the server talks to the outside world, its tool
+descriptions and results are written by whoever can reach the thing it talks to. So names are
+validated, descriptions are stripped of control characters and capped, schemas are checked for
+the shape a provider needs, results are truncated, binary content is described rather than
+carried, and a frame is size-limited before it is parsed.
+
+**Nothing here is a second, softer path to a tool.** The catalogue hands `Box<dyn Tool>` to
+whatever assembles the registry and never to anything that could call one; from there an MCP
+tool goes through the same policy engine, the same approval sink and the same audit events as
+`fs.write`. Four limits apply, and only one of them is policy:
+
+| Limit | Answers | Set by |
+|---|---|---|
+| Registration (`--mcp`) | Is there an MCP tool at all? | The command line |
+| `agent.mcp.servers` and each `tools` list | Which servers, and which of their tools? | Configuration, at startup |
+| Policy (`mcp.invoke` on `mcp:<server>/<tool>`) | Who may call which, and when is a human asked? | The policy document |
+| Frames, results, tool counts, timeouts | What may one call cost? | Configuration, conservative by default |
+
+```json
+{ "action": "mcp.invoke", "resource": "mcp:files/read_file", "effect": { "decision": "allow" } },
+{ "action": "mcp.invoke", "resource": "mcp:files/write_file",
+  "effect": { "decision": "require_approval", "prompt": "let the agent write that file?" } }
+```
+
+The refusals are the interesting part again:
+
+* **A server cannot make itself auto-approvable.** MCP tools may carry a `readOnlyHint`, and
+  it is written by the thing being authorized, so it is not read. Every remote tool is
+  `read_only: false`; a deployment that knows better says so in *its* policy.
+* **A server cannot ask anything of this process.** This client advertises no capabilities, so
+  `sampling/createMessage` — a server asking your model to generate text, with a prompt the
+  server wrote and a bill you pay — is answered "method not found", promptly and by id. So is
+  a request for your filesystem roots.
+* **A server gets an environment built from nothing.** `env_clear`, then exactly what
+  `agent.mcp.servers[].env` names. Your model credential, your database path and your
+  `SSH_AUTH_SOCK` do not reach third-party code because nobody thought about it.
+* **A server cannot shadow a native tool.** Names are namespaced by the deployment's own label,
+  a remote name that could punctuate that namespace is refused, and a collision with an
+  already-registered tool fails the kernel's startup rather than displacing anything.
+* **A misconfigured server is a startup failure, not a missing capability.** A `tools` entry
+  the server does not offer, a command that is not on the configured search path, a listing
+  larger than the deployment accepts: each names the setting that is wrong, because an agent
+  that quietly cannot do what the operator granted is the worse outcome.
+
 ## Configuration
 
 The kernel reads no files. It accepts JSON layers, deep-merged in order, so the host
@@ -637,6 +709,16 @@ a host process over one database cannot describe two different assistants:
 | `agent.exec.programs` | none | The bare program names `aik-exec` will run |
 | `agent.exec.writable` | `false` | Whether a program may write to the root |
 | `agent.exec.network` | `false` | Whether a program has a network |
+| `agent.mcp.servers[].label` | required | The name the server's tools are namespaced under: `mcp.<label>.<tool>` |
+| `agent.mcp.servers[].command` / `.args` | required / none | The bare program name to run, and its argument vector; there is no shell |
+| `agent.mcp.servers[].env` | none | The server's entire environment; nothing is inherited |
+| `agent.mcp.servers[].cwd` | `agent.root` | Where the server is started |
+| `agent.mcp.servers[].tools` | all of them | Which of the server's tools this deployment exposes at all |
+| `agent.mcp.servers[].permission` | `mcp.invoke` | The action policy is asked about for every call |
+| `agent.mcp.servers[].search_path` | `/usr/bin:/bin:/usr/local/bin` | Where the command is looked for; never the inherited `PATH` |
+| `agent.mcp.servers[].call_timeout_ms` | 60000 | The wall-clock budget for one `tools/call` |
+| `agent.mcp.servers[].max_result_bytes` | 65536 | The largest result carried back to a model |
+| `agent.mcp.servers[].max_tools` | 128 | The largest listing accepted from the server |
 
 ## Development
 
@@ -698,8 +780,8 @@ the newest records, a write that cannot embed fails rather than storing a record
 will ever find, and a provider with no embeddings endpoint fails at startup rather than
 serving a memory that silently never searches.
 
-Context summarisation is the newest of these, and the first capability that had to be built
-*beside* a subsystem rather than into it. `aik-context` deliberately cannot summarise —
+Context summarisation was the first capability that had to be built *beside* a subsystem
+rather than into it. `aik-context` deliberately cannot summarise —
 replacing turns with a paragraph needs a model, and a store that needed one would be a store
 that could fail, cost money and be talked into things. So `aik-summary` is its own crate
 behind its own contract, `ContextCompactor`: it reads the turns a window is about to drop,
@@ -712,6 +794,21 @@ call and no history; the summarising call offers no tools, so a transcript canno
 summarisation into an action; and the recap is never pinned and never a system message, so a
 model cannot make its own words permanent or give them the authority of the deployment's own
 prompt.
+
+`aik-mcp` is the newest of these, and the first that supplies tools this repository did not
+write. Everything that acted before it — `aik-fs`, `aik-exec`, the memory tools — was code
+reviewed here, changing only when somebody changed it. An MCP server is a program the operator
+points at, whose tool names, descriptions, schemas and results are authored elsewhere and can
+change between one start and the next. So it splits the trust question in two: the server is
+trusted code, run as your account and not sandboxed, chosen once in configuration by a person;
+its output is untrusted input, parsed narrowly and bounded everywhere. It also needed the one
+seam `ToolCatalog` never had — nothing consumed a catalogue, because a registry could only be
+handed tools that already existed as values — so `aik-tools` gained a `with_catalog` that
+drains one during `init`, which keeps the property the registry rests on: the set of tools is
+frozen before anything can reach it. The refusals are again where the design is: a server
+cannot sample from this kernel's model, cannot see its filesystem roots, cannot declare its own
+tools auto-approvable, cannot shadow a native tool, and inherits none of this process's
+environment.
 
 What is genuinely not built yet: any platform integration at all. `aik-scheduler` now defines
 a cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an

@@ -240,6 +240,7 @@ dependencies = [
  "aik-daemon",
  "aik-exec",
  "aik-fs",
+ "aik-mcp",
  "aik-memory",
  "aik-policy",
  "aik-runtime",
@@ -267,6 +268,23 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "aik-mcp"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-exec",
+ "aik-policy",
+ "aik-tools",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -333,6 +351,7 @@ dependencies = [
  "aik-core",
  "aik-exec",
  "aik-fs",
+ "aik-mcp",
  "aik-memory",
  "aik-ollama",
  "aik-policy",
