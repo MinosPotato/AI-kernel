@@ -69,6 +69,7 @@ use aik_ollama::OllamaComponent;
 use aik_policy::RuleBasedPolicyEngine;
 use aik_scheduler::{RedbSchedulerComponent, SchedulerComponent};
 use aik_store::StoreComponent;
+use aik_summary::SummaryComponent;
 use aik_tools::ToolsComponent;
 
 use crate::jobs::AgentJobComponent;
@@ -165,11 +166,28 @@ pub fn builder(
         }
     }
 
-    let agent = AgentComponent::new(settings.agent.clone(), settings.loop_settings(model))
-        .described("the assistant this deployment serves")
-        .requires(aik_tools::DEFAULT_COMPONENT_ID)
-        .requires(aik_context::DEFAULT_COMPONENT_ID)
-        .requires(settings.model_component.clone());
+    let mut agent = AgentComponent::new(
+        settings.agent.clone(),
+        settings.loop_settings(model.clone()),
+    )
+    .described("the assistant this deployment serves")
+    .requires(aik_tools::DEFAULT_COMPONENT_ID)
+    .requires(aik_context::DEFAULT_COMPONENT_ID)
+    .requires(settings.model_component.clone());
+
+    // Registered before the agent and declared as a dependency of it, because the agent
+    // resolves `dyn ContextCompactor` optionally during `init`: a compactor initialised
+    // afterwards would be a deployment that configured compaction and silently did not get
+    // it. Leaving it out is the supported way to have none — the loop then evicts
+    // deterministically, exactly as it did before this existed.
+    let compactor = settings.summary.is_enabled().then(|| {
+        SummaryComponent::new(settings.summary.resolve(model))
+            .requires(aik_context::DEFAULT_COMPONENT_ID)
+            .requires(settings.model_component.clone())
+    });
+    if compactor.is_some() {
+        agent = agent.requires(aik_summary::DEFAULT_COMPONENT_ID);
+    }
 
     let builder = Kernel::builder()
         .config(settings.config.clone())
@@ -226,6 +244,11 @@ pub fn builder(
     let builder = match settings.jobs {
         JobExecution::Disabled => builder,
         JobExecution::Agent => builder.component(AgentJobComponent::new()),
+    };
+
+    let builder = match compactor {
+        Some(compactor) => builder.component(compactor),
+        None => builder,
     };
 
     Ok((builder.component(agent), broker))
@@ -420,6 +443,63 @@ mod tests {
         assert!(!off.exec.is_enabled());
         // And asking for it anyway is answered rather than panicked on.
         assert_eq!(exec_tool(&off).unwrap_err().kind(), ErrorKind::Config);
+    }
+
+    /// Stands in for the provider component the agent and the compactor depend on by name.
+    ///
+    /// Registered but never started, because these tests are about which components a
+    /// deployment *has*: dependency resolution happens at build time and needs the id to
+    /// exist, while resolving `dyn ModelProvider` happens at `init` and does not.
+    struct StubProvider;
+
+    #[async_trait]
+    impl Component for StubProvider {
+        fn descriptor(&self) -> ComponentDescriptor {
+            ComponentDescriptor::new(ComponentId::new("model.stub"))
+        }
+    }
+
+    /// The component ids a deployment's builder registers, without starting anything.
+    fn registered(settings: &RuntimeSettings) -> Vec<ComponentId> {
+        let (builder, _) = builder(settings, ModelId::new("test-model")).expect("wiring");
+        builder
+            .component(StubProvider)
+            .build()
+            .expect("a kernel")
+            .component_ids()
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn a_deployment_compacts_long_sessions_unless_it_says_otherwise() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        // The agent depends on the provider component by name, so point both at something
+        // this test does not have to start.
+        settings.model_component = ComponentId::new("model.stub");
+
+        let ids = registered(&settings);
+        assert!(
+            ids.contains(&ComponentId::new(aik_summary::DEFAULT_COMPONENT_ID)),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_turned_off_registers_nothing_and_the_agent_stops_depending_on_it() {
+        // The failure this rules out is an agent left declaring a dependency on a component
+        // nobody registered, which is a kernel that does not start at all.
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.model_component = ComponentId::new("model.stub");
+        settings.summary.enabled = Some(false);
+
+        let ids = registered(&settings);
+        assert!(
+            !ids.contains(&ComponentId::new(aik_summary::DEFAULT_COMPONENT_ID)),
+            "{ids:?}"
+        );
     }
 
     #[test]

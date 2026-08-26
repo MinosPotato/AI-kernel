@@ -113,6 +113,20 @@ aik_core::uuid_id! {
 /// mistaking the marker for content.
 pub const ELISION_MARKER: &str = "aik.elided";
 
+/// The marker a [`ContextCompactor`] uses to say "the turns here were replaced by a recap".
+///
+/// It opens the text of the record a compactor appends
+/// (`[aik.summary of 12 earlier turns] …`), for the same reason [`ELISION_MARKER`] exists:
+/// a model reading its own history must be able to tell a recap of what was said from
+/// something that was said. It is also what makes the recap recognisable to *trusted* code
+/// after the fact — an operator reading a transcript, or a later compaction folding one
+/// recap into the next.
+///
+/// Recognising the marker is not the same as trusting what follows it. A summary is model
+/// output, so anything after the marker is content, never instruction — see
+/// [`ContextCompactor`].
+pub const SUMMARY_MARKER: &str = "aik.summary";
+
 /// What trusted code asks a [`ContextStore`] to record.
 ///
 /// Deliberately thin: the message, and whether it is exempt from eviction. Everything else
@@ -530,9 +544,11 @@ pub trait ContextStore: Send + Sync + 'static {
     ///
     /// Deterministic and model-free. There is no summarisation here and there will not be:
     /// replacing turns with a paragraph needs a model, which makes the operation fallible,
-    /// costly, non-deterministic and a prompt-injection surface. A component above this one
-    /// can summarise by reading records through [`ContextStore::get`] and appending the
-    /// result back as an ordinary pinned record; what this method does is only reclaim.
+    /// costly, non-deterministic and a prompt-injection surface. That is what
+    /// [`ContextCompactor`] is — a separate contract, implemented outside any store, that
+    /// reads records through [`ContextStore::get`], has a model write a recap, appends it
+    /// back through [`ContextStore::append`] and *then* calls this. What this method does is
+    /// only reclaim.
     ///
     /// Implementations must:
     ///
@@ -569,6 +585,133 @@ pub trait ContextStore: Send + Sync + 'static {
     ) -> Result<usize>;
 }
 
+/// What one round of compaction did to a session.
+///
+/// Counts only, like [`ContextUsage`], and for the same reason: this is what a caller reads
+/// to decide whether compaction achieved anything, and what a
+/// [`ContextCompacted`] event carries to an operator. Neither audience needs a line of the
+/// conversation to answer that question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Compaction {
+    /// The record holding the recap that was appended, if one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ContextId>,
+    /// How many records the recap covers.
+    pub summarised_records: usize,
+    /// How many records were then removed from the session.
+    ///
+    /// Not necessarily equal to [`Compaction::summarised_records`]: reclaiming works
+    /// through [`ContextStore::compact`], which counts from the newest end, so a record
+    /// stranded by an earlier round can go with them.
+    pub removed_records: usize,
+    /// The full-fidelity cost of what was removed.
+    pub reclaimed_tokens: u64,
+    /// What the recap itself costs, which is the part of the saving that is spent again.
+    pub summary_tokens: u64,
+}
+
+impl Compaction {
+    /// A round that changed nothing.
+    pub const NONE: Self = Self {
+        summary: None,
+        summarised_records: 0,
+        removed_records: 0,
+        reclaimed_tokens: 0,
+        summary_tokens: 0,
+    };
+
+    /// Whether the session is unchanged.
+    pub fn is_empty(&self) -> bool {
+        self.removed_records == 0 && self.summary.is_none()
+    }
+
+    /// What the session is estimated to have saved: what went, less what replaced it.
+    ///
+    /// Saturating, because a recap longer than the turns it covers is a bad summary rather
+    /// than a negative cost.
+    pub fn saved_tokens(&self) -> u64 {
+        self.reclaimed_tokens.saturating_sub(self.summary_tokens)
+    }
+}
+
+/// Frees a session's context by replacing its oldest turns with a recap of them.
+///
+/// This is the half of compaction that [`ContextStore::compact`] deliberately is not.
+/// The store reclaims *deterministically*: it drops the oldest evictable records and there
+/// is nothing left where they were. A compactor is what reads them first, has a model write
+/// down what they amounted to, appends that back through
+/// [`ContextStore::append`] as an ordinary record, and only then asks the store to reclaim.
+/// Everything it does, it does through the same public store methods any other caller has,
+/// which is why it can live outside the store — and why it is not, and must never become, a
+/// [`Tool`](crate::tool::Tool).
+///
+/// # Obligations
+///
+/// 1. **Act as the caller.** Every store call must use the `cx` it was given, so a compactor
+///    reaches exactly the sessions its caller could reach and no others. It must not
+///    construct a context of its own, and must not widen the principal it was handed.
+/// 2. **Summarise before removing.** A round that could not produce a recap must remove
+///    nothing and report [`Compaction::NONE`], because reclaiming without one is the
+///    silent history loss compaction exists to end.
+/// 3. **Never remove the recent end.** Whatever is kept, it is the newest records; a
+///    compactor that summarised the last thing the user said would answer a question it had
+///    just deleted.
+/// 4. **Leave pinned records alone.** They belong to whoever assembled the agent. A
+///    compactor neither summarises them away nor appends its recap as one — see below.
+/// 5. **Be idempotent when there is nothing to do.** A session too short to compact is
+///    [`Compaction::NONE`] and not an error, so a caller may try on every turn.
+///
+/// # The recap is content, not instruction
+///
+/// A summary is written *by a model*, from a transcript that contains tool output, file
+/// contents and whatever a user pasted — all of which may be hostile. So the record a
+/// compactor appends is subject to two rules that are not negotiable:
+///
+/// * **It is never pinned.** Pinning is [reserved for trusted
+///   callers](ContextEntry::pinned) precisely so a model cannot make its own words
+///   permanent, and a recap is model output. Unpinned, it ages out like anything else — and
+///   nothing is lost when it does, because the next round summarises it along with the rest.
+/// * **It is never a [`Role::System`](crate::model::Role::System) message.** Instructions
+///   that frame a conversation come from whoever assembled the agent. A recap that arrived
+///   as one would let text a model wrote — at the suggestion, perhaps, of a file it
+///   read — speak with the authority of the deployment's own prompt.
+///
+/// The recap is marked with [`SUMMARY_MARKER`] so that neither a later reader nor the model
+/// itself mistakes it for a turn that actually happened.
+///
+/// # Where the recap lands
+///
+/// At the end. A transcript is append-only and [`ContextStore`] offers no way to insert, so
+/// a recap of a session's *oldest* turns is stored as its *newest* record — after the turns
+/// it kept, not before them. That is a property callers have to plan around rather than one
+/// a compactor can fix:
+///
+/// * the recap must say what it is, in text a model reads before the summary itself, or the
+///   likeliest reading of the newest message in a conversation is that somebody just said
+///   it;
+/// * a caller that is about to append fresh input should **compact first and append after**,
+///   so that the last thing in the window is the thing being answered rather than a summary
+///   of what came before it.
+#[async_trait]
+pub trait ContextCompactor: Send + Sync + 'static {
+    /// Compacts `session` so that its next window fits `budget` better than this one did.
+    ///
+    /// `budget` is the one the caller assembles windows under, passed so that a compactor
+    /// can decide *how much* to reclaim rather than guessing; how it uses it is its own
+    /// policy. A caller that has no budget passes [`ContextBudget::UNLIMITED`], which is a
+    /// session that never needs compacting.
+    ///
+    /// Compacting an unknown session is [`Compaction::NONE`], not an error. Compacting one
+    /// owned by another principal is whatever the underlying store says, which is
+    /// [`Error::PermissionDenied`](aik_core::Error::PermissionDenied).
+    async fn compact(
+        &self,
+        session: &SessionId,
+        budget: &ContextBudget,
+        cx: &ExecutionContext,
+    ) -> Result<Compaction>;
+}
+
 /// One context window was assembled.
 ///
 /// Published on the kernel [`EventBus`](aik_core::EventBus) so context cost is observable
@@ -593,6 +736,28 @@ pub struct ContextAssembled {
 
 impl Event for ContextAssembled {
     const NAME: &'static str = "aik.context.assembled";
+}
+
+/// One session was compacted: its oldest turns were replaced by a recap of them.
+///
+/// The counterpart to [`ContextAssembled`], and the only record that a piece of a
+/// conversation stopped being available in full. It carries counts and one record id, never
+/// the recap's text: an event that shipped a summary of the conversation to a log
+/// aggregator would disclose, in one message, what a whole session was about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompacted {
+    /// The operation that triggered the compaction.
+    pub correlation: CorrelationId,
+    /// When it happened, by the kernel clock.
+    pub timestamp: Timestamp,
+    /// The session that was compacted.
+    pub session: SessionId,
+    /// What it did.
+    pub compaction: Compaction,
+}
+
+impl Event for ContextCompacted {
+    const NAME: &'static str = "aik.context.compacted";
 }
 
 #[cfg(test)]

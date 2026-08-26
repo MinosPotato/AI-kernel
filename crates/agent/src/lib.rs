@@ -13,6 +13,9 @@
 //!  AgentRequest
 //!       │
 //!       ▼
+//!  ContextCompactor      ── optional: asked for room while the window is dropping records
+//!       │
+//!       ▼
 //!  ContextStore::append  ── system prompt (pinned, once per session), then the input
 //!       │
 //!       ▼
@@ -93,11 +96,13 @@
 //! * **No process execution and no sandboxing.** Tools run in-process, as they already did.
 //!   A tool that spawns a subprocess needs an enforcement boundary the tool cannot reach
 //!   around, and that belongs with the tool's execution environment, not here.
-//! * **No summarisation or memory.** When a window overflows, the budget elides and evicts,
-//!   deterministically; replacing turns with a model-written summary is a fallible, costly
-//!   operation with its own injection surface, and belongs in a component above this one that
-//!   reads records through the store and appends the summary back as an ordinary pinned
-//!   record.
+//! * **No summarisation of its own, and no memory.** Replacing turns with a model-written
+//!   summary is a fallible, costly operation with its own injection surface, so it lives
+//!   behind [`ContextCompactor`](aik_api::context::ContextCompactor) — implemented by
+//!   [`aik-summary`](../aik_summary/index.html) — and the loop's whole part in it is the
+//!   trigger: when its window reports dropped records it asks for room, once, before taking
+//!   the turn. See [`AgentLoop::with_compactor`]. A loop with no compactor registered elides
+//!   and evicts deterministically, exactly as it always did.
 //! * **No token-level streaming.** [`Agent::stream`](aik_api::agent::Agent::stream) reports
 //!   at action granularity — content, a tool call, its result, the response — using
 //!   [`ModelProvider::complete`](aik_api::model::ModelProvider::complete), because that is

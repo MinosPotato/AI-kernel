@@ -270,6 +270,56 @@ pub struct ExecSettings {
     pub search_path: Option<String>,
 }
 
+/// What a deployment says about compacting long sessions, read from `agent.summary`.
+///
+/// Compaction is the one capability here that is *on* unless a deployment says otherwise,
+/// and the asymmetry is deliberate. Every other switch in this file guards something that
+/// reaches outside the conversation — a program that runs, a file that is written, a memory
+/// that is kept. This one guards nothing: the model, the principal, the transcript and the
+/// tools are the same either way. What turning it off changes is only what happens when a
+/// session outgrows its budget — a recap of the oldest turns, or their silent disappearance
+/// — and the second is the worse default to ship.
+///
+/// What it does cost is a model call per compaction, on a conversation long enough to need
+/// one. A deployment that would rather forget than pay sets `enabled = false`; one that would
+/// rather pay less names a smaller `model`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SummarySettings {
+    /// Whether long sessions are compacted at all. Absent means yes.
+    pub enabled: Option<bool>,
+    /// The model that writes recaps, defaulting to the model that answers.
+    pub model: Option<String>,
+    /// How many recent records to keep when no token budget bounds the window.
+    pub keep_recent: Option<usize>,
+}
+
+impl SummarySettings {
+    /// Whether this deployment registers a compactor at all.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The compactor's settings, falling back to `answering` when no model was named.
+    ///
+    /// The fallback is the agent's own model rather than a guess at a smaller one: a model
+    /// name that is not configured anywhere is a startup failure waiting for the first long
+    /// conversation, and the one model this deployment is known to be able to reach is the
+    /// one it is already answering with.
+    pub fn resolve(&self, answering: ModelId) -> aik_summary::SummarySettings {
+        let model = self
+            .model
+            .clone()
+            .filter(|model| non_blank(model))
+            .map_or(answering, ModelId::new);
+        let mut settings = aik_summary::SummarySettings::new(model);
+        if let Some(keep_recent) = self.keep_recent {
+            settings.keep_recent_records = keep_recent;
+        }
+        settings
+    }
+}
+
 /// Whether unattended scheduled work actually runs in this process.
 ///
 /// A schedule and a thing that runs it are two different capabilities, and wiring them
@@ -429,6 +479,7 @@ struct AgentSection {
     provider: Option<String>,
     system_prompt: Option<String>,
     exec: ExecSettings,
+    summary: SummarySettings,
 }
 
 impl AgentSection {
@@ -641,6 +692,7 @@ impl Deployment {
             memory: self.memory,
             exec: self.exec,
             exec_settings: section.exec,
+            summary: section.summary,
             storage,
             jobs: self.jobs,
             system_prompt: section.system_prompt.filter(|prompt| non_blank(prompt)),
@@ -714,6 +766,8 @@ pub struct RuntimeSettings {
     pub exec: ExecSet,
     /// Which programs may be run, and how, read from `agent.exec`.
     pub exec_settings: ExecSettings,
+    /// Whether long sessions are compacted, and with what, read from `agent.summary`.
+    pub summary: SummarySettings,
     /// Where the durable subsystems keep what they hold, if anywhere.
     pub storage: Storage,
     /// Whether scheduled jobs are executed in this process, and by what.
@@ -775,6 +829,7 @@ impl RuntimeSettings {
             memory: MemorySet::default(),
             exec: ExecSet::default(),
             exec_settings: ExecSettings::default(),
+            summary: SummarySettings::default(),
             storage: Storage::Ephemeral,
             jobs: JobExecution::default(),
             system_prompt: None,
@@ -835,6 +890,29 @@ impl RuntimeSettings {
         self.system_prompt.is_some()
     }
 
+    /// One line describing what happens to a session that outgrows its budget.
+    ///
+    /// Said out loud by both frontends for the same reason the database path is: compaction
+    /// spends a model call the person did not ask for, and its absence quietly loses the
+    /// beginning of long conversations. Either way, that is something to be told rather than
+    /// to discover.
+    pub fn summary_notice(&self) -> String {
+        if !self.summary.is_enabled() {
+            return "off (long sessions lose their oldest turns silently)".to_owned();
+        }
+        match self
+            .summary
+            .model
+            .as_deref()
+            .filter(|model| non_blank(model))
+        {
+            Some(model) => format!("on ({model} recaps what a long session no longer shows)"),
+            None => {
+                "on (the agent's own model recaps what a long session no longer shows)".to_owned()
+            }
+        }
+    }
+
     /// Whether a policy document was configured at all.
     ///
     /// An absent one is valid and denies everything, which is the right default and a
@@ -866,6 +944,73 @@ mod tests {
             storage: StorageChoice::None,
             ..Deployment::default()
         }
+    }
+
+    #[test]
+    fn compaction_is_on_by_default_and_uses_the_model_that_answers() {
+        let settings = deployment()
+            .resolve(Config::default(), env(&[]))
+            .expect("defaults resolve");
+
+        assert!(settings.summary.is_enabled());
+        assert_eq!(
+            settings.summary.resolve(ModelId::new("llama3.2")).model,
+            ModelId::new("llama3.2"),
+            "an unnamed summarising model is the one this deployment can already reach"
+        );
+    }
+
+    #[test]
+    fn a_deployment_can_compact_with_a_smaller_model_than_it_answers_with() {
+        let config = Config::builder()
+            .layer(json!({
+                "agent": { "summary": { "model": "llama3.2:1b", "keep_recent": 3 } }
+            }))
+            .build();
+
+        let settings = deployment().resolve(config, env(&[])).expect("resolves");
+        let summary = settings.summary.resolve(ModelId::new("llama3.2"));
+
+        assert!(settings.summary.is_enabled());
+        assert_eq!(summary.model, ModelId::new("llama3.2:1b"));
+        assert_eq!(summary.keep_recent_records, 3);
+    }
+
+    #[test]
+    fn both_frontends_say_what_happens_to_a_long_session() {
+        let mut settings = RuntimeSettings::new("/tmp");
+        assert!(settings.summary_notice().starts_with("on ("));
+
+        settings.summary.model = Some("llama3.2:1b".to_owned());
+        assert!(settings.summary_notice().contains("llama3.2:1b"));
+
+        settings.summary.enabled = Some(false);
+        assert!(settings.summary_notice().starts_with("off ("));
+    }
+
+    #[test]
+    fn compaction_can_be_turned_off_outright() {
+        let config = Config::builder()
+            .layer(json!({ "agent": { "summary": { "enabled": false } } }))
+            .build();
+
+        let settings = deployment().resolve(config, env(&[])).expect("resolves");
+        assert!(!settings.summary.is_enabled());
+    }
+
+    #[test]
+    fn a_misspelled_summary_key_fails_at_startup_naming_itself() {
+        // The failure mode this rules out is the one the whole section exists to end: a
+        // setting silently ignored looks exactly like a system that decided not to honour it.
+        let config = Config::builder()
+            .layer(json!({ "agent": { "summary": { "enabld": false } } }))
+            .build();
+
+        let error = deployment()
+            .resolve(config, env(&[]))
+            .expect_err("an unknown key is a mistake, not a default");
+        assert_eq!(error.kind(), aik_core::ErrorKind::Config);
+        assert!(format!("{error}").contains("enabld"), "{error}");
     }
 
     #[test]

@@ -43,6 +43,7 @@ AI-kernel/
 │  ├─ store/    → aik-store    : the shared redb database backing context and memory
 │  ├─ memory/   → aik-memory   : a persistent record store, retrieved by kind, metadata or meaning
 │  ├─ scheduler/→ aik-scheduler: time- and event-triggered jobs, optionally durable
+│  ├─ summary/  → aik-summary  : a session's oldest turns, replaced by a recap of them
 │  ├─ agent/    → aik-agent    : the agent loop tying every capability above together
 │  ├─ runtime/  → aik-runtime  : system assembly — settings in, wired kernel out
 │  ├─ ipc/      → aik-ipc      : the authenticated local protocol, host and client halves
@@ -65,7 +66,10 @@ first `Tool` implementation, and the first code in the workspace that touches th
 filesystem; `aik-exec` is the first whose subject is host code rather than a request it
 carries out itself, and so the first that needs an enforcement boundary — namespaces — rather
 than a check it makes on itself; `aik-context` implements `ContextStore`; `aik-scheduler` implements `Scheduler`, running
-unattended work against the same shared database; `aik-agent` composes a `ModelProvider`,
+unattended work against the same shared database; `aik-summary` implements `ContextCompactor`
+— the first crate here that is *beside* a subsystem rather than under it, composing the
+context store with a model to do the one thing that store cannot do without becoming
+fallible; `aik-agent` composes a `ModelProvider`,
 a `ToolRegistry` and a `ContextStore` into a request/response loop; `aik-runtime` is the one
 thing that assembles a real kernel out of all of them; `aik-daemon` is the long-lived process
 that owns that kernel, the database under it and the schedule over it, and serves clients over
@@ -181,6 +185,7 @@ every "Implemented by" column below is a separate crate.
 | `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (both), `aik-anthropic` (`ModelProvider`) |
 | `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
+| `context`    | `ContextCompactor`: replacing evicted turns with a recap, rather than losing them | `aik-summary` |
 | `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query needs an `Embedder`) |
 | `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               | `aik-policy` (`PolicyEngine`), `aik-approval` (`ApprovalSink`) |
 | `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) | `aik-scheduler` |
@@ -195,7 +200,18 @@ owner, precisely because building it showed that a schedule nobody owns cannot b
 `platform` remains a shape with no implementation yet, deliberately not built ahead of the
 evidence that would justify one.
 
-`Embedder` is the most recent of these to acquire an implementation, and it is worth noting
+`ContextCompactor` is the most recent of these, and the only one added *because* an existing
+contract refused to grow. `ContextStore::compact` says, in the contract itself, that it will
+never summarise: it is deterministic, model-free and cannot fail interestingly, and a store
+that summarised would have to be all three of the opposite things. So the capability became a
+second trait in the same module rather than a method on the first, implemented by a crate
+that holds a `ContextStore` and a `ModelProvider` and adds no state of its own. What that
+buys is the ability to say no in one place: an implementation is required to summarise before
+it removes anything, so every failure mode — an unreachable model, an empty answer, a caller
+who does not own the session — leaves a session holding more than it needs rather than less
+than it had.
+
+`Embedder` was the previous one to acquire an implementation, and it is worth noting
 what that cost: nothing in `aik-api` changed shape, because the contract already said what an
 embedder was. `aik-memory` gained an optional collaborator and `MemoryStore` gained a
 `capabilities()` method with a default, so a store that cannot rank by meaning still compiles

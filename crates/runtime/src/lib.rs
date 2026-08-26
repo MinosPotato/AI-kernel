@@ -65,7 +65,7 @@ pub use jobs::{AgentJobComponent, AgentJobHandler, AgentJobPayload};
 pub use settings::{
     AGENT_SECTION, DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, Deployment, ENV_PREFIX, ExecSet,
     ExecSettings, JobExecution, MemorySet, POLICY_SECTION, Provider, RuntimeSettings,
-    SYSTEM_PROMPT_KEY, Storage, StorageChoice, ToolSet, load_config, pin_database_path,
-    system_prompt,
+    SYSTEM_PROMPT_KEY, Storage, StorageChoice, SummarySettings, ToolSet, load_config,
+    pin_database_path, system_prompt,
 };
 pub use wiring::{Assembled, assemble, builder, first_available_model};

@@ -26,6 +26,7 @@ aik-ollama.workspace = true
 aik-policy.workspace = true
 aik-scheduler.workspace = true
 aik-store.workspace = true
+aik-summary.workspace = true
 aik-tools.workspace = true
 async-trait.workspace = true
 serde.workspace = true
