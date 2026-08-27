@@ -75,6 +75,7 @@ use aik_summary::SummaryComponent;
 use aik_tools::ToolsComponent;
 
 use crate::jobs::AgentJobComponent;
+use crate::schedule_tools::ScheduleToolsComponent;
 use crate::settings::{
     ExecSet, ExecSettings, JobExecution, MCP_SERVERS_PATH, MemorySet, Provider, RuntimeSettings,
     Storage, ToolSet,
@@ -179,6 +180,17 @@ pub fn builder(
         }
     }
 
+    // Scheduling a prompt is only offered when something in this process will actually run
+    // it: with `JobExecution::Disabled`, `schedule.create` would let a model create a job
+    // that can never fire, since no `AgentJobHandler` is registered to be its handler.
+    let schedule_tools = ScheduleToolsComponent::new();
+    if matches!(settings.jobs, JobExecution::Agent) {
+        tools = tools
+            .with_tool(schedule_tools.create())
+            .with_tool(schedule_tools.list())
+            .with_tool(schedule_tools.cancel());
+    }
+
     let mut agent = AgentComponent::new(
         settings.agent.clone(),
         settings.loop_settings(model.clone()),
@@ -266,7 +278,9 @@ pub fn builder(
     // holds is a separate decision. See [`JobExecution`].
     let builder = match settings.jobs {
         JobExecution::Disabled => builder,
-        JobExecution::Agent => builder.component(AgentJobComponent::new()),
+        JobExecution::Agent => builder
+            .component(AgentJobComponent::new())
+            .component(schedule_tools),
     };
 
     let builder = match compactor {
