@@ -58,10 +58,14 @@
 //! ```
 
 pub mod jobs;
+pub mod schedule_tools;
 pub mod settings;
 pub mod wiring;
 
 pub use jobs::{AgentJobComponent, AgentJobHandler, AgentJobPayload};
+pub use schedule_tools::{
+    ScheduleCancelTool, ScheduleCreateTool, ScheduleListTool, ScheduleToolsComponent,
+};
 pub use settings::{
     AGENT_SECTION, DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, Deployment, ENV_PREFIX, ExecSet,
     ExecSettings, JobExecution, MCP_SERVERS_PATH, McpSet, McpSettings, MemorySet, POLICY_SECTION,
