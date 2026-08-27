@@ -1,0 +1,149 @@
+# The verification suite documented in README.md ("Development"), enforced.
+#
+# Every job here mirrors one command a contributor is expected to run locally. If a
+# command is added there it belongs here too, and vice versa: a suite nothing runs is
+# a suite that is already broken.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default. No job here writes to the repository, publishes anything, or
+# needs a token beyond checking out a public tree.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI machine is not a workstation: an incremental cache costs more to restore than
+  # the rebuild it saves, and debug info is only ever read by a human at a breakpoint.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+# Deliberately *not* set here: `RUSTFLAGS: -D warnings`. Cargo passes RUSTFLAGS to
+# every unit it builds, dependencies included, so a global one would let a warning in
+# somebody else's crate fail a pull request that never touched it. Warnings are denied
+# where they can be scoped to this workspace instead: the `clippy` job passes
+# `-D warnings` after `--`, which reaches the primary packages only, and the lints the
+# workspace actually cares about are declared in `[workspace.lints]` in Cargo.toml.
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: check
+      - run: cargo check --workspace --all-targets --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: clippy
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: test
+      # aik-exec confines children with bubblewrap and unprivileged user namespaces.
+      # Its tests skip themselves on a host with no `bwrap` at all, so without this the
+      # sandbox — the one boundary here that is enforcement rather than a cooperative
+      # check — would be the least tested thing in the workspace on the only machine
+      # that gates merges. Ubuntu 24.04 ships an AppArmor profile that denies
+      # unprivileged user namespaces; the sysctl lifts it for this runner only.
+      - name: Enable the sandbox the exec tests need
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --unshare-user --unshare-pid --ro-bind / / -- /bin/true
+      - run: cargo test --workspace --locked
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: docs
+      # Scoped by `--no-deps`: rustdoc only documents this workspace, so denying
+      # warnings here cannot be tripped by a dependency's documentation.
+      - run: cargo doc --workspace --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The claim in Cargo.toml, checked against a compiler that old rather than
+      # against whatever stable happens to be. Read from the manifest so the two
+      # cannot drift.
+      - name: Read rust-version from the workspace manifest
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml | head -1)"
+          if [ -z "$version" ]; then
+            echo "no rust-version in Cargo.toml [workspace.package]" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install the toolchain
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+      # Compilability only. An old compiler's lint set is not the current one's, so
+      # this job is not the place to be strict about warnings; `clippy` is.
+      - run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      # Advisories, licences, duplicate versions and, above all, sources: a dependency
+      # pulled from anywhere but crates.io is a supply-chain question, and this is
+      # where it gets asked. The policy itself is deny.toml.
+      - uses: ./.github/actions/cargo-deny
+        with:
+          checks: all

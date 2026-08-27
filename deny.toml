@@ -1,0 +1,66 @@
+# Supply-chain policy for the workspace, enforced by `cargo deny check` in CI.
+#
+# The workspace is deliberately thin on dependencies, and this file is how that stays
+# true rather than being a thing somebody remembers. It answers four questions about
+# everything the tree links against: is it known-vulnerable, may we ship it, are we
+# carrying it twice, and where did it come from.
+
+[graph]
+# The target system is Linux, but the workspace claims to compile anywhere Tokio does,
+# so the graph is resolved for every target rather than only the host's. Anything
+# platform-specific that slips in is then a licence and advisory question here too.
+all-features = true
+
+[advisories]
+version = 2
+# No `ignore` entries. An advisory against a dependency is a decision to make in a
+# commit that explains it, not a line that quietly accumulates.
+ignore = []
+# `unmaintained` findings are informational rather than exploitable; they are still
+# worth failing on in a tree this small, where replacing one crate is a morning's work.
+unmaintained = "all"
+yanked = "deny"
+
+[licenses]
+version = 2
+# The workspace itself is MIT OR Apache-2.0. Everything it links against must be
+# something that can ship under those terms: permissive only, no copyleft, and no
+# unknown or unparseable licence text.
+#
+# This is exactly the set the current tree actually uses, and cargo-deny warns when an
+# entry here goes unused. Adding a licence is therefore a deliberate act with a diff
+# attached, which is the point: the list is a decision, not a catch-all.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are a warning rather than an error: they are usually somebody
+# else's transitive problem, and failing on them would make an unrelated upgrade
+# somewhere in the tree block an unrelated pull request here.
+multiple-versions = "warn"
+# A wildcard version is an unbounded promise about code nobody has read yet.
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # `openssl-sys` links the system OpenSSL. Every HTTP client here is configured for
+    # rustls precisely so that the TLS stack is one the build controls; a dependency
+    # quietly enabling the native-tls path would undo that without a diff to notice.
+    { crate = "openssl-sys", reason = "this workspace uses rustls; see reqwest's features in Cargo.toml" },
+    { crate = "native-tls", reason = "this workspace uses rustls; see reqwest's features in Cargo.toml" },
+]
+
+[sources]
+# Where code came from. Nothing in this tree should come from anywhere but crates.io,
+# and a git dependency is a review question rather than a default.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

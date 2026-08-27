@@ -1,0 +1,44 @@
+# Install a pinned cargo-deny and run it.
+#
+# Pinned rather than latest, for the same reason the workspace commits a Cargo.lock:
+# the tool that polices the supply chain should not itself arrive from an unpinned
+# `cargo install` on every run. Both workflows share this file so the version is
+# written down once, which is also what makes the binary cache key correct.
+name: cargo-deny
+description: Run cargo-deny against the workspace with a pinned version.
+
+inputs:
+  checks:
+    description: Which cargo-deny checks to run (advisories, bans, licenses, sources, all).
+    required: false
+    default: all
+
+runs:
+  using: composite
+  steps:
+    - id: version
+      shell: bash
+      run: echo "cargo-deny=0.20.2" >> "$GITHUB_OUTPUT"
+
+    # Building cargo-deny from source is minutes; restoring it is seconds. The version
+    # is in the key, so a bump above invalidates the cache rather than silently
+    # reusing the old binary.
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-deny
+        key: cargo-deny-${{ steps.version.outputs.cargo-deny }}-${{ runner.os }}
+
+    # RUSTFLAGS is cleared for the build: whatever a workflow denies about this
+    # workspace's code has no bearing on compiling somebody else's tool.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        RUSTFLAGS: ""
+        RUSTDOCFLAGS: ""
+      run: cargo install --locked --version ${{ steps.version.outputs.cargo-deny }} cargo-deny
+
+    # `--all-features` so the graph checked is the widest one any job here builds,
+    # rather than the default-feature subset.
+    - shell: bash
+      run: cargo deny --all-features check ${{ inputs.checks }}

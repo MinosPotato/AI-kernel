@@ -1,0 +1,34 @@
+# The advisory database moves; Cargo.lock does not.
+#
+# CI answers "is this change safe" and runs when somebody pushes. Nobody pushes on the
+# day a vulnerability is published against a dependency that has been pinned here for
+# months, so that day would otherwise pass unnoticed. This job asks the question on a
+# schedule instead of on a commit.
+name: Advisories
+
+on:
+  schedule:
+    # 05:17 UTC daily. Off the hour on purpose: the top of the hour is when every
+    # scheduled job on the platform runs, and queued is indistinguishable from broken.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  advisories:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      # Only the checks whose answer can change without a commit. Licences, bans and
+      # sources are properties of the tree, and CI already has those covered.
+      - uses: ./.github/actions/cargo-deny
+        with:
+          checks: advisories

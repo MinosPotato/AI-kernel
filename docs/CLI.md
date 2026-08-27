@@ -17,7 +17,7 @@ its own — see [The host process](#the-host-process-aikd).
 
 ## Prerequisites
 
-- Rust 1.85 or newer (edition 2024) — `rustc --version`
+- Rust 1.90 or newer (edition 2024) — `rustc --version`
 - A running [Ollama](https://ollama.com) server, local or remote — `ollama serve`
 - At least one model pulled — `ollama pull llama3.1:8b`
 - For tool-calling scenarios (the interesting ones), the model must report the `tools`

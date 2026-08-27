@@ -1,0 +1,22 @@
+# Dependency updates as pull requests, so an upgrade arrives with a diff and a CI run
+# rather than as a `cargo update` somebody ran locally.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Patch and minor bumps of the same crate arrive together: individually they are
+    # noise, and as one pull request they are one review and one CI run.
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]
+
+  # The workflows above pin actions by major tag. Dependabot is what moves those pins
+  # when a new major appears, rather than them silently ageing.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
