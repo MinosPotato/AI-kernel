@@ -27,6 +27,7 @@ use aik_api::model::{
     CompletionRequest, ContentPart, FinishReason, Message, ModelProvider, Role, ToolDefinition,
     Usage,
 };
+use aik_api::quota::{QuotaGuard, UsageCharge};
 use aik_api::tool::{ToolCall, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::clock::{SharedClock, Timestamp};
 use aik_core::event::{Envelope, EventBus};
@@ -59,6 +60,9 @@ pub(crate) struct Wiring {
     /// What the run asks for room when a window starts dropping records, if anything; see
     /// [`crate::AgentLoop::with_compactor`].
     pub(crate) compactor: Option<Arc<dyn ContextCompactor>>,
+    /// What the run asks before each turn and charges afterwards, if anything; see
+    /// [`crate::AgentLoop::with_quota`].
+    pub(crate) quota: Option<Arc<dyn QuotaGuard>>,
 }
 
 /// One conversation turn-taking session, advanced one action at a time.
@@ -362,6 +366,13 @@ impl Run {
             )));
         }
 
+        // Before anything is assembled, compacted or counted. A principal that is out of
+        // budget must cost nothing to refuse — and in particular must not have a compaction
+        // run, since that is itself a model call.
+        if let Some(quota) = &self.wiring.quota {
+            quota.check(&self.wiring.settings.model, &self.cx).await?;
+        }
+
         // Recomputed every turn, from the transcript, under the run's budget. Nothing that
         // was elided or evicted here is lost: it stays in the store, addressable by record
         // id.
@@ -412,6 +423,12 @@ impl Run {
         // produced.
         self.publish_measurement(estimate, context_usage, response.usage, model_latency);
 
+        // Not observational. The turn has been taken and something has to be charged for it,
+        // so a guard that cannot record it ends the run rather than letting the next turn
+        // proceed on a budget nobody is keeping.
+        self.charge(response.usage, estimate, &response.message)
+            .await?;
+
         if response.finish_reason == FinishReason::Cancelled {
             return Err(Error::Cancelled);
         }
@@ -445,6 +462,38 @@ impl Run {
         }
 
         Ok(updates)
+    }
+
+    /// Charges the quota guard, if there is one, for the turn that just happened.
+    ///
+    /// The figures are the provider's own when it reports usage. When it does not, they are
+    /// this run's own estimate — the same one [`RequestMeasured`] carries for the request,
+    /// plus the counter's reading of the reply — and the charge says so. Substituting an
+    /// estimate is what keeps a token or cost ceiling reachable behind a provider that
+    /// reports nothing; charging zero would quietly make one unenforceable.
+    async fn charge(
+        &self,
+        usage: Option<Usage>,
+        estimate: RequestEstimate,
+        reply: &Message,
+    ) -> Result<()> {
+        let Some(quota) = &self.wiring.quota else {
+            return Ok(());
+        };
+        let charge = match usage {
+            Some(usage) => UsageCharge::turn(
+                self.wiring.settings.model.clone(),
+                usage.input_tokens,
+                usage.output_tokens,
+            ),
+            None => UsageCharge::turn(
+                self.wiring.settings.model.clone(),
+                estimate.total_tokens,
+                self.wiring.counter.count_message(reply),
+            )
+            .as_estimate(),
+        };
+        quota.record(&charge, &self.cx).await
     }
 
     /// Accepts a tool call against the run's budget and announces it.

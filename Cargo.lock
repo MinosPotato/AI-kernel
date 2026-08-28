@@ -243,6 +243,7 @@ dependencies = [
  "aik-mcp",
  "aik-memory",
  "aik-policy",
+ "aik-quota",
  "aik-runtime",
  "aik-scheduler",
  "aik-store",
@@ -339,6 +340,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-quota"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-policy",
+ "aik-store",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aik-runtime"
 version = "0.1.0"
 dependencies = [
@@ -355,6 +373,7 @@ dependencies = [
  "aik-memory",
  "aik-ollama",
  "aik-policy",
+ "aik-quota",
  "aik-scheduler",
  "aik-store",
  "aik-summary",

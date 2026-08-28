@@ -38,6 +38,16 @@ pub const DATABASE_PATH_KEY: &str = "components.store.db.path";
 /// The configuration path the policy document is read from.
 pub const POLICY_SECTION: &str = "policy";
 
+/// The configuration section the spend ceilings are read from.
+///
+/// A top-level section rather than the quota component's own, for the same reason
+/// [`POLICY_SECTION`] is one: it is read and validated while the kernel is being assembled,
+/// so a malformed ceiling stops the deployment from starting with the rule that is wrong
+/// named, rather than surfacing at the first model turn somebody takes. It also puts the two
+/// documents that decide what the system may do side by side — one deciding whether, the
+/// other how much.
+pub const QUOTA_SECTION: &str = "quota";
+
 /// The configuration section the agent's own settings are read from.
 ///
 /// Deliberately *not* a frontend's section. What the agent is told before its first turn is a
@@ -404,10 +414,11 @@ pub enum JobExecution {
 
 /// Where a deployment keeps everything that could outlive one turn.
 ///
-/// The transcript, the agent's memories, any persistent scheduled job and the audit trail
-/// share one database, so this is one decision rather than four: a deployment either has
-/// somewhere durable to put them or it does not, and it cannot end up remembering facts while
-/// forgetting the conversation they came from.
+/// The transcript, the agent's memories, any persistent scheduled job, the audit trail and
+/// the spend ledger share one database, so this is one decision rather than five: a
+/// deployment either has somewhere durable to put them or it does not, and it cannot end up
+/// remembering facts while forgetting the conversation they came from — or enforcing a
+/// monthly budget that a restart resets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Storage {
     /// No database. Everything lives for the life of the process.

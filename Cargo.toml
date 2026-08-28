@@ -9,6 +9,7 @@ members = [
     "crates/tools",
     "crates/mcp",
     "crates/policy",
+    "crates/quota",
     "crates/fs",
     "crates/exec",
     "crates/approval",
@@ -40,6 +41,7 @@ aik-api = { version = "0.1.0", path = "crates/api" }
 aik-tools = { version = "0.1.0", path = "crates/tools" }
 aik-mcp = { version = "0.1.0", path = "crates/mcp" }
 aik-policy = { version = "0.1.0", path = "crates/policy" }
+aik-quota = { version = "0.1.0", path = "crates/quota" }
 aik-fs = { version = "0.1.0", path = "crates/fs" }
 aik-exec = { version = "0.1.0", path = "crates/exec" }
 aik-approval = { version = "0.1.0", path = "crates/approval" }

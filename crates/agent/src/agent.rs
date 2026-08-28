@@ -7,6 +7,7 @@ use aik_api::context::ContextCompactor;
 use aik_api::context::{ContextStore, TokenCounter};
 use aik_api::execution::ExecutionContext;
 use aik_api::model::ModelProvider;
+use aik_api::quota::QuotaGuard;
 use aik_api::tool::{ToolName, ToolRegistry};
 use aik_core::Result;
 use aik_core::clock::{SharedClock, SystemClock};
@@ -144,6 +145,9 @@ pub struct AgentLoop {
     /// What the loop asks for room when a window starts dropping records, if anything;
     /// see [`AgentLoop::with_compactor`].
     compactor: Option<Arc<dyn ContextCompactor>>,
+    /// What the loop asks before every turn, and tells afterwards; see
+    /// [`AgentLoop::with_quota`].
+    quota: Option<Arc<dyn QuotaGuard>>,
 }
 
 impl std::fmt::Debug for AgentLoop {
@@ -155,6 +159,7 @@ impl std::fmt::Debug for AgentLoop {
             .field("max_tool_calls", &self.settings.max_tool_calls)
             .field("tools", &self.allowed)
             .field("compacts", &self.compactor.is_some())
+            .field("metered", &self.quota.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -184,6 +189,7 @@ impl AgentLoop {
             counter: Arc::new(FallbackTokenCounter),
             events: None,
             compactor: None,
+            quota: None,
         }
     }
 
@@ -268,6 +274,34 @@ impl AgentLoop {
         self
     }
 
+    /// Asks `quota` before every model turn, and tells it what the turn cost afterwards.
+    ///
+    /// The bounds in [`AgentLoopSettings`] stop one run; this stops a principal, across every
+    /// run it starts. Without one, a deployment has per-run bounds only, exactly as it did
+    /// before quotas existed.
+    ///
+    /// # What the loop guarantees about it
+    ///
+    /// * The check happens **before** the request is assembled, so an exhausted budget costs
+    ///   nothing at all — not a window assembly, not a compaction, not a token.
+    /// * The charge is recorded **after** the response, from
+    ///   [`CompletionResponse::usage`](aik_api::model::CompletionResponse::usage) when the
+    ///   provider reports it and from this run's own [`TokenCounter`] when it does not, marked
+    ///   as an estimate either way. A provider that reports nothing would otherwise charge
+    ///   zero for ever, which would make a token or cost ceiling silently unreachable.
+    /// * A guard that **fails** ends the run. That is deliberate for both directions: a check
+    ///   that cannot be answered is not a budget, and spend that cannot be recorded is spend
+    ///   with no account of it. The turn that was already taken stays in the transcript, so
+    ///   nothing is lost — the run simply does not start another.
+    /// * Nothing here is derived from model output. The principal comes from the run's
+    ///   [`ExecutionContext`], the model from the run's settings, the figures from the
+    ///   provider or the counter.
+    #[must_use]
+    pub fn with_quota(mut self, quota: Arc<dyn QuotaGuard>) -> Self {
+        self.quota = Some(quota);
+        self
+    }
+
     /// Starts a run, deriving its execution context from the caller's.
     fn begin(&self, request: AgentRequest, cx: &ExecutionContext) -> Run {
         let session = request.session;
@@ -290,6 +324,7 @@ impl AgentLoop {
                 events: self.events.clone(),
                 allowed: self.allowed.clone(),
                 compactor: self.compactor.clone(),
+                quota: self.quota.clone(),
             },
             session,
             request.input,

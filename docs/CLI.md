@@ -656,6 +656,63 @@ rejected on syntax alone) and a symlink whose target resolves outside the root
 audit consumer can tell a genuine escape attempt from a typo; see
 [Filesystem confinement](#filesystem-confinement)), never reaching a permission decision.
 
+### Spend ceilings: the `quota` section
+
+Policy decides whether an action may happen. A quota decides whether there is any budget left
+for one that may. They are independent, both apply, and they live side by side in the same
+file:
+
+```json
+{ "quota": {
+    "limits": [
+      { "subject": "*",         "period": "day",   "max_turns": 500 },
+      { "subject": "*",         "period": "month", "max_cost_micros": 50000000 },
+      { "subject": "scheduler", "period": "hour",  "max_turns": 20 }
+    ],
+    "prices": {
+      "claude-*": { "input_micros_per_million": 3000000, "output_micros_per_million": 15000000 },
+      "*":        { "input_micros_per_million": 0, "output_micros_per_million": 0 }
+    }
+} }
+```
+
+Four things differ from the policy document above and each of them matters when writing one:
+
+- **Every matching rule applies.** Not first-match-wins. Order is insignificant, and a rule
+  added here can only tighten what was already there. To raise one subject's ceiling, narrow
+  the rule that constrains it rather than adding a more specific rule to override it.
+- **`period` is required**, and is UTC: `hour`, `day`, `week` (ISO, Monday to Monday), `month`
+  or `total`. `total` never resets.
+- **A charge lands on two identities.** Every turn is counted against the acting principal
+  *and* against whoever it is acting for. Since every CLI turn runs as `agent.agent` acting for
+  `agent.user`, a rule naming either of them counts the same turns, and a rule naming
+  `scheduler` counts what unattended work spends on everybody's behalf together.
+- **A cost ceiling needs a price for every model it might see.** Prices are per million
+  tokens, in millionths of a currency unit, keyed by the same pattern syntax as policy
+  resources — note `"claude-*"` with the star, since `"claude-"` without one is an exact match
+  no model id has. A model with no price under a cost ceiling is *refused*, naming the key to
+  add; that is deliberate, because pricing an unknown model at zero is how a budget silently
+  stops meaning anything. A genuinely free model is priced at zero explicitly.
+
+A malformed rule stops the process at startup, naming it — `configuration error at
+quota.limits[1].max_turns` — rather than surfacing at the first turn. A ceiling of zero is
+refused rather than obeyed: it reads as a prohibition, and a prohibition belongs in the policy
+document where it is auditable as an authorization decision.
+
+When a ceiling is reached, the run stops with a permission error naming the subject, both
+numbers, the window and when it resets:
+
+```text
+`user` has used 500 of 500 model turns for this day; the day window `day:2026-08-28` resets
+at 2026-08-29T00:00:00Z
+```
+
+Two properties are worth knowing before relying on it. A period can end **one turn** over its
+ceiling, because what a turn costs is only knowable after it has been taken — set the ceiling
+where one turn of slack is acceptable. And the ledger is durable only where the rest of the
+state is: with `--ephemeral`, a budget lasts as long as the process, exactly as the audit trail
+does.
+
 ## Approvals and the one-shot security posture
 
 `require_approval` is answered by whoever holds an `ApprovalGate`. **Interactive mode holds

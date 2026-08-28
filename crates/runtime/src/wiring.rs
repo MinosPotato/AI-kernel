@@ -13,7 +13,7 @@
 //! a host process that stays — and the moment there were two, "how the system is put
 //! together" stopped being a property of either. Two copies of this function would be two
 //! deployments that agree today: the same policy section, the same component ids, the same
-//! four durable subsystems over the same database. They would not stay that way, and the
+//! five durable subsystems over the same database. They would not stay that way, and the
 //! first divergence anybody noticed would be a capability present in one and absent in the
 //! other, which is a security difference.
 //!
@@ -23,8 +23,9 @@
 //!
 //! # The durable stack
 //!
-//! The transcript, the agent's memories, the schedule and the audit trail are four subsystems
-//! over one database, and each publishes the same capability under the same component id
+//! The transcript, the agent's memories, the schedule, the audit trail and the spend ledger
+//! are five subsystems over one database, and each publishes the same capability under the
+//! same component id
 //! whichever backend is chosen. So the choice is one `match` on [`Storage`] and nothing
 //! downstream changes: the agent resolves `dyn ContextStore`, the memory tools bind to
 //! `dyn MemoryStore`, and neither can tell — nor should be able to tell — whether what it
@@ -69,6 +70,7 @@ use aik_mcp::{McpCatalog, McpClient, McpComponent};
 use aik_memory::{MemoryComponent, MemoryToolsComponent, RedbMemoryComponent};
 use aik_ollama::OllamaComponent;
 use aik_policy::RuleBasedPolicyEngine;
+use aik_quota::{QuotaComponent, QuotaDocument, RedbQuotaComponent};
 use aik_scheduler::{RedbSchedulerComponent, SchedulerComponent};
 use aik_store::StoreComponent;
 use aik_summary::SummaryComponent;
@@ -83,6 +85,8 @@ use crate::settings::{
 
 /// The configuration path the policy document is read from.
 pub use crate::settings::POLICY_SECTION;
+/// The configuration path the spend ceilings are read from.
+pub use crate::settings::QUOTA_SECTION;
 
 /// Everything a frontend needs to hold onto after the kernel is built.
 #[derive(Debug)]
@@ -111,6 +115,11 @@ pub fn builder(
     // Read and validated here so a malformed document fails at startup, naming the rule that
     // is wrong, rather than at the first tool call.
     let policy = RuleBasedPolicyEngine::from_config(&settings.config, POLICY_SECTION)?;
+
+    // The other half of "what may this deployment do": policy decides whether, this decides
+    // how much. Read at the same point and for the same reason — a ceiling nobody can parse
+    // should stop the process, not the first turn.
+    let quota = QuotaDocument::from_config(&settings.config, QUOTA_SECTION)?;
 
     let mut tools = ToolsComponent::new()
         .with_policy(Arc::new(policy))
@@ -198,6 +207,12 @@ pub fn builder(
     .described("the assistant this deployment serves")
     .requires(aik_tools::DEFAULT_COMPONENT_ID)
     .requires(aik_context::DEFAULT_COMPONENT_ID)
+    // Declared unconditionally, and the guard is registered unconditionally to match. A
+    // deployment that configured ceilings and silently did not get them is the one outcome
+    // worth designing against, and the way to make it impossible is to leave nothing
+    // conditional: an empty document produces a guard that refuses nothing and writes
+    // nothing, which is exactly what "no quota" meant before there was one.
+    .requires(aik_quota::DEFAULT_COMPONENT_ID)
     .requires(settings.model_component.clone());
 
     // Registered before the agent and declared as a dependency of it, because the agent
@@ -250,6 +265,7 @@ pub fn builder(
                 .component(memory)
                 .component(SchedulerComponent::new())
                 .component(AuditComponent::new())
+                .component(QuotaComponent::new(quota))
         }
         Storage::Persistent(_) => {
             let memory = RedbMemoryComponent::new();
@@ -263,6 +279,7 @@ pub fn builder(
                 .component(memory)
                 .component(RedbSchedulerComponent::new())
                 .component(RedbAuditComponent::new())
+                .component(RedbQuotaComponent::new(quota))
         }
     };
 

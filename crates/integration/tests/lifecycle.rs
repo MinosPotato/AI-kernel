@@ -181,7 +181,7 @@ async fn the_stack_records_one_schema_version_for_every_subsystem() {
     assert_eq!(
         db.schema_version().unwrap(),
         aik_store::SCHEMA_VERSION,
-        "four subsystems in one file agree on one schema version"
+        "every subsystem in one file agrees on one schema version"
     );
 
     drop(db);

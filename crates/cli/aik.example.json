@@ -33,6 +33,40 @@
     }
   },
 
+  "quota": {
+    "limits": [
+      {
+        "description": "A day's work for anybody. Every rule whose subject matches applies — unlike the policy document above, this is not first-match-wins — so a rule added here can only ever tighten what came before it.",
+        "subject": "*",
+        "period": "day",
+        "max_turns": 500
+      },
+      {
+        "description": "And a month's money, priced below. 50 currency units, in millionths: a ceiling that a runaway loop reaches long before a person does.",
+        "subject": "*",
+        "period": "month",
+        "max_cost_micros": 50000000
+      },
+      {
+        "description": "Autonomous work is bounded far more tightly than attended work, because nobody is watching it. A charge lands on the acting principal and on whoever it acts for, so this counts everything the schedule spends on everyone's behalf together.",
+        "subject": "scheduler",
+        "period": "hour",
+        "max_turns": 20
+      }
+    ],
+
+    "prices": {
+      "claude-*": {
+        "input_micros_per_million": 3000000,
+        "output_micros_per_million": 15000000
+      },
+      "*": {
+        "input_micros_per_million": 0,
+        "output_micros_per_million": 0
+      }
+    }
+  },
+
   "policy": {
     "rules": [
       {

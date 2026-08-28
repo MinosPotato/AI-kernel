@@ -30,6 +30,7 @@ aik-tools.workspace = true
 aik-mcp.workspace = true
 aik-exec.workspace = true
 aik-policy.workspace = true
+aik-quota.workspace = true
 aik-fs.workspace = true
 aik-agent.workspace = true
 # Both frontends, because the property under test in `deployment.rs` is that they resolve the

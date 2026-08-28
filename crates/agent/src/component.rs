@@ -5,6 +5,7 @@ use std::sync::Arc;
 use aik_api::agent::{Agent, AgentId};
 use aik_api::context::{ContextCompactor, ContextStore, TokenCounter};
 use aik_api::model::ModelProvider;
+use aik_api::quota::QuotaGuard;
 use aik_api::tool::{ToolName, ToolRegistry};
 use aik_core::prelude::*;
 
@@ -166,6 +167,15 @@ impl Component for AgentComponent {
         // here would turn a capability into a startup dependency.
         if let Ok(compactor) = ctx.service::<dyn ContextCompactor>() {
             agent = agent.with_compactor(compactor);
+        }
+        // Optional in the same way, and the asymmetry is the point: a deployment that
+        // registered no guard has per-run bounds only, which is what every deployment had
+        // before quotas existed. What must *not* happen is a deployment that registered one
+        // and silently did not get it, and that is a wiring question rather than a resolution
+        // one — `requires` is what orders the guard's component before this one, so a
+        // registered guard is always found here. See `aik-runtime`, which declares it.
+        if let Ok(quota) = ctx.service::<dyn QuotaGuard>() {
+            agent = agent.with_quota(quota);
         }
         if let Some(description) = &self.description {
             agent = agent.described(description.clone());
