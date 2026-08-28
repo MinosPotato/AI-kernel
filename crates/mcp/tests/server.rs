@@ -338,7 +338,26 @@ async fn shutting_the_kernel_down_stops_the_server() {
     // The failure this rules out is a kernel that exits and leaves a tool server running,
     // holding whatever it had open.
     let directory = tempfile::tempdir().unwrap();
-    let (kernel, _catalog) = kernel_with(directory.path(), Arc::new(AllowEverything)).await;
+    let command = format!(
+        "scripted-mcp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    write_server(directory.path(), &command, TOOLS);
+    let catalog = catalog(directory.path(), settings(directory.path(), "demo", &command));
+
+    let kernel = Kernel::builder()
+        .component(
+            ToolsComponent::new()
+                .with_policy(Arc::new(AllowEverything))
+                .with_catalog(catalog.clone() as Arc<dyn ToolCatalog>),
+        )
+        .component(McpComponent::new(catalog))
+        .build()
+        .expect("a kernel");
+    kernel.start().await.expect("the kernel starts");
     kernel.shutdown().await.unwrap();
 
     // The script's own children are in the process group the child led, so a `sed` mid-call
@@ -349,7 +368,7 @@ async fn shutting_the_kernel_down_stops_the_server() {
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             std::fs::read_to_string(entry.path().join("cmdline"))
-                .map(|cmdline| cmdline.contains("scripted-mcp"))
+                .map(|cmdline| cmdline.contains(&command))
                 .unwrap_or(false)
         })
         .count();
