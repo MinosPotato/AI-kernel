@@ -25,8 +25,8 @@ use aik_core::{ErrorKind, event::EventStream};
 use futures::StreamExt;
 use serde_json::json;
 use support::{
-    Behaviour, FixedApprovals, Harness, ProbeTool, RecordingPolicy, Reply, ScriptedModel, call,
-    offered, text_of, user,
+    Behaviour, FixedApprovals, Harness, ProbeTool, RecordingPolicy, RecordingQuota, Reply,
+    ScriptedModel, call, offered, text_of, user,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -1366,4 +1366,180 @@ async fn every_phase_of_a_call_is_audited_under_one_correlation_id() {
     assert_eq!(invocations.len(), 1);
     assert_eq!(invocations[0].outcome, InvocationOutcome::Succeeded);
     assert_eq!(invocations[0].correlation, cx.correlation);
+}
+
+// --- spend ceilings ------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_turn_is_checked_against_the_quota_before_it_is_taken() {
+    let quota = Arc::new(RecordingQuota::permissive());
+    let harness = Harness::builder(ScriptedModel::new([
+        Reply::calls([call("c1", "probe", json!({}))]),
+        Reply::answer("done"),
+    ]))
+    .tool(ProbeTool::new("probe", Behaviour::Echo))
+    .quota(quota.clone())
+    .build();
+
+    harness
+        .agent
+        .run(request("go", harness.session), &user("alice"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        quota.checks().len(),
+        2,
+        "one check per model turn, not one per run"
+    );
+    assert!(
+        quota
+            .checks()
+            .iter()
+            .all(|model| model.as_str() == "test-model")
+    );
+}
+
+#[tokio::test]
+async fn an_exhausted_budget_stops_the_run_before_the_model_is_called() {
+    let quota = Arc::new(RecordingQuota::refusing_from(0));
+    let harness = Harness::builder(ScriptedModel::new([Reply::answer("never sent")]))
+        .quota(quota.clone())
+        .build();
+
+    let error = harness
+        .agent
+        .run(request("go", harness.session), &user("alice"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Permission);
+    assert!(error.to_string().contains("budget"), "{error}");
+    assert_eq!(
+        harness.model.call_count(),
+        0,
+        "a refused turn must not cost a model call"
+    );
+    assert!(quota.charges().is_empty());
+}
+
+#[tokio::test]
+async fn a_budget_that_runs_out_mid_run_stops_it_and_closes_off_the_transcript() {
+    // The first turn is allowed and asks for a tool; the second is refused.
+    let quota = Arc::new(RecordingQuota::refusing_from(1));
+    let harness = Harness::builder(ScriptedModel::new([
+        Reply::calls([call("c1", "probe", json!({}))]),
+        Reply::answer("never sent"),
+    ]))
+    .tool(ProbeTool::new("probe", Behaviour::Echo))
+    .quota(quota.clone())
+    .build();
+    let cx = user("alice");
+
+    let error = harness
+        .agent
+        .run(request("go", harness.session), &cx)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Permission);
+    assert_eq!(harness.model.call_count(), 1);
+    assert_eq!(
+        quota.charges().len(),
+        1,
+        "the turn that did happen is charged"
+    );
+
+    // The tool call the first turn asked for was answered before the run stopped, so the
+    // session is still a conversation somebody else can resume.
+    let results = harness
+        .transcript(&cx)
+        .await
+        .iter()
+        .filter(|record| record.message.role == Role::Tool)
+        .count();
+    assert_eq!(results, 1);
+}
+
+#[tokio::test]
+async fn a_charge_carries_the_providers_own_figures_when_it_reports_them() {
+    let quota = Arc::new(RecordingQuota::permissive());
+    let harness = Harness::builder(ScriptedModel::new([Reply::answer("done").costing(431, 17)]))
+        .quota(quota.clone())
+        .build();
+
+    harness
+        .agent
+        .run(request("go", harness.session), &user("alice"))
+        .await
+        .unwrap();
+
+    let charges = quota.charges();
+    assert_eq!(charges.len(), 1);
+    assert_eq!(charges[0].turns, 1);
+    assert_eq!(charges[0].input_tokens, 431);
+    assert_eq!(charges[0].output_tokens, 17);
+    assert!(!charges[0].estimated);
+    assert_eq!(charges[0].model.as_str(), "test-model");
+}
+
+#[tokio::test]
+async fn a_provider_that_reports_no_usage_is_charged_an_estimate_rather_than_nothing() {
+    let quota = Arc::new(RecordingQuota::permissive());
+    let harness = Harness::builder(ScriptedModel::new([Reply::answer(
+        "a reply of some length",
+    )]))
+    .quota(quota.clone())
+    .build();
+
+    harness
+        .agent
+        .run(
+            request("a question of some length", harness.session),
+            &user("alice"),
+        )
+        .await
+        .unwrap();
+
+    let charges = quota.charges();
+    assert_eq!(charges.len(), 1);
+    assert!(charges[0].estimated, "an unreported turn must not be free");
+    assert!(charges[0].input_tokens > 0, "the request was not empty");
+    assert!(charges[0].output_tokens > 0, "the reply was not empty");
+}
+
+#[tokio::test]
+async fn a_ledger_that_cannot_be_written_ends_the_run() {
+    let quota = Arc::new(RecordingQuota::unrecordable());
+    let harness = Harness::builder(ScriptedModel::new([
+        Reply::calls([call("c1", "probe", json!({}))]),
+        Reply::answer("never reached"),
+    ]))
+    .tool(ProbeTool::new("probe", Behaviour::Echo))
+    .quota(quota.clone())
+    .build();
+
+    let error = harness
+        .agent
+        .run(request("go", harness.session), &user("alice"))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("ledger"), "{error}");
+    assert_eq!(
+        harness.model.call_count(),
+        1,
+        "spend that cannot be recorded must not be followed by more spend"
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_with_no_quota_behaves_exactly_as_it_did_before() {
+    let harness = Harness::builder(ScriptedModel::new([Reply::answer("done")])).build();
+    let response = harness
+        .agent
+        .run(request("go", harness.session), &user("alice"))
+        .await
+        .unwrap();
+    assert_eq!(response.output, vec![ContentPart::text("done")]);
 }

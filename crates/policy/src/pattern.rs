@@ -52,7 +52,11 @@ impl Pattern {
 
     /// Returns true if this pattern can never usefully match anything, e.g. the empty
     /// exact string produced by an empty configuration field.
-    pub(crate) fn is_vacuous(&self) -> bool {
+    ///
+    /// Public because every configuration surface built on [`Pattern`] has to reject the
+    /// same mistake, and a second copy of "what counts as an empty matcher" is a second
+    /// thing to keep in step with this one.
+    pub fn is_vacuous(&self) -> bool {
         matches!(self, Self::Exact(exact) if exact.is_empty())
     }
 }

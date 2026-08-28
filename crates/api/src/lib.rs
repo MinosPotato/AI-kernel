@@ -15,6 +15,7 @@
 //! | [`context`] | An agent's transcript, and the bounded view of it a model is sent |
 //! | [`measurement`] | What one request to a model provider cost, estimated and reported |
 //! | [`memory`] | Persistent records and retrieval |
+//! | [`quota`] | Cumulative ceilings on what a principal may spend on models |
 //! | [`scheduler`] | Time- and event-triggered jobs |
 //! | [`agent`] | Long-running work with streamed progress |
 //! | [`platform`] | The single seam to an OS or desktop |
@@ -80,6 +81,7 @@ pub mod memory;
 pub mod model;
 pub mod permission;
 pub mod platform;
+pub mod quota;
 pub mod scheduler;
 pub mod tool;
 
@@ -102,6 +104,7 @@ pub mod prelude {
         Decision, PermissionRequest, PolicyEngine, Principal, ResourceAuthorizer,
     };
     pub use crate::platform::{PlatformCapability, PlatformIntegration};
+    pub use crate::quota::{QuotaGuard, QuotaStatus, UsageCharge};
     pub use crate::scheduler::{JobHandler, JobSpec, Scheduler, Trigger};
     pub use crate::tool::{
         ResourceClaim, Tool, ToolCatalog, ToolName, ToolOutcome, ToolRegistry, ToolSpec,

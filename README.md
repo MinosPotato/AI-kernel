@@ -24,6 +24,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-tools`](crates/tools) | The authorization-gated `ToolRegistry` implementation |
 | [`aik-mcp`](crates/mcp) | External Model Context Protocol tool servers, as one `ToolCatalog` |
 | [`aik-policy`](crates/policy) | A deterministic, configuration-driven `PolicyEngine` |
+| [`aik-quota`](crates/quota) | Cumulative ceilings on what a principal may spend on models |
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
 | [`aik-exec`](crates/exec) | Running allowlisted programs behind an OS-level sandbox |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
@@ -658,6 +659,81 @@ The refusals are the interesting part again:
   larger than the deployment accepts: each names the setting that is wrong, because an agent
   that quietly cannot do what the operator granted is the worse outcome.
 
+## Spending only so much
+
+Every bound the agent loop has is a bound on one run: sixteen model turns, sixty-four tool
+calls, an eight-thousand-token window. They stop a conversation that will not stop itself,
+which is what they are for, and then the next run starts at zero. Nothing in them answers the
+question an operator actually has — how much may this deployment spend today — and once
+`schedule.create` existed, a model could arrange for runs to happen while nobody was watching.
+
+[`aik-quota`](crates/quota) is the ceiling that does not reset. It is a second document beside
+the policy one: policy decides *whether* something may happen, this decides *how much*.
+
+```json
+{ "quota": {
+    "limits": [
+      { "subject": "*",         "period": "day",   "max_turns": 500 },
+      { "subject": "*",         "period": "month", "max_cost_micros": 50000000 },
+      { "subject": "scheduler", "period": "hour",  "max_turns": 20,
+        "description": "autonomous work, unattended" }
+    ],
+    "prices": {
+      "claude-*": { "input_micros_per_million": 3000000, "output_micros_per_million": 15000000 },
+      "*":        { "input_micros_per_million": 0, "output_micros_per_million": 0 }
+    }
+} }
+```
+
+Unlike the policy document, this one is not first-match-wins: **every rule whose subject
+matches applies**, and the check refuses as soon as any of them is exhausted. Order is
+therefore insignificant, and adding a rule can only tighten what a deployment permits — which
+is the property worth having in the document that decides how much money can be spent. Prices
+are quoted per million tokens because that is how providers publish them, in millionths of a
+currency unit so that `$3.00 / Mtok` is the exact integer `3000000` with no floating point
+between an intention and an enforced ceiling. No currency is named anywhere.
+
+A charge lands on **both** identities in play. A turn taken by `assistant` acting for `alice`
+is added to the agent's counters and to Alice's, as two independent rows, because they answer
+two different questions: a ceiling written for a person should hold however many agents do
+that person's work, and one written for `scheduler` should hold across everybody whose jobs it
+is running. Every identity comes from the `ExecutionContext`; nothing a model emits reaches
+this.
+
+The loop asks before the turn and reports after it:
+
+```text
+check(model) ──▶ assemble window ──▶ model turn ──▶ record(turns, tokens, price)
+      │                                                        │
+   refused: no window, no compaction, no request      failed: the run stops
+```
+
+Checking first and charging afterwards means a period can end at most **one turn** over its
+ceiling — the turn that crossed it — because what a turn costs is only knowable once it has
+been taken. That bound is documented rather than hidden; reserving an estimate up front would
+trade an explicable overshoot for a systematic over- or under-charge, since the estimate is a
+heuristic and the real figure comes back with the response.
+
+The refusals are again where the design is:
+
+- **A refused turn costs nothing.** The check happens before the window is assembled, so an
+  exhausted budget does not pay for a compaction, which is itself a model call.
+- **A provider that reports no usage is not free.** Its turns are charged from the run's own
+  token estimate, marked as an estimate, because charging zero would make a token or cost
+  ceiling silently unreachable.
+- **An unpriced model under a cost ceiling is refused**, naming the model and the key to add.
+  Pricing it at zero is how a deployment says a model is genuinely free.
+- **Spend that cannot be recorded ends the run.** A ledger that cannot be written is not a
+  reason to keep spending; the turn already taken stays in the transcript, and no further turn
+  is started.
+- **A restart is not a way to reset a budget.** The durable ledger lives in the shared
+  database alongside the transcript, the schedule and the audit trail. An `--ephemeral`
+  deployment gets the volatile one, bounded while it runs, exactly as its audit trail is.
+
+The ledger is an enforcement counter and not a record of what happened — the audit trail is
+that. So every write drops the windows that have closed, and the table holds one row per
+subject per period rather than one per day for ever.
+
 ## Configuration
 
 The kernel reads no files. It accepts JSON layers, deep-merged in order, so the host
@@ -719,6 +795,23 @@ a host process over one database cannot describe two different assistants:
 | `agent.mcp.servers[].call_timeout_ms` | 60000 | The wall-clock budget for one `tools/call` |
 | `agent.mcp.servers[].max_result_bytes` | 65536 | The largest result carried back to a model |
 | `agent.mcp.servers[].max_tools` | 128 | The largest listing accepted from the server |
+
+Spend ceilings live in their own top-level `quota` section, read and validated while the
+kernel is assembled so a malformed rule stops the process rather than the first turn:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `quota.limits[].subject` | `*` | Which identity this rule counts: `*`, a prefix like `agent.*`, or an exact principal id |
+| `quota.limits[].period` | required | `hour`, `day`, `week`, `month` or `total`, in UTC |
+| `quota.limits[].max_turns` | none | The most model turns one window may take |
+| `quota.limits[].max_input_tokens` / `.max_output_tokens` / `.max_total_tokens` | none | Token ceilings, each enforced independently |
+| `quota.limits[].max_cost_micros` | none | What one window may cost, priced by `quota.prices` |
+| `quota.limits[].description` | none | What the rule is for, quoted back in the refusal |
+| `quota.prices.<model>` | none | `input_micros_per_million` and `output_micros_per_million`; the key is a pattern, exact beats longest prefix |
+
+A rule that sets no ceiling, or sets one to zero, is refused rather than ignored: zero is
+never something anybody configures on purpose, and a prohibition belongs in the policy
+document where it is auditable as an authorization decision.
 
 ## Development
 
@@ -884,6 +977,26 @@ handler with no business taking one from a model's whim. Binding the tools to th
 deployment holds the agent, which holds the tool registry these tools are registered in — a
 cycle a daemon test caught by reopening the shared database after stopping the host and finding
 it still locked. The binding holds a `Weak<dyn Scheduler>` instead.
+
+`aik-quota` is the newest of these, and the first that constrains the system rather than
+enabling it. Everything before it added a capability; this one takes one away, on purpose. The
+gap it closes had been visible since the agent loop was written and became load-bearing the
+moment `schedule.create` existed: every bound in `AgentLoopSettings` is per run and resets with
+it, so a principal that could start runs — a person at a terminal, or a cron expression a model
+wrote for itself — had no cumulative ceiling on tokens or money at all, and
+`aik_api::measurement` reported what was spent to whoever was listening without anything being
+able to refuse. So there is now a second document beside the policy one, read from the same
+configuration at the same point in start-up, and one more thing in the shared database: policy
+decides whether an action may happen, the ledger decides whether there is any budget left for
+one that may. The two are independent and both apply. A charge lands on the acting principal
+*and* on whoever it acted for, so a ceiling written for a person holds however many agents do
+that person's work. Everything interesting is a refusal: a check happens before the window is
+assembled so an exhausted budget cannot pay for a compaction; a provider that reports no usage
+is charged the run's own estimate rather than nothing, because zero would make a token ceiling
+unreachable; a cost ceiling over a model nobody priced is refused rather than treated as free;
+spend that cannot be recorded ends the run rather than continuing on a budget nobody is
+keeping; and the durable ledger means restarting the process is not a way to buy another day's
+turns.
 
 What is genuinely not built yet: any platform integration at all. `aik-scheduler` now defines
 a cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an

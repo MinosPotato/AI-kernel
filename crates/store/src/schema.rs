@@ -53,6 +53,7 @@ use crate::error::store_error;
 /// | 5 | `sched.jobs`, owned by `aik-scheduler` |
 /// | 6 | `context.by_owner`, `context.by_updated`, owned by `aik-context` |
 /// | 7 | `audit.records`, `audit.by_time`, `audit.by_principal`, `audit.by_correlation`, `audit.meta`, owned by `aik-audit` |
+/// | 8 | `quota.usage`, owned by `aik-quota` |
 ///
 /// A subsystem that adds tables raises this even though redb needs no migration to create
 /// one. The version is what stops an older build from opening the file afterwards, and an
@@ -66,7 +67,12 @@ use crate::error::store_error;
 /// an older build that does not know `audit.*` exists is one that would carry a compaction or
 /// a repair over the record of what this system was allowed to do — the one collection whose
 /// value is precisely that nobody could quietly shorten it.
-pub const SCHEMA_VERSION: u32 = 7;
+///
+/// For the quota ledger it is sharper in a third way. `quota.usage` is the only table here
+/// whose *absence* is permissive: a build that dropped it would not fail, it would report
+/// every budget as untouched, and the deployment would go on looking healthy while spending
+/// without a ceiling. A version bump is what stops such a build from opening the file.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// The table holding the store's own bookkeeping, keyed by a short ASCII name.
 ///
@@ -116,6 +122,10 @@ impl std::fmt::Debug for Migration {
 ///   nothing to backfill either: a trail records what happened while it was running, and
 ///   inventing records for the period before it existed would be the one thing an audit trail
 ///   must never do.
+/// * **7 → 8** added `quota.usage`. A table, so nothing to transform; and nothing to backfill
+///   either, for the opposite reason to the audit trail's. A ledger counts a window that is
+///   open now, and every window that predates the ledger has closed — so a fresh table is not
+///   an incomplete one, it is the correct one.
 ///
 /// Adding a real migration means appending an entry here *and* raising [`SCHEMA_VERSION`] to
 /// match its `to`; the invariant between the two is checked by [`migrate`] on every open.

@@ -24,12 +24,13 @@ use aik_api::context::{
 use aik_api::execution::ExecutionContext;
 use aik_api::model::{
     CompletionChunk, CompletionRequest, CompletionResponse, ContentPart, FinishReason, Message,
-    ModelDescriptor, ModelProvider, Role, Usage,
+    ModelDescriptor, ModelId, ModelProvider, Role, Usage,
 };
 use aik_api::permission::{
     ActionId, ApprovalSink, Decision, PermissionRequest, PolicyEngine, Principal, PrincipalKind,
     ResourceAuthorizer,
 };
+use aik_api::quota::{QuotaGuard, QuotaStatus, UsageCharge};
 use aik_api::tool::{ResourceClaim, Tool, ToolCall, ToolName, ToolOutcome, ToolSpec};
 use aik_context::InMemoryContextStore;
 use aik_core::clock::{ManualClock, SharedClock, SystemClock, Timestamp};
@@ -495,6 +496,84 @@ impl ApprovalSink for FixedApprovals {
 
 // --- the compactor -----------------------------------------------------------------
 
+/// A [`QuotaGuard`] that records what it was asked and answers however the test says.
+///
+/// Deliberately not the real one: what these tests check is what the *loop* does with a
+/// guard — when it asks, what it charges, and what it does when the answer is no — not
+/// whether a ledger adds up.
+#[derive(Debug, Default)]
+pub struct RecordingQuota {
+    /// The models `check` was called with, in order.
+    checks: Mutex<Vec<ModelId>>,
+    /// Everything `record` was told.
+    charges: Mutex<Vec<UsageCharge>>,
+    /// Refuse every check from this one onward (0 refuses the first).
+    refuse_from: Option<usize>,
+    /// Fail every `record`, as a store that cannot be written would.
+    fail_records: bool,
+}
+
+impl RecordingQuota {
+    /// A guard that allows everything and just watches.
+    pub fn permissive() -> Self {
+        Self::default()
+    }
+
+    /// A guard that refuses the check numbered `index` and every one after it.
+    pub fn refusing_from(index: usize) -> Self {
+        Self {
+            refuse_from: Some(index),
+            ..Self::default()
+        }
+    }
+
+    /// A guard whose ledger cannot be written.
+    pub fn unrecordable() -> Self {
+        Self {
+            fail_records: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn checks(&self) -> Vec<ModelId> {
+        self.checks.lock().expect("the quota lock").clone()
+    }
+
+    pub fn charges(&self) -> Vec<UsageCharge> {
+        self.charges.lock().expect("the quota lock").clone()
+    }
+}
+
+#[async_trait]
+impl QuotaGuard for RecordingQuota {
+    async fn check(&self, model: &ModelId, _cx: &ExecutionContext) -> Result<()> {
+        let mut checks = self.checks.lock().expect("the quota lock");
+        let index = checks.len();
+        checks.push(model.clone());
+        match self.refuse_from {
+            Some(from) if index >= from => Err(Error::PermissionDenied(
+                "the budget for this principal is gone".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    async fn record(&self, charge: &UsageCharge, _cx: &ExecutionContext) -> Result<()> {
+        self.charges
+            .lock()
+            .expect("the quota lock")
+            .push(charge.clone());
+        if self.fail_records {
+            return Err(Error::other("the ledger could not be written"));
+        }
+        Ok(())
+    }
+
+    async fn status(&self, _cx: &ExecutionContext) -> Result<Vec<QuotaStatus>> {
+        Ok(Vec::new())
+    }
+}
+
 /// What a [`StubCompactor`] does when the loop asks it for room.
 #[derive(Clone)]
 pub enum Compacts {
@@ -600,6 +679,8 @@ pub struct Harness {
     pub agent: AgentLoop,
     /// The compactor the loop was given, if the test asked for one.
     pub compactor: Option<Arc<StubCompactor>>,
+    /// The quota guard the loop was given, if the test asked for one.
+    pub quota: Option<Arc<RecordingQuota>>,
     pub session: SessionId,
 }
 
@@ -622,6 +703,7 @@ pub struct HarnessBuilder {
     allowed: Option<Vec<ToolName>>,
     clock: SharedClock,
     compactor: Option<Compacts>,
+    quota: Option<Arc<RecordingQuota>>,
 }
 
 impl std::fmt::Debug for HarnessBuilder {
@@ -682,6 +764,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// Wires a [`RecordingQuota`] into the loop.
+    #[must_use]
+    pub fn quota(mut self, quota: Arc<RecordingQuota>) -> Self {
+        self.quota = Some(quota);
+        self
+    }
+
     pub fn build(self) -> Harness {
         let events = EventBus::new(1_024, self.clock.clone());
         let policy = Arc::new(self.policy);
@@ -723,6 +812,10 @@ impl HarnessBuilder {
         if let Some(compactor) = &compactor {
             agent = agent.with_compactor(compactor.clone());
         }
+        let quota = self.quota;
+        if let Some(quota) = &quota {
+            agent = agent.with_quota(quota.clone());
+        }
 
         Harness {
             model,
@@ -731,6 +824,7 @@ impl HarnessBuilder {
             events,
             agent,
             compactor,
+            quota,
             session: SessionId::new(),
         }
     }
@@ -747,6 +841,7 @@ impl Harness {
             allowed: None,
             clock: Arc::new(SystemClock),
             compactor: None,
+            quota: None,
         }
     }
 
