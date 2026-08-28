@@ -25,6 +25,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-mcp`](crates/mcp) | External Model Context Protocol tool servers, as one `ToolCatalog` |
 | [`aik-policy`](crates/policy) | A deterministic, configuration-driven `PolicyEngine` |
 | [`aik-quota`](crates/quota) | Cumulative ceilings on what a principal may spend on models |
+| [`aik-resilience`](crates/resilience) | Retrying, circuit breaking and concurrency limiting in front of any `ModelProvider` |
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
 | [`aik-exec`](crates/exec) | Running allowlisted programs behind an OS-level sandbox |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
@@ -759,8 +760,28 @@ id nest — and holds locations and limits, never the key itself:
 | `endpoint` | `https://api.anthropic.com` | Must be `https` unless it is loopback |
 | `api_version` | `2023-06-01` | The `anthropic-version` header |
 | `max_output_tokens` | 4096 | The `max_tokens` a request does not set itself |
-| `max_retries` | 2 | Retries for rate limiting and 5xx, never past the deadline |
 | `request_timeout_ms` | 300000 | Ceiling on one request, unless the caller's deadline is shorter |
+
+Retrying, circuit breaking and concurrency limiting are configured once for whichever provider
+the deployment chose, under `components.model.resilient`. The layer is always registered — the
+way to have none is to configure a pass-through, so the question "does this deployment retry?"
+is answered by this section rather than by whether something happens to be wired in:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `retry.max_attempts` | 3 | Attempts per call, including the first; `1` disables retrying |
+| `retry.base_delay_ms` | 500 | The first backoff ceiling, doubling per attempt |
+| `retry.max_delay_ms` | 8000 | The largest backoff ceiling, however many attempts failed |
+| `retry.max_retry_after_ms` | 60000 | The longest a service's own `retry-after` may park a call |
+| `breaker.failure_threshold` | 5 | Consecutive transient failures before calls are refused outright; `0` disables the breaker |
+| `breaker.cooldown_ms` | 30000 | How long an open circuit waits before letting one call through |
+| `max_concurrent` | 4 | Calls in flight at once; `0` is unlimited |
+| `acquire_timeout_ms` | 30000 | How long a call waits for a slot, unless the caller's deadline is shorter |
+
+Only a failure the provider itself marked transient is ever repeated: a rate limit, a 5xx, a
+connection that could not be made. A refused credential, a malformed request and a model that
+does not exist are answered once. The delay is fully jittered, so several callers that failed
+together do not march back in step.
 
 Kernel settings:
 
@@ -997,6 +1018,59 @@ unreachable; a cost ceiling over a model nobody priced is refused rather than tr
 spend that cannot be recorded ends the run rather than continuing on a budget nobody is
 keeping; and the durable ledger means restarting the process is not a way to buy another day's
 turns.
+
+`aik-resilience` is the newest of these, and the first that wraps a contract rather than
+implementing one. Every subsystem before it was registered *beside* the others; this one is
+registered *in front of* one — a `ModelProvider` that holds another and hands back something
+that behaves identically and fails less often. Everything that resolves `dyn ModelProvider` by
+capability therefore gets it without being told, which is a property of component
+initialisation order and nothing else, so the wiring declares the dependency rather than
+hoping.
+
+The gap it closes had been open since the first model call: everything a provider does crosses
+a boundary this process does not control, and a single rate limit, restarting server or
+connection cut ended a run — taking a transcript's worth of assembled context, and the money
+already spent building it, with it. Three mechanisms answer three different failures. Retry
+answers one 503. A circuit breaker answers the hundredth, because a provider that is down does
+not come back for being asked again, and retrying into it converts one outage into a queue of
+calls that each take several seconds to fail. A concurrency limit answers the failure a client
+causes itself: a scheduler firing several agent jobs on the same minute, each retrying, is how
+a deployment manufactures its own rate limit.
+
+The interesting part is what decides that a call may be repeated, because `ErrorKind` could
+not. A rate limit, an overloaded upstream and a malformed request are all `ErrorKind::Other`
+once a provider has wrapped them, which left a caller two options: match on message text, or
+retry everything. So `aik_api::resilience` adds a third — a `TransientFailure` a provider
+attaches to the error's source chain — and everything unmarked is terminal. That is the
+fail-closed direction: not retrying something that would have worked costs one failed run,
+while retrying a request a service refused on its merits pays for the same refusal several
+times over. The refusals follow from it: a 401 is never repeated, an open circuit is never
+retried around, a terminal failure is never evidence for the breaker, a wait that would
+outlast the caller's deadline is not taken, and cancellation beats a pending retry.
+
+Streaming is where the rule bites hardest. Establishing a stream is retried; a stream that has
+begun never is, because no provider can resume a response and a second attempt would either
+duplicate what the caller already saw or silently replace it. Its failure still reaches the
+breaker, so a service that accepts every request and then breaks halfway through the answer is
+not reported as healthy.
+
+Two things had to move for this to be one answer rather than two. `aik-anthropic` had grown its
+own retry loop — its own backoff, its own status list, its own deadline arithmetic — and
+leaving it in place would have multiplied the attempt counts: a bound of three attempts would
+have been nine upstream calls and nine times the tokens, with neither layer's configuration
+describing what actually happened. So that loop is gone and its `max_retries` setting with it,
+answered by name at start-up rather than by `deny_unknown_fields`, so a deployment that had
+configured retrying is told where it went instead of being told it made a typo. What stays in
+each provider is the half only a provider can do: recognising that a failure was the service's,
+and passing on how long the service asked to be left alone.
+
+And it charges nothing. An attempt that failed on the way out cost an upstream real work and
+this client no tokens it can count, and inventing a figure would put a number nobody can check
+into the ledger. What keeps that honest is where the retrying sits: strictly *below* the point
+where a response exists to charge for, so the quota guard charges exactly once per turn however
+many attempts that turn took, and `retry.max_attempts` is the stated bound on how many that can
+be. A cross-subsystem test asserts exactly that, because neither crate could: `aik-quota` has
+never heard of a retry and `aik-resilience` never touches a ledger.
 
 What is genuinely not built yet: any platform integration at all. `aik-scheduler` now defines
 a cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an

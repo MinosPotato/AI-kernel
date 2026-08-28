@@ -71,6 +71,7 @@ use aik_memory::{MemoryComponent, MemoryToolsComponent, RedbMemoryComponent};
 use aik_ollama::OllamaComponent;
 use aik_policy::RuleBasedPolicyEngine;
 use aik_quota::{QuotaComponent, QuotaDocument, RedbQuotaComponent};
+use aik_resilience::ResilienceComponent;
 use aik_scheduler::{RedbSchedulerComponent, SchedulerComponent};
 use aik_store::StoreComponent;
 use aik_summary::SummaryComponent;
@@ -213,7 +214,11 @@ pub fn builder(
     // conditional: an empty document produces a guard that refuses nothing and writes
     // nothing, which is exactly what "no quota" meant before there was one.
     .requires(aik_quota::DEFAULT_COMPONENT_ID)
-    .requires(settings.model_component.clone());
+    // The resilience layer, not the provider underneath it. Both would resolve the same
+    // capability, but only this ordering guarantees the agent gets the wrapped one: the
+    // wrapper becomes the registry's default during its own `init`, so a component that
+    // initialised before it would hold the bare provider for the rest of the process.
+    .requires(aik_resilience::DEFAULT_COMPONENT_ID);
 
     // Registered before the agent and declared as a dependency of it, because the agent
     // resolves `dyn ContextCompactor` optionally during `init`: a compactor initialised
@@ -223,7 +228,10 @@ pub fn builder(
     let compactor = settings.summary.is_enabled().then(|| {
         SummaryComponent::new(settings.summary.resolve(model))
             .requires(aik_context::DEFAULT_COMPONENT_ID)
-            .requires(settings.model_component.clone())
+            // The wrapper, for the same reason the agent depends on it: a compaction is a
+            // model call like any other, and one that gave up on the first 503 would cost a
+            // run its whole transcript at exactly the moment the transcript is largest.
+            .requires(aik_resilience::DEFAULT_COMPONENT_ID)
     });
     if compactor.is_some() {
         agent = agent.requires(aik_summary::DEFAULT_COMPONENT_ID);
@@ -232,6 +240,13 @@ pub fn builder(
     let builder = Kernel::builder()
         .config(settings.config.clone())
         .component(ApprovalComponent::new(broker.clone()))
+        // Registered unconditionally, like the audit trail and the quota guard, and for the
+        // same reason: the failure worth designing against is a deployment that believed it
+        // had this and did not. Its settings can narrow it to a pass-through — one attempt,
+        // no breaker, no concurrency limit — but nothing removes it from the wiring, so the
+        // question "does this deployment retry?" is answered by one configuration section
+        // rather than by whether a component happens to be present.
+        .component(ResilienceComponent::from_config().wrapping(settings.model_component.clone()))
         .component(tools);
 
     // Registered for its shutdown, not for anything it provides: a tool server is a process

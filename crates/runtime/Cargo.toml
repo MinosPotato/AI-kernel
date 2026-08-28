@@ -25,6 +25,7 @@ aik-anthropic.workspace = true
 aik-ollama.workspace = true
 aik-policy.workspace = true
 aik-quota.workspace = true
+aik-resilience.workspace = true
 aik-scheduler.workspace = true
 aik-store.workspace = true
 aik-summary.workspace = true

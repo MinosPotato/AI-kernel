@@ -34,9 +34,11 @@ const fn default_max_output_tokens() -> u32 {
     4096
 }
 
-const fn default_max_retries() -> u32 {
-    2
-}
+/// The setting that used to configure this provider's own retrying.
+///
+/// See [`AnthropicSettings::read`] for why it is answered by name rather than left to
+/// `deny_unknown_fields`.
+const MOVED_RETRY_KEY: &str = "max_retries";
 
 /// Keys that would put a secret in the configuration tree.
 ///
@@ -73,10 +75,6 @@ pub struct AnthropicSettings {
     /// provider-specific limit, so it lives here and can be overridden per request through
     /// [`parameters`](aik_api::model::CompletionRequest::parameters).
     pub max_output_tokens: u32,
-    /// How many times a retryable failure is tried again before giving up.
-    ///
-    /// Zero disables retrying. Retries never outlive the request's deadline.
-    pub max_retries: u32,
 }
 
 impl Default for AnthropicSettings {
@@ -88,7 +86,6 @@ impl Default for AnthropicSettings {
             api_key_file: None,
             request_timeout_ms: default_request_timeout_ms(),
             max_output_tokens: default_max_output_tokens(),
-            max_retries: default_max_retries(),
         }
     }
 }
@@ -114,6 +111,16 @@ impl AnthropicSettings {
                     ),
                 ));
             }
+        }
+        if section.contains(MOVED_RETRY_KEY) {
+            // `deny_unknown_fields` would already refuse this, with a message that reads like
+            // a typo. A deployment that had configured retrying and was told "unknown field"
+            // could reasonably conclude it had never worked, rather than that it moved.
+            return Err(Error::config(
+                MOVED_RETRY_KEY.to_string(),
+                "retrying is no longer this provider's own concern; it is configured once for \
+                 every provider under `components.model.resilient.retry`",
+            ));
         }
         let settings: Self = section.get_or_default("")?;
         settings.validate()?;
@@ -199,6 +206,17 @@ fn header_safe(value: &str, field: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_configuration_that_still_sets_max_retries_is_told_where_it_went() {
+        let section = Config::from_value(serde_json::json!({ "max_retries": 5 }));
+        let error = AnthropicSettings::read(&section).unwrap_err();
+        assert!(error.to_string().contains("max_retries"), "{error}");
+        assert!(
+            error.to_string().contains("model.resilient"),
+            "the message must name where the setting moved to: {error}"
+        );
+    }
     use super::*;
     use aik_core::ErrorKind;
     use serde_json::json;

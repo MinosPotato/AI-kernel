@@ -51,16 +51,6 @@ impl Deadline {
     pub(crate) fn budget(&self) -> Duration {
         self.budget
     }
-
-    /// How much of the budget is left right now.
-    ///
-    /// Used to decide whether a retry has room to happen at all: sleeping past the deadline
-    /// and then issuing a request that cannot finish wastes the remaining time and returns
-    /// the less useful of two errors.
-    pub(crate) fn remaining(&self) -> Duration {
-        self.instant
-            .saturating_duration_since(tokio::time::Instant::now())
-    }
 }
 
 /// Runs `future` to completion, unless `cancellation` fires or `deadline` passes first.
@@ -138,14 +128,5 @@ mod tests {
             Deadline::compute(&clock(), Duration::from_secs(10), &ExecutionContext::new());
         let result = race(async { Ok(42) }, &CancellationToken::new(), deadline).await;
         assert_eq!(result.unwrap(), 42);
-    }
-
-    #[tokio::test]
-    async fn the_remaining_budget_shrinks_as_time_passes() {
-        tokio::time::pause();
-        let deadline =
-            Deadline::compute(&clock(), Duration::from_secs(10), &ExecutionContext::new());
-        tokio::time::advance(Duration::from_secs(4)).await;
-        assert!(deadline.remaining() <= Duration::from_secs(6));
     }
 }

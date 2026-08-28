@@ -45,7 +45,7 @@
 //! | [`component`] | [`AnthropicComponent`] — registers the provider into a kernel |
 //! | `protocol` (private) | The Messages API's JSON and its translation to `aik_api::model` |
 //! | `stream` (private) | Parses the server-sent event stream, reassembling tool calls |
-//! | `http` (private) | Headers, error translation, and the retry policy |
+//! | `http` (private) | Headers, error translation, and which failures are worth repeating |
 //! | `deadline` (private) | Combines the configured timeout and a request's own deadline |
 //!
 //! # The credential
