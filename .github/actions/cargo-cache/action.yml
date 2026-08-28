@@ -1,0 +1,42 @@
+# A cargo cache built out of first-party actions only.
+#
+# The usual answer here is a third-party caching action. This workflow exists partly to
+# police the supply chain of what the workspace links against, so it would be strange
+# for it to widen its own: `actions/checkout` and `actions/cache` are the whole trusted
+# set, and this composite is the small amount of glue that costs.
+name: cargo-cache
+description: Restore and save the cargo registry and the workspace target directory.
+
+inputs:
+  key:
+    description: Distinguishes one job's target directory from another's.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The registry and the git checkouts under it are keyed by Cargo.lock alone: they
+    # hold sources, which depend on the resolved graph and on nothing else.
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: cargo-registry-
+
+    # Build artefacts also depend on the compiler, so it is part of the key: cargo
+    # would rebuild anyway on a toolchain change, but a key that ignored it would keep
+    # paying to carry artefacts nothing can ever use again.
+    - id: rustc
+      shell: bash
+      run: echo "version=$(rustc --version | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
+
+    # A restore-key lets an unrelated lockfile change reuse most of a previous build
+    # rather than starting from nothing.
+    - uses: actions/cache@v4
+      with:
+        path: target
+        key: cargo-target-${{ inputs.key }}-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: cargo-target-${{ inputs.key }}-${{ runner.os }}-${{ steps.rustc.outputs.version }}-

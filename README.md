@@ -419,7 +419,7 @@ machine-readable analysis, and reproducible benchmark commands — see
 
 ### Prerequisites
 
-- Rust 1.85 or newer (edition 2024)
+- Rust 1.90 or newer (edition 2024)
 - A running [Ollama](https://ollama.com) server (`ollama serve`) with at least one model pulled
   (`ollama pull llama3.1:8b`). For tool-calling examples specifically, the model needs to report
   the `tools` capability — check with `ollama show <model>`; not every model does, and one that
@@ -732,8 +732,67 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
-Requires Rust 1.85 or newer (edition 2024). No platform-specific code: the workspace
+Requires Rust 1.90 or newer (edition 2024). No platform-specific code: the workspace
 compiles anywhere Tokio does, even though the target system is Arch Linux with Hyprland.
+
+Two things that suite does not cover, because they are questions about the dependency
+tree rather than about this code:
+
+```bash
+cargo deny --all-features check                        # advisories, licences, duplicates, sources
+cargo +1.90 check --workspace --all-targets --locked   # the MSRV actually claimed
+```
+
+`cargo deny` needs installing once, pinned to the version CI uses:
+
+```bash
+cargo install --locked --version 0.20.2 cargo-deny
+```
+
+### What CI runs
+
+Every command above is a job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml),
+on each push to `main` and each pull request. A suite that only runs when somebody
+remembers is a suite that has already stopped running, so the two lists are meant to
+stay identical: a command added here belongs there, and vice versa.
+
+Three of those jobs are not just the local suite repeated:
+
+- **`msrv`** reads `rust-version` out of `Cargo.toml` and checks the workspace with a
+  compiler that old, rather than with whatever stable happens to be. The claim and the
+  check cannot drift, because there is only one place the version is written down.
+- **`test`** installs bubblewrap and lifts Ubuntu's AppArmor restriction on
+  unprivileged user namespaces. `aik-exec`'s confinement tests skip themselves on a
+  host with no `bwrap`, so without this the one boundary here that is *enforcement*
+  rather than a cooperative check would be the least-tested thing in the workspace on
+  the only machine that gates merges.
+- **`cargo-deny`** is governed by [`deny.toml`](deny.toml): permissive licences only,
+  no wildcard versions, crates.io as the only source, and `openssl-sys`/`native-tls`
+  denied outright so that nothing can quietly move the TLS stack off rustls without a
+  diff to notice. A separate daily
+  [advisories workflow](.github/workflows/advisories.yml) re-asks the vulnerability
+  question against an unchanged `Cargo.lock`, because the advisory database moves on
+  days when nobody pushes.
+
+The workflows depend on `actions/checkout` and `actions/cache` and nothing else, and
+neither is granted more than `contents: read`. A pipeline whose job is to police what
+the workspace links against would be a strange place to widen the set of third parties
+trusted to run in it, so the cargo cache is a small first-party composite in
+[`.github/actions/cargo-cache`](.github/actions/cargo-cache/action.yml) rather than the
+usual third-party action, and cargo-deny is installed from a pinned version in
+[`.github/actions/cargo-deny`](.github/actions/cargo-deny/action.yml) rather than from
+whatever `cargo install` resolves to that morning.
+
+One thing CI deliberately does *not* set is a global `RUSTFLAGS: -D warnings`. Cargo
+passes RUSTFLAGS to every unit it builds, dependencies included, so a global one would
+let a warning in somebody else's crate fail a pull request that never touched it.
+Warnings are denied where the flag can be scoped to this workspace instead: `clippy`
+passes `-D warnings` after `--`, `cargo doc` is scoped by `--no-deps`, and the lints
+the workspace actually cares about are declared in `[workspace.lints]` in `Cargo.toml`.
+
+[Dependabot](.github/dependabot.yml) opens the upgrade pull requests these jobs then
+judge: cargo weekly with minor and patch bumps grouped into one review, and the
+workflows' own action pins monthly.
 
 ## Status
 

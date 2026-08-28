@@ -1,4 +1,4 @@
-//! Scheduling as something an agent can reach: three [`Tool`](aik_api::tool::Tool)s over the
+//! Scheduling as something an agent can reach: three [`Tool`]s over the
 //! existing [`Scheduler`].
 //!
 //! # Why this is here rather than in `aik-scheduler`
