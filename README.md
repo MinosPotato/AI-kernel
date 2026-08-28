@@ -869,9 +869,40 @@ cannot sample from this kernel's model, cannot see its filesystem roots, cannot 
 tools auto-approvable, cannot shadow a native tool, and inherits none of this process's
 environment.
 
+`aik-scheduler` could already run jobs and fire an agent turn when one came due, but nothing
+let a conversation create one — only a deployment's own configuration could. `aik-runtime`
+now closes that: three tools (`schedule.create`, `schedule.list`, `schedule.cancel`),
+registered by default whenever `JobExecution::Agent` is on, mirroring the split `aik-memory`
+already uses instead of one tool with an `operation` argument, so a deployment can hand an
+agent the ability to see and cancel its own reminders without the ability to create new ones.
+No input carries an `owner`; the scheduler stamps it from the `ExecutionContext` the registry
+already hands the tool. And `ScheduleCreateTool` has no `handler` argument at all — every job
+it creates targets one fixed component, set once when the tool is built, never read from a
+call's arguments, so a model can schedule a reminder for itself but cannot aim a job at a
+handler with no business taking one from a model's whim. Binding the tools to the scheduler by
+`Arc` would have held the scheduler, which holds every registered job handler, which in this
+deployment holds the agent, which holds the tool registry these tools are registered in — a
+cycle a daemon test caught by reopening the shared database after stopping the host and finding
+it still locked. The binding holds a `Weak<dyn Scheduler>` instead.
+
 What is genuinely not built yet: any platform integration at all. `aik-scheduler` now defines
 a cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an
 expression that does not parse in it, not the concept.
+
+Nothing enforced this document's own five-command suite or checked the dependency tree before
+now, so a regression only surfaced if a contributor happened to run it by hand. GitHub Actions
+now gates every push and pull request to `main` on it: `fmt`, `check`, `clippy -D warnings`,
+`test`, `rustdoc --no-deps`, and an `msrv` build that reads `rust-version` out of `Cargo.toml`
+rather than pinning a second copy of the number, so the claim and the check cannot drift.
+`cargo-deny` runs alongside — advisories, licences, bans, sources — on the same trigger and
+again daily against the unchanged lockfile, because the advisory database moves on days when
+nobody pushes. `test` installs bubblewrap and lifts Ubuntu's AppArmor restriction on
+unprivileged user namespaces, because `aik-exec`'s confinement tests otherwise skip themselves
+on a host with no `bwrap` — without it, the one boundary here that is enforcement rather than a
+cooperative check would have been the least-tested thing in the workspace on the only machine
+that gates merges. Running the suite for the first time surfaced two real defects it then
+fixed: a redundant doc link in `schedule_tools.rs` that fails `cargo doc -D warnings`, and this
+document and `docs/CLI.md` both still claiming Rust 1.85 after `Cargo.toml` had moved to 1.90.
 
 The full pipeline — filesystem confinement, policy evaluation, human approval, tool exposure
 narrowing, verbose auditing, and the CLI's own error and session handling — has been manually
