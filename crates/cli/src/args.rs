@@ -184,11 +184,14 @@ pub const HELP: &str = concat!(
     "                         first model the provider reports\n",
     "        --embedding-model <ID>\n",
     "                         embed memories with this model, so `memory.query` can\n",
-    "                         search by meaning; needs the ollama provider\n",
+    "                         search by meaning; needs the ollama or openai provider\n",
     "                         [default: none, and search stays exact]\n",
     "        --provider <P>   where that model comes from: ollama (a local server),\n",
     "                         anthropic (the Messages API; needs an API key in\n",
-    "                         $ANTHROPIC_API_KEY) [default: ollama]\n",
+    "                         $ANTHROPIC_API_KEY), openai (any server speaking the\n",
+    "                         chat-completions dialect, from api.openai.com to a local\n",
+    "                         vLLM; needs an API key in $OPENAI_API_KEY unless the\n",
+    "                         endpoint is loopback) [default: ollama]\n",
     "    -a, --agent <ID>     the agent's identity, as policy sees it [default: assistant]\n",
     "    -u, --user <ID>      the user's identity, as policy sees it [default: user]\n",
     "    -r, --root <DIR>     directory the filesystem tools are confined to\n",
@@ -911,8 +914,16 @@ mod tests {
             Some(Provider::Ollama)
         );
 
-        let error = parse(["--provider", "openai"]).unwrap_err();
-        assert!(format!("{error}").contains("ollama, anthropic"), "{error}");
+        assert_eq!(
+            options(&["--provider", "openai"]).provider,
+            Some(Provider::OpenAi)
+        );
+
+        let error = parse(["--provider", "gemini"]).unwrap_err();
+        assert!(
+            format!("{error}").contains("ollama, anthropic, openai"),
+            "{error}"
+        );
     }
 
     #[test]
