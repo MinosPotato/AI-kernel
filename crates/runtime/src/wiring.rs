@@ -69,6 +69,7 @@ use aik_fs::{FsListTool, FsReadTool, FsWriteTool};
 use aik_mcp::{McpCatalog, McpClient, McpComponent};
 use aik_memory::{MemoryComponent, MemoryToolsComponent, RedbMemoryComponent};
 use aik_ollama::OllamaComponent;
+use aik_openai::OpenAiComponent;
 use aik_policy::RuleBasedPolicyEngine;
 use aik_quota::{QuotaComponent, QuotaDocument, RedbQuotaComponent};
 use aik_resilience::ResilienceComponent;
@@ -341,7 +342,7 @@ fn embedder_choice(settings: &RuntimeSettings) -> Result<Option<(ComponentId, Mo
             format!(
                 "provider `{}` serves no embeddings, so `{model}` cannot be used to search \
                  memories by meaning; either clear `agent.embedding_model` or use the ollama \
-                 provider, which does",
+                 or openai provider, both of which do",
                 settings.provider.as_str()
             ),
         )
@@ -451,6 +452,7 @@ fn provider_component(builder: KernelBuilder, provider: Provider) -> KernelBuild
     match provider {
         Provider::Ollama => builder.component(OllamaComponent::new()),
         Provider::Anthropic => builder.component(AnthropicComponent::new()),
+        Provider::OpenAi => builder.component(OpenAiComponent::new()),
     }
 }
 
@@ -699,6 +701,19 @@ mod tests {
         let error = embedder_choice(&settings).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Config);
         assert!(format!("{error}").contains("ollama"), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_provider_that_does_embed_points_the_store_at_its_own_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::new(directory.path());
+        settings.provider = Provider::OpenAi;
+        settings.model_component = Provider::OpenAi.component_id();
+        settings.embedding_model = Some(ModelId::new("text-embedding-3-small"));
+
+        let (component, model) = embedder_choice(&settings).unwrap().expect("an embedder");
+        assert_eq!(component, Provider::OpenAi.component_id());
+        assert_eq!(model, ModelId::new("text-embedding-3-small"));
     }
 
     /// The two backends must be indistinguishable here too: whichever one a deployment gets,

@@ -34,6 +34,7 @@ AI-kernel/
 │  ├─ aik/      → aik          : thin facade re-exporting both
 │  ├─ ollama/   → aik-ollama   : a ModelProvider, talking to a local Ollama server
 │  ├─ anthropic/→ aik-anthropic: a ModelProvider, talking to the Anthropic Messages API
+│  ├─ openai/   → aik-openai   : a ModelProvider and Embedder, for the chat-completions dialect
 │  ├─ resilience/→ aik-resilience: a ModelProvider wrapping another, to retry and circuit-break it
 │  ├─ tools/    → aik-tools    : the reference ToolRegistry (authorization-gated)
 │  ├─ mcp/      → aik-mcp      : a ToolCatalog over external Model Context Protocol servers
@@ -59,9 +60,11 @@ reasoned about without any opinion at all about agents or models, and `aik-api` 
 implemented, allowed to churn while `aik-core` stays stable.
 
 Every other crate is a concrete implementation of one or more `aik-api` contracts, built in
-dependency order: `aik-ollama` implements `ModelProvider`, and `aik-anthropic` implements it a
+dependency order: `aik-ollama` implements `ModelProvider`, `aik-anthropic` implements it a
 second time — over HTTPS, against a service, which is what makes the contract a contract rather
-than a description of Ollama, and what makes this the one crate holding a credential; `aik-policy` implements
+than a description of Ollama, and what makes it the first crate holding a credential — and
+`aik-openai` a third time, against a *dialect* rather than a service, which is what stops the
+contract from being a description of any one vendor; `aik-policy` implements
 `PolicyEngine`; `aik-tools` is the reference `ToolRegistry`, gating every call through
 whichever `PolicyEngine` and `ApprovalSink` (`aik-approval`) it is given; `aik-fs` is the
 first `Tool` implementation, and the first code in the workspace that touches the host
@@ -184,8 +187,8 @@ every "Implemented by" column below is a separate crate.
 | Module       | Contract                                                              | Implemented by |
 |--------------|------------------------------------------------------------------------|----------------|
 | `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     | — (a plain value type, not a trait) |
-| `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (both), `aik-anthropic` (`ModelProvider`) |
-| `resilience` | `TransientFailure`: a provider saying a failure was the service's, not the request's | marked by `aik-ollama` and `aik-anthropic`, acted on by `aik-resilience` |
+| `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (both), `aik-openai` (both), `aik-anthropic` (`ModelProvider`) |
+| `resilience` | `TransientFailure`: a provider saying a failure was the service's, not the request's | marked by `aik-ollama`, `aik-anthropic` and `aik-openai`, acted on by `aik-resilience` |
 | `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`), `aik-mcp` (`ToolCatalog`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
 | `context`    | `ContextCompactor`: replacing evicted turns with a recap, rather than losing them | `aik-summary` |

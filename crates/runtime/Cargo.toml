@@ -23,6 +23,7 @@ aik-fs.workspace = true
 aik-memory.workspace = true
 aik-anthropic.workspace = true
 aik-ollama.workspace = true
+aik-openai.workspace = true
 aik-policy.workspace = true
 aik-quota.workspace = true
 aik-resilience.workspace = true

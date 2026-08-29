@@ -329,6 +329,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-openai"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "futures",
+ "futures-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "aik-policy"
 version = "0.1.0"
 dependencies = [
@@ -389,6 +411,7 @@ dependencies = [
  "aik-mcp",
  "aik-memory",
  "aik-ollama",
+ "aik-openai",
  "aik-policy",
  "aik-quota",
  "aik-resilience",

@@ -79,8 +79,9 @@ export ANTHROPIC_API_KEY=sk-ant-...
 aik --provider anthropic -m claude-sonnet-4-5 "what is in src?"
 ```
 
-`--provider` takes `ollama` (the default: a local server, no credential) or `anthropic` (the
-Messages API, which needs a key). Like the model, it can be set in a config file
+`--provider` takes `ollama` (the default: a local server, no credential), `anthropic` (the
+Messages API, which needs a key), or `openai` (any server speaking the chat-completions
+dialect, which needs a key unless its endpoint is loopback). Like the model, it can be set in a config file
 (`agent.provider`) or as `AIK_AGENT__PROVIDER`, and the command line wins over both; it lives
 in `agent` for the same reason the model does, since one database answered by two different
 services is the same problem as one answered by two different models. `--provider` is refused
@@ -100,6 +101,29 @@ with a cause explaining that a key belongs in `api_key_env` or `api_key_file`. A
 a malformed one, a key file at mode `644`, and a non-`https` endpoint that is not loopback all
 stop the process the same way — before a session exists, rather than on the first turn typed
 into one.
+
+The `openai` provider follows the same rules under `components.model.openai`, with
+`OPENAI_API_KEY` as the default variable, and adds two settings the others do not have. Its
+`endpoint` includes the version prefix (default `https://api.openai.com/v1`), so pointing it
+at something else is how a gateway or a local server is reached:
+
+```bash
+export OPENAI_API_KEY=sk-...
+aik --provider openai -m gpt-4.1-mini "what is in src?"
+```
+
+```bash
+# A local server, no credential involved. Requires api_key_required=false in the config,
+# which is accepted only because the endpoint is loopback.
+aik --provider openai --config local.json -m qwen3 "what is in src?"
+```
+
+`api_key_required = false` is the only relaxation of the rules above, and it is refused for
+any endpoint that is not loopback: sending a whole conversation off this machine with no
+credential is a configuration mistake far more often than it is a private gateway. A
+configured `api_key_file` that does not exist is still an error even with the requirement off,
+because falling back to an unauthenticated request over a typo is the wrong direction to fail
+in.
 
 ## Interactive mode vs. one-shot mode
 
@@ -1160,8 +1184,9 @@ These are documented, deliberate properties of the current implementation, not d
   similarity; the ranking is a scan over the records the exact filters already narrowed to,
   with no approximate-nearest-neighbour index behind it, and changing the embedding model
   later leaves every record stored under the old one out of semantic results. It needs the
-  `ollama` provider: the Anthropic Messages API serves no embeddings, and naming an embedding
-  model alongside it fails at startup rather than starting a memory that never searches.
+  `ollama` or `openai` provider: the Anthropic Messages API serves no embeddings, and naming
+  an embedding model alongside it fails at startup rather than starting a memory that never
+  searches.
 - **Nothing schedules anything by default.** The scheduler is wired and its persistent jobs
   survive a restart, but the frontend registers no job handlers and offers no tool for
   scheduling, so a stock `aik` has an empty schedule. Handlers are contributed by components,

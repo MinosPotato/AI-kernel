@@ -78,9 +78,17 @@ pub const DEFAULT_USER: &str = "user";
 /// assistant changing its mind rather than like a configuration mistake.
 ///
 /// The default is [`Provider::Ollama`], which is the only one that needs no credential and
-/// no network beyond this machine. Choosing [`Provider::Anthropic`] is choosing to send the
-/// conversation — and whatever the filesystem tools have read into it — to a third party, so
-/// it is never the default and is always something a deployment wrote down.
+/// no network beyond this machine. Choosing [`Provider::Anthropic`] or [`Provider::OpenAi`]
+/// is choosing to send the conversation — and whatever the filesystem tools have read into
+/// it — to a third party, so neither is ever the default and both are always something a
+/// deployment wrote down.
+///
+/// [`Provider::OpenAi`] is the one entry that is not a service. It names a *dialect*, and
+/// the endpoint it is pointed at decides who hears the conversation: `api.openai.com` by
+/// default, but equally a gateway, or a server on this machine that no packet leaves. That
+/// makes it the one choice where reading the name is not enough to know where the words go,
+/// which is why [`aik_openai`](../aik_openai/index.html) refuses an endpoint that is neither
+/// `https` nor loopback rather than trusting that whoever wrote it meant it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Provider {
     /// A local or self-hosted Ollama server.
@@ -90,6 +98,10 @@ pub enum Provider {
     /// [`aik_anthropic`](../aik_anthropic/index.html) for where that key may and may not
     /// live.
     Anthropic,
+    /// Any server speaking the OpenAI chat-completions dialect: OpenAI itself, a gateway
+    /// such as OpenRouter, or a local vLLM or llama.cpp. See
+    /// [`aik_openai`](../aik_openai/index.html) for the endpoint and credential rules.
+    OpenAi,
 }
 
 impl Provider {
@@ -98,8 +110,9 @@ impl Provider {
         match raw.trim() {
             "ollama" => Ok(Self::Ollama),
             "anthropic" => Ok(Self::Anthropic),
+            "openai" => Ok(Self::OpenAi),
             other => Err(Error::InvalidArgument(format!(
-                "provider takes one of ollama, anthropic; got `{other}`"
+                "provider takes one of ollama, anthropic, openai; got `{other}`"
             ))),
         }
     }
@@ -109,6 +122,7 @@ impl Provider {
         match self {
             Self::Ollama => "ollama",
             Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
         }
     }
 
@@ -117,6 +131,7 @@ impl Provider {
         ComponentId::new(match self {
             Self::Ollama => aik_ollama::DEFAULT_COMPONENT_ID,
             Self::Anthropic => aik_anthropic::DEFAULT_COMPONENT_ID,
+            Self::OpenAi => aik_openai::DEFAULT_COMPONENT_ID,
         })
     }
 
@@ -128,9 +143,15 @@ impl Provider {
     /// it cannot do is rank by meaning, and
     /// [`assemble`](crate::wiring::assemble) says so rather than quietly leaving the setting
     /// out.
+    ///
+    /// The other two publish one from the same component as their completions, over the same
+    /// endpoint and the same credential — which is why a single id serves both here. It is
+    /// still a *different model*: `agent.embedding_model` names it, and neither provider's
+    /// listing says which of the models it serves can embed.
     pub fn embedder_component_id(self) -> Option<ComponentId> {
         match self {
             Self::Ollama => Some(ComponentId::new(aik_ollama::DEFAULT_COMPONENT_ID)),
+            Self::OpenAi => Some(ComponentId::new(aik_openai::DEFAULT_COMPONENT_ID)),
             Self::Anthropic => None,
         }
     }
@@ -1152,14 +1173,17 @@ mod tests {
     #[test]
     fn a_provider_nobody_implements_fails_at_startup() {
         let config = Config::builder()
-            .layer(json!({ "agent": { "provider": "openai" } }))
+            .layer(json!({ "agent": { "provider": "gemini" } }))
             .build();
 
         let error = deployment()
             .resolve(config, env(&[]))
             .expect_err("an unknown provider is a mistake");
 
-        assert!(format!("{error}").contains("ollama, anthropic"), "{error}");
+        assert!(
+            format!("{error}").contains("ollama, anthropic, openai"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik`](crates/aik) | Facade re-exporting both |
 | [`aik-ollama`](crates/ollama) | A `ModelProvider` backed by a local or remote Ollama server |
 | [`aik-anthropic`](crates/anthropic) | A `ModelProvider` backed by the Anthropic Messages API, credential and all |
+| [`aik-openai`](crates/openai) | A `ModelProvider` and `Embedder` for any server speaking the OpenAI chat-completions dialect |
 | [`aik-tools`](crates/tools) | The authorization-gated `ToolRegistry` implementation |
 | [`aik-mcp`](crates/mcp) | External Model Context Protocol tool servers, as one `ToolCatalog` |
 | [`aik-policy`](crates/policy) | A deterministic, configuration-driven `PolicyEngine` |
@@ -222,6 +223,53 @@ written down as a practice:
 
 A missing or malformed key stops the kernel from starting, rather than being discovered on the
 first turn somebody types.
+
+### One dialect, many servers
+
+[`aik-openai`](crates/openai) is the third `ModelProvider`, and the first that is not a
+description of one service. The chat-completions dialect is spoken by OpenAI, and equally by
+OpenRouter, Groq, Together, vLLM, llama.cpp, LM Studio and Ollama's own compatibility
+endpoint — so one crate reaches all of them, by naming a different `endpoint` and nothing
+else:
+
+```bash
+export OPENAI_API_KEY=sk-...
+aik --provider openai -m gpt-4.1-mini "what is a kernel?"
+```
+
+That breadth is why it is careful about what it claims. A server speaking this dialect is
+*not* OpenAI: it may omit the `[DONE]` sentinel that ends a stream, answer a 502 with an HTML
+page, reject the multi-part content form that a one-element array produces, or have no notion
+of an account at all. Each of those is handled rather than assumed away — a stream that
+reached a finish reason is complete with or without the sentinel, a body that is not the error
+envelope is passed through as text rather than becoming a decode failure that hides the
+status, a message that is only text is sent as a bare string, and `api_key_required = false`
+turns off the credential requirement for a server that has none.
+
+That last one is the only relaxation of the credential rules above, and it is bounded: it is
+accepted **only for a loopback endpoint**. Off this machine, an unauthenticated request
+carrying a whole conversation is a configuration mistake far more often than it is a private
+gateway, and a deployment that really has one can hand it any key it accepts.
+
+Two things follow from the dialect rather than from the service. A tool call's arguments
+travel as a JSON *string* in both directions, and a streamed one arrives as fragments of that
+string with nothing announcing when it is finished — so fragments are reassembled per index
+and held until the choice reports a finish reason, and a sequence that never parses is an
+error rather than a call with empty arguments. And a tool result has no error flag here, so
+`is_error` is encoded into the content rather than dropped: a refused `filesystem.write` that
+reached the model as its bare output would read exactly like a successful one.
+
+This is also the first hosted provider with an `Embedder`. It serves `/embeddings` over the
+same endpoint and the same credential, so semantic memory works on a hosted service and not
+only against a local Ollama. The batch is checked rather than trusted: vectors are placed by
+the index each entry carries, and a response with a missing index, a duplicate one, a
+different length or ragged widths is an error, because a batch silently transposed would
+embed every record under the wrong text and nothing downstream could ever detect it.
+
+What it does not do is model reasoning content. Servers in this family that produce it
+document that it must *not* be sent back on the next turn, so modelling it would build a
+transcript this provider then had to refuse to replay — breaking every conversation at its
+second turn. It is display-only text with nowhere in the contract to live.
 
 ## Authorizing and touching real files
 
@@ -762,6 +810,23 @@ id nest — and holds locations and limits, never the key itself:
 | `max_output_tokens` | 4096 | The `max_tokens` a request does not set itself |
 | `request_timeout_ms` | 300000 | Ceiling on one request, unless the caller's deadline is shorter |
 
+The OpenAI-compatible provider's section is `components.model.openai`, and follows the same
+rule — locations and limits, never the key:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `api_key_env` | `OPENAI_API_KEY` | The environment variable the key is read from |
+| `api_key_file` | none | A file holding the key; wins over the variable, must be mode `600` |
+| `api_key_required` | `true` | Whether a missing key stops start-up; `false` is accepted only for a loopback `endpoint` |
+| `endpoint` | `https://api.openai.com/v1` | Including the version prefix. Must be `https` unless it is loopback |
+| `organization` / `project` | none | The `openai-organization` and `openai-project` headers |
+| `request_timeout_ms` | 300000 | Ceiling on one request, unless the caller's deadline is shorter |
+
+There is no `max_output_tokens` here, because this API does not require the field. A request
+that wants one sets it through the call's own `parameters` — where the spelling the target
+server wants (`max_tokens` or `max_completion_tokens`) is the caller's to choose, since it
+differs between servers and between models on the same server.
+
 Retrying, circuit breaking and concurrency limiting are configured once for whichever provider
 the deployment chose, under `components.model.resilient`. The layer is always registered — the
 way to have none is to configure a pass-through, so the question "does this deployment retry?"
@@ -797,9 +862,9 @@ a host process over one database cannot describe two different assistants:
 |---|---|---|
 | `agent.agent` / `agent.user` | `assistant` / `user` | The identities policy and the audit trail see |
 | `agent.root` | the working directory | The confinement root, for files and for programs |
-| `agent.provider` | `ollama` | Which model provider answers: `ollama` or `anthropic` |
+| `agent.provider` | `ollama` | Which model provider answers: `ollama`, `anthropic` or `openai` |
 | `agent.model` | the provider's first model | The model every turn is sent to |
-| `agent.embedding_model` | none | Embed memories with this, so `memory.query` can search by meaning; needs the `ollama` provider |
+| `agent.embedding_model` | none | Embed memories with this, so `memory.query` can search by meaning; needs the `ollama` or `openai` provider |
 | `agent.summary.enabled` | `true` | Whether an overflowing session is compacted rather than silently shortened |
 | `agent.summary.model` | `agent.model` | The model that writes recaps; usually worth pointing at a smaller one |
 | `agent.summary.keep_recent` | 8 | How many recent records survive a round when no token budget bounds the window |
@@ -1071,6 +1136,47 @@ where a response exists to charge for, so the quota guard charges exactly once p
 many attempts that turn took, and `retry.max_attempts` is the stated bound on how many that can
 be. A cross-subsystem test asserts exactly that, because neither crate could: `aik-quota` has
 never heard of a retry and `aik-resilience` never touches a ledger.
+
+`aik-openai` is the newest of these, and the first provider that is not a description of a
+service. `aik-anthropic` exists so that `ModelProvider` is a contract rather than a portrait of
+Ollama; this one tests something the first two could not, because the chat-completions dialect
+is spoken by a dozen implementations that agree on the schema and disagree on everything
+around it. The same code path reaches `api.openai.com`, a gateway, and a llama.cpp on this
+machine — and the interesting work is entirely in not assuming they behave alike. A stream
+that reached a finish reason is complete with or without the `[DONE]` sentinel, because
+several of them never send it. A body that is not the error envelope is passed through as text
+rather than becoming a decode failure that hides the status, because a gateway's 502 is an
+HTML page. A message that is only text is sent as a bare string rather than a one-element
+array, because several of them reject the array. None of that is speculative generality: each
+one is a server in this family behaving differently from the one the format is named after.
+
+Three things it refuses are where the design is. A tool result has no error flag in this
+dialect, so `is_error` is encoded into the content rather than dropped — a refused
+`filesystem.write` arriving as its bare output would read to the model exactly like a
+successful one. Reasoning content is not modelled at all, because the servers that produce it
+document that it must not be sent back, so surfacing it would build a transcript this provider
+then had to refuse to replay, breaking every conversation at its second turn; declining to
+carry non-replayable display text is not the same failure as dropping a tool call, and the
+crate says which it is doing. And `n` is refused rather than silently truncated to the first
+choice, because a `CompletionResponse` holds one message and the rest would be billed for and
+never read.
+
+It also settles a question the credential rules had not been asked before: what a provider
+does when the endpoint has no account. A local inference server takes no key, so
+`api_key_required` can turn the requirement off — and only for a loopback endpoint, because an
+unauthenticated request carrying a whole conversation off this machine is a configuration
+mistake far more often than it is a private gateway. Everything else about a key is unchanged
+and re-tested here rather than assumed: a file still beats a variable, a world-readable file is
+still a startup failure, a key with a newline in it is still refused as header injection, and
+a configured file that does not exist is an error even when no key is required — falling back
+to an unauthenticated request because of a typo is the wrong direction to fail in.
+
+Finally, it is the first hosted provider with an `Embedder`, over the same endpoint and the
+same credential, so semantic memory is no longer something only a local Ollama can do. The
+batch is verified rather than trusted: vectors are placed by the index each entry carries, and
+a missing index, a duplicate, a short batch or ragged widths is an error. That check is the
+whole point — a transposed batch would embed every record under the wrong text, produce
+plausible-looking results forever, and be undetectable from anywhere downstream.
 
 What is genuinely not built yet: any platform integration at all. `aik-scheduler` now defines
 a cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an
