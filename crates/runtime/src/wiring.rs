@@ -68,6 +68,7 @@ use aik_exec::{ExecTool, Sandbox};
 use aik_fs::{FsListTool, FsReadTool, FsWriteTool};
 use aik_mcp::{McpCatalog, McpClient, McpComponent};
 use aik_memory::{MemoryComponent, MemoryToolsComponent, RedbMemoryComponent};
+use aik_net::WebFetchTool;
 use aik_ollama::OllamaComponent;
 use aik_openai::OpenAiComponent;
 use aik_policy::RuleBasedPolicyEngine;
@@ -152,6 +153,16 @@ pub fn builder(
     // start rather than running programs unconfined and saying nothing.
     if settings.exec.is_enabled() {
         tools = tools.with_tool(exec_tool(settings)?);
+    }
+
+    // Registered on the same terms as the two above, and for a third reason again. `aik-fs`
+    // is bounded by a root and `aik-exec` by a sandbox, both of which are things this
+    // deployment configured; a fetch is bounded by what its *destination* turns out to be,
+    // and the destination is a model's argument. So the crate enforces its own boundary on
+    // every URL — scheme, address, resolution, redirect — and this switch only decides
+    // whether the capability exists in this run at all. See `aik_net`.
+    if settings.net.is_enabled() {
+        tools = tools.with_tool(WebFetchTool::new(settings.net_settings.clone())?);
     }
 
     // The same shape again, over tools this repository did not write. Every server's

@@ -242,6 +242,7 @@ dependencies = [
  "aik-fs",
  "aik-mcp",
  "aik-memory",
+ "aik-net",
  "aik-policy",
  "aik-quota",
  "aik-resilience",
@@ -256,6 +257,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -305,6 +307,24 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aik-net"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "aik-policy",
+ "aik-tools",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -410,6 +430,7 @@ dependencies = [
  "aik-fs",
  "aik-mcp",
  "aik-memory",
+ "aik-net",
  "aik-ollama",
  "aik-openai",
  "aik-policy",

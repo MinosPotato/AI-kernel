@@ -29,6 +29,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the reasoning behind i
 | [`aik-resilience`](crates/resilience) | Retrying, circuit breaking and concurrency limiting in front of any `ModelProvider` |
 | [`aik-fs`](crates/fs) | Filesystem `Tool`s — read and write — each confined to a configured root |
 | [`aik-exec`](crates/exec) | Running allowlisted programs behind an OS-level sandbox |
+| [`aik-net`](crates/net) | One HTTP GET, confined to the addresses and hosts a deployment allows |
 | [`aik-approval`](crates/approval) | A human-in-the-loop `ApprovalSink`, answered by a frontend |
 | [`aik-context`](crates/context) | An agent's transcript, and the budgeted model window derived from it |
 | [`aik-summary`](crates/summary) | Replacing a session's oldest turns with a model-written recap of them |
@@ -637,6 +638,71 @@ for `git commit -m fix` must not also match one argument that merely looks like 
 Resource patterns match by prefix with no word boundary, which is why every pattern above
 carries its separating space: `command/git*` would also match `gitk`.
 
+## Fetching a document
+
+[`aik-net`](crates/net) is where the model chooses where the process connects. `aik-anthropic`
+and `aik-openai` also leave the machine, but to one endpoint an operator wrote down; here the
+destination is an argument, produced by a model, from a conversation that may contain text
+somebody else wrote. That inverts the question. It is not *may this deployment reach the
+network* — it is, given that the address is attacker-influenced, *what may it be*.
+
+```bash
+aik --net on "summarise https://doc.rust-lang.org/std/pin/index.html"
+```
+
+An unconstrained fetch is a privilege escalation rather than a convenience, because a process
+that makes an HTTP request on somebody's behalf is a proxy into every network that process
+sits in. `169.254.169.254` answers, on most hosted machines, with credentials for the role the
+machine runs as. `127.0.0.1` and the RFC 1918 ranges reach the admin interfaces and databases
+that are unauthenticated *because* they are unreachable from outside. A DNS record that
+changes between the check and the connection reaches both while every check written against
+the name passes. So the crate enforces a boundary of its own, exactly as `aik-fs` confines a
+path to a root: policy decides whether a principal may fetch at all, and this decides,
+unconditionally, what a URL is allowed to be.
+
+| Boundary | What it stops |
+|---|---|
+| Shape | Schemes other than http(s), credentials in the URL, privileged ports other than 80 and 443, hosts a deployment excluded |
+| Address | Loopback, private and carrier-grade-NAT ranges unless opted into; the link-local metadata range, multicast, broadcast and IPv4-in-IPv6 spellings always |
+| Resolution | A record that changes between the check and the connection — the client's only resolver is one that cannot return a refused address |
+| Response | Unbounded bodies, non-text content, a charset nobody decodes, unauthorized redirect hops |
+
+The tool takes a URL and nothing else. There is no method, header, body or timeout argument,
+because each is a way for model output to change what the request *is* rather than where it
+points: a method turns a retrieval into a submission, a header is where `Authorization` and
+`Host` live, and a bound chosen by the party it protects against is not a bound.
+
+Redirects are the interesting case, and the first use in the workspace of the mechanism
+[`aik_api::tool`](crates/api/src/tool.rs) calls a resource *discovered mid-run*. The HTTP
+client follows none: a `3xx` names a destination chosen by the server that answered, which did
+not exist when the call was authorized, so each hop is re-validated and put through the
+`ResourceAuthorizer` before it is fetched. A redirect from `https` to `http` is refused
+outright rather than re-asked, because a downgrade nobody requested is not a destination
+anybody chose.
+
+Each call declares two resources, so a rule can answer at either grain:
+
+```json
+{ "action": "web.fetch", "resource": "host/docs.rs",        "effect": { "decision": "allow" } },
+{ "action": "web.fetch", "resource": "url/https://docs.rs/*", "effect": { "decision": "allow" } },
+{ "action": "web.fetch", "resource": "url/*",
+  "effect": { "decision": "require_approval", "prompt": "let the agent fetch this URL?" } }
+```
+
+The URL a rule sees has its query string removed. A resource travels into the durable audit
+trail, and a query is where session tokens, signed links and unbounded model-authored text
+live — none of which a rule can usefully match on, and all of which would then be kept
+forever.
+
+What comes back is written by whoever runs that server, which is the position `aik-mcp` puts a
+third party's tool results in, and it gets the same treatment: bounded everywhere, decoded as
+one encoding rather than whatever was declared, reduced to text before a model sees it, and
+described to the model as something to evaluate rather than obey. What no layer here can do is
+make a fetched page not contain instructions. The guarantee that holds instead is structural:
+a page that talks a model into asking for something reaches the tool registry, and policy,
+approval and the audit trail are all still in front of whatever it asks for. Fetching grants
+nothing.
+
 ## Tools this repository did not write
 
 [`aik-mcp`](crates/mcp) connects to Model Context Protocol servers — the programs that expose
@@ -871,6 +937,13 @@ a host process over one database cannot describe two different assistants:
 | `agent.exec.programs` | none | The bare program names `aik-exec` will run |
 | `agent.exec.writable` | `false` | Whether a program may write to the root |
 | `agent.exec.network` | `false` | Whether a program has a network |
+| `agent.net.allow_hosts` | none | The only hosts a fetch may reach; empty means any that resolves acceptably, `.example.com` matches subdomains |
+| `agent.net.deny_hosts` | none | Hosts a fetch may never reach, applied before the allowlist |
+| `agent.net.allow_local_addresses` | `false` | Whether loopback, RFC 1918 and unique-local addresses may be reached; never the link-local metadata range |
+| `agent.net.allow_http` | `false` | Whether plaintext `http` URLs are accepted as well as `https` |
+| `agent.net.max_bytes` | 524288 | The largest response body one call reads; more is truncated, and says so |
+| `agent.net.timeout_ms` | 20000 | The budget for one call — resolution, connection, every hop and the body together |
+| `agent.net.max_redirects` | 3 | How many hops one call may follow, each re-authorized |
 | `agent.mcp.servers[].label` | required | The name the server's tools are namespaced under: `mcp.<label>.<tool>` |
 | `agent.mcp.servers[].command` / `.args` | required / none | The bare program name to run, and its argument vector; there is no shell |
 | `agent.mcp.servers[].env` | none | The server's entire environment; nothing is inherited |
@@ -1177,6 +1250,34 @@ batch is verified rather than trusted: vectors are placed by the index each entr
 a missing index, a duplicate, a short batch or ragged widths is an error. That check is the
 whole point — a transposed batch would embed every record under the wrong text, produce
 plausible-looking results forever, and be undetectable from anywhere downstream.
+
+`aik-net` is the newest of these, and the first capability whose *destination* comes from the
+model. Everything before it acted on things a deployment had already named: a root, an
+allowlist of programs, a list of servers, a database. A fetch acts on a URL that arrives as
+text, from a conversation that may contain text somebody else wrote, and that is a different
+kind of question — not whether the deployment may reach the network, but what an
+attacker-influenced address may be. So the crate carries a boundary of its own, in four
+independent places, none of which is the reason another is safe: the shape of the URL, the
+class of the address it resolves to, the resolver the client is given, and what may come back.
+
+The one setting that relaxes an address check admits this machine's own networks and not the
+link-local range where hosted machines answer with their own credentials — a deployment that
+meant to reach a wiki at `10.0.0.5` did not thereby mean to hand out its instance role. The
+refusals are again where the design is: a name that resolves to one public and one private
+address is connected to on the public one rather than refused outright, because that is an
+ordinary split-horizon zone; a redirect is a resource discovered mid-run, so it is
+re-authorized through the same `ResourceAuthorizer` a filesystem tool would use for a symlink
+that moved, and an `https` hop that turns into `http` is refused rather than re-asked; a
+content type that is not text is refused instead of decoded, because a model reading a
+mangled PNG is worse than a model told there was one; and the resource a rule matches carries
+no query string, because an audit trail that keeps every signed URL forever is a credential
+store nobody meant to build.
+
+It is also the first tool whose *output* is a third party's prose rather than this machine's
+state, and there the honest claim is narrow. Nothing at this layer can make a fetched page not
+contain instructions. What holds instead is that fetching one grants nothing: a page that
+talks a model into asking for something reaches `ToolRegistry::invoke` like any other request,
+and policy, approval, quota and the audit trail are all still in front of it.
 
 What is genuinely not built yet: any platform integration at all. `aik-scheduler` now defines
 a cron dialect of its own — five-field, UTC, `cron(5)`-compatible — and refuses only an

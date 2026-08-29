@@ -346,7 +346,10 @@ async fn shutting_the_kernel_down_stops_the_server() {
             .as_nanos()
     );
     write_server(directory.path(), &command, TOOLS);
-    let catalog = catalog(directory.path(), settings(directory.path(), "demo", &command));
+    let catalog = catalog(
+        directory.path(),
+        settings(directory.path(), "demo", &command),
+    );
 
     let kernel = Kernel::builder()
         .component(

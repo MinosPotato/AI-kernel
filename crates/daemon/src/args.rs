@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use aik_core::{Error, Result};
-use aik_runtime::{ExecSet, McpSet, MemorySet, Provider};
+use aik_runtime::{ExecSet, McpSet, MemorySet, NetSet, Provider};
 
 /// The program name used in help and error messages.
 pub const PROGRAM: &str = "aikd";
@@ -50,6 +50,8 @@ pub struct Options {
     pub exec: Option<ExecSet>,
     /// Whether to start the external MCP tool servers.
     pub mcp: Option<McpSet>,
+    /// Whether the agent may fetch documents over HTTP, or `None` for the default.
+    pub net: Option<NetSet>,
     /// Where the shared database lives.
     pub database: Option<PathBuf>,
     /// Whether to run with no database at all.
@@ -102,6 +104,8 @@ pub const HELP: &str = concat!(
     "        --memory <MODE>  which memory tools to register: off, recall, remember, full\n",
     "        --mcp <MODE>     start the servers in agent.mcp.servers and register what\n",
     "                         they offer: off, on [default: off]\n",
+    "        --net <MODE>     let the agent fetch documents over HTTP, bounded by\n",
+    "                         agent.net: off, on [default: off]\n",
     "        --exec <MODE>    run the programs in agent.exec.programs: off, sandboxed,\n",
     "                         unconfined (no sandbox — the allowlist is the only limit)\n",
     "                         [default: off]\n",
@@ -187,6 +191,12 @@ where
                         .map_err(|error| usage(format!("`--mcp` is wrong: {error}")))?,
                 );
             }
+            "--net" => {
+                options.net = Some(
+                    NetSet::parse(&value(&flag)?)
+                        .map_err(|error| usage(format!("`--net` is wrong: {error}")))?,
+                );
+            }
             "--memory" => {
                 let raw = value(&flag)?;
                 options.memory = Some(
@@ -221,6 +231,12 @@ where
     if options.no_tools && options.mcp.is_some() {
         return Err(usage(
             "`--no-tools` and `--mcp` contradict each other".to_owned(),
+        ));
+    }
+
+    if options.no_tools && options.net.is_some() {
+        return Err(usage(
+            "`--no-tools` and `--net` contradict each other".to_owned(),
         ));
     }
     if options.ephemeral && options.database.is_some() {
@@ -269,6 +285,14 @@ impl Options {
             return McpSet::Off;
         }
         self.mcp.unwrap_or_default()
+    }
+
+    /// Whether these options ask for the web fetch tool. See [`Options::memory`].
+    pub fn net(&self) -> NetSet {
+        if self.no_tools {
+            return NetSet::Off;
+        }
+        self.net.unwrap_or_default()
     }
 }
 
@@ -348,6 +372,9 @@ mod tests {
         assert_eq!(serve(&["--exec", "sandboxed"]).exec(), ExecSet::Sandboxed);
         assert_eq!(serve(&[]).mcp(), McpSet::Off);
         assert_eq!(serve(&["--mcp", "on"]).mcp(), McpSet::On);
+        assert_eq!(serve(&[]).net(), NetSet::Off);
+        assert_eq!(serve(&["--net", "on"]).net(), NetSet::On);
+        assert_eq!(serve(&["--no-tools"]).net(), NetSet::Off);
 
         let error = parse(["--exec", "sandbox"].iter().map(|a| (*a).to_owned())).unwrap_err();
         assert!(

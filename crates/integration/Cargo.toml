@@ -29,6 +29,7 @@ aik-summary.workspace = true
 aik-tools.workspace = true
 aik-mcp.workspace = true
 aik-exec.workspace = true
+aik-net.workspace = true
 aik-policy.workspace = true
 aik-quota.workspace = true
 aik-resilience.workspace = true
@@ -47,3 +48,4 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tempfile.workspace = true
+wiremock.workspace = true
