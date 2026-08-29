@@ -25,6 +25,7 @@ use aik_api::model::ModelId;
 use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
 use aik_core::ComponentId;
 use aik_core::prelude::*;
+use aik_net::NetSettings;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -359,6 +360,54 @@ pub struct McpSettings {
     pub servers: Vec<aik_mcp::ServerSettings>,
 }
 
+/// Where a deployment writes down what a fetch may reach.
+pub const NET_SECTION: &str = "agent.net";
+
+/// Whether the agent may fetch documents over HTTP in this run.
+///
+/// A frontend decision, like [`ExecSet`] and [`McpSet`], and off by default for the same
+/// reason as both: what a fetch may reach is written in configuration by an operator and
+/// cannot be widened from a command line, but whether this particular run can reach the
+/// network at all is something the person starting it gets to say.
+///
+/// It is the one capability here whose *destination* comes from the model rather than from
+/// configuration, which is why the crate behind it enforces a boundary of its own on every
+/// URL regardless of what policy allows. See [`aik_net`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetSet {
+    /// No fetch tool is registered.
+    #[default]
+    Off,
+    /// `web.fetch` is registered, bounded by `agent.net`.
+    On,
+}
+
+impl NetSet {
+    /// Reads a mode by name, or explains what the names are.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
+            other => Err(Error::InvalidArgument(format!(
+                "unknown network mode `{other}`; expected one of off, on"
+            ))),
+        }
+    }
+
+    /// The name this mode is written as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// Whether this run registers a fetch tool at all.
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 /// What a deployment says about compacting long sessions, read from `agent.summary`.
 ///
 /// Compaction is the one capability here that is *on* unless a deployment says otherwise,
@@ -570,6 +619,7 @@ struct AgentSection {
     system_prompt: Option<String>,
     exec: ExecSettings,
     mcp: McpSettings,
+    net: NetSettings,
     summary: SummarySettings,
 }
 
@@ -729,6 +779,8 @@ pub struct Deployment {
     pub exec: ExecSet,
     /// Whether external MCP tool servers are started.
     pub mcp: McpSet,
+    /// Whether the agent may fetch documents over HTTP.
+    pub net: NetSet,
     /// Whether scheduled work runs in this process.
     pub jobs: JobExecution,
     /// Where durable state goes, if anywhere.
@@ -787,6 +839,8 @@ impl Deployment {
             exec_settings: section.exec,
             mcp: self.mcp,
             mcp_settings: section.mcp,
+            net: self.net,
+            net_settings: section.net,
             summary: section.summary,
             storage,
             jobs: self.jobs,
@@ -865,6 +919,10 @@ pub struct RuntimeSettings {
     pub mcp: McpSet,
     /// The servers this deployment describes, whatever this run does with them.
     pub mcp_settings: McpSettings,
+    /// Whether a fetch tool is registered in this run.
+    pub net: NetSet,
+    /// What a fetch may reach, read from `agent.net`, whatever this run does with it.
+    pub net_settings: NetSettings,
     /// Whether long sessions are compacted, and with what, read from `agent.summary`.
     pub summary: SummarySettings,
     /// Where the durable subsystems keep what they hold, if anywhere.
@@ -930,6 +988,8 @@ impl RuntimeSettings {
             exec_settings: ExecSettings::default(),
             mcp: McpSet::default(),
             mcp_settings: McpSettings::default(),
+            net: NetSet::default(),
+            net_settings: NetSettings::default(),
             summary: SummarySettings::default(),
             storage: Storage::Ephemeral,
             jobs: JobExecution::default(),

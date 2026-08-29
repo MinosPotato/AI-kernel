@@ -189,7 +189,7 @@ every "Implemented by" column below is a separate crate.
 | `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     | — (a plain value type, not a trait) |
 | `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (both), `aik-openai` (both), `aik-anthropic` (`ModelProvider`) |
 | `resilience` | `TransientFailure`: a provider saying a failure was the service's, not the request's | marked by `aik-ollama`, `aik-anthropic` and `aik-openai`, acted on by `aik-resilience` |
-| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`), `aik-mcp` (`ToolCatalog`) |
+| `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs`, `aik-exec` and `aik-net` (`Tool`), `aik-mcp` (`ToolCatalog`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
 | `context`    | `ContextCompactor`: replacing evicted turns with a recap, rather than losing them | `aik-summary` |
 | `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query needs an `Embedder`) |

@@ -21,7 +21,7 @@ pub const PROGRAM: &str = "aik";
 /// which capability exists at all — and the host process makes exactly the same two. A
 /// second definition would be a second thing to keep in step, and the drift would show up as
 /// a tool present in one frontend and absent in the other.
-pub use aik_runtime::{ExecSet, McpSet, MemorySet, Provider, ToolSet};
+pub use aik_runtime::{ExecSet, McpSet, MemorySet, NetSet, Provider, ToolSet};
 
 /// What the user asked for on the command line.
 ///
@@ -69,6 +69,11 @@ pub struct Options {
     /// An `Option` for the same reason as [`Options::exec`]: `--mcp` alongside `--no-tools`
     /// is a contradiction to be rejected rather than a race between two switches.
     pub mcp: Option<McpSet>,
+    /// Whether the agent may fetch documents over HTTP, or `None` to take the default.
+    ///
+    /// An `Option` for the same reason as [`Options::mcp`]: `--net` alongside `--no-tools`
+    /// is a contradiction to be rejected rather than a race between two switches.
+    pub net: Option<NetSet>,
     /// Which memory tools to register, or `None` to take the default.
     ///
     /// An `Option` rather than a bare [`MemorySet`] so that `--memory` combined with
@@ -129,6 +134,17 @@ impl Options {
         match self.no_tools {
             true => McpSet::Off,
             false => self.mcp.unwrap_or_default(),
+        }
+    }
+
+    /// Whether these options ask for the web fetch tool.
+    ///
+    /// `--no-tools` covers this one too, for the reason it covers the others: it means no
+    /// tools at all, and it has to keep meaning that as tools are added.
+    pub fn net(&self) -> NetSet {
+        match self.no_tools {
+            true => NetSet::Off,
+            false => self.net.unwrap_or_default(),
         }
     }
 
@@ -205,6 +221,8 @@ pub const HELP: &str = concat!(
     "                         allowlist is then the only limit) [default: off]\n",
     "        --mcp <MODE>     start the external tool servers in agent.mcp.servers and\n",
     "                         register what they offer: off, on [default: off]\n",
+    "        --net <MODE>     let the agent fetch documents over HTTP, bounded by\n",
+    "                         agent.net: off, on [default: off]\n",
     "        --memory <MODE>  which memory tools to register: off, recall (get, query),\n",
     "                         remember (recall plus put), full (also delete)\n",
     "                         [default: remember]\n",
@@ -246,6 +264,16 @@ pub const HELP: &str = concat!(
     "    A server is not sandboxed: it runs as your account. It also cannot ask anything\n",
     "    of this process — no sampling from your model, no view of your filesystem roots —\n",
     "    and nothing it says about itself makes its tools auto-approvable.\n",
+    "\n",
+    "FETCHING DOCUMENTS:\n",
+    "    `--net on` registers web.fetch: one https GET, no method, header or body argument,\n",
+    "    text formats only, and the body cut at agent.net.max_bytes. What it may reach is\n",
+    "    checked independently of policy — private, loopback and cloud-metadata addresses\n",
+    "    are refused, the address checked is the address connected to, and each redirect is\n",
+    "    re-authorized as its own resource. agent.net widens it: allow_local_addresses for\n",
+    "    services on your own network, allow_hosts to narrow it to a list you name.\n",
+    "    Whatever comes back was written by whoever runs that server; fetching it grants\n",
+    "    nothing, and anything it asks for goes through policy like any other request.\n",
     "\n",
     "APPROVALS:\n",
     "    An interactive session answers `require_approval` from the terminal. A one-shot\n",
@@ -389,6 +417,14 @@ where
                     ))
                 })?);
             }
+            "--net" => {
+                let raw = value(&flag)?;
+                options.net = Some(NetSet::parse(&raw).map_err(|error| {
+                    usage(format!(
+                        "`--net` takes one of off, on; got `{raw}` ({error})"
+                    ))
+                })?);
+            }
             "--memory" => {
                 let raw = value(&flag)?;
                 options.memory = Some(MemorySet::parse(&raw).map_err(|error| {
@@ -434,6 +470,12 @@ where
         ));
     }
 
+    if options.no_tools && options.net.is_some() {
+        return Err(usage(
+            "`--no-tools` and `--net` contradict each other".to_owned(),
+        ));
+    }
+
     if options.ephemeral && options.database.is_some() {
         return Err(usage(
             "`--ephemeral` and `--db` contradict each other".to_owned(),
@@ -462,6 +504,7 @@ where
             ("--memory", options.memory.is_some()),
             ("--exec", options.exec.is_some()),
             ("--mcp", options.mcp.is_some()),
+            ("--net", options.net.is_some()),
             ("--db", options.database.is_some()),
             ("--ephemeral", options.ephemeral),
             ("--policy", options.policy.is_some()),
@@ -865,6 +908,31 @@ mod tests {
         for (name, expected) in [("off", McpSet::Off), ("on", McpSet::On)] {
             assert_eq!(options(&["--mcp", name]).mcp(), expected);
         }
+    }
+
+    #[test]
+    fn the_network_is_off_unless_a_run_asks_for_it() {
+        assert_eq!(options(&[]).net(), NetSet::Off);
+        assert_eq!(options(&["--write", "--mcp", "on"]).net(), NetSet::Off);
+    }
+
+    #[test]
+    fn every_network_mode_is_selectable_by_name() {
+        for (name, expected) in [("off", NetSet::Off), ("on", NetSet::On)] {
+            assert_eq!(options(&["--net", name]).net(), expected);
+        }
+    }
+
+    #[test]
+    fn an_unknown_network_mode_is_rejected_rather_than_taken_as_the_default() {
+        let error = parse(["--net", "yes"]).unwrap_err();
+        assert!(error.to_string().contains("--net"), "{error}");
+    }
+
+    #[test]
+    fn no_tools_and_net_contradict_each_other() {
+        assert!(parse(["--no-tools", "--net", "on"]).is_err());
+        assert_eq!(options(&["--no-tools"]).net(), NetSet::Off);
     }
 
     #[test]

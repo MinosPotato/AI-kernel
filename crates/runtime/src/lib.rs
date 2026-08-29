@@ -68,8 +68,8 @@ pub use schedule_tools::{
 };
 pub use settings::{
     AGENT_SECTION, DATABASE_PATH_KEY, DEFAULT_AGENT, DEFAULT_USER, Deployment, ENV_PREFIX, ExecSet,
-    ExecSettings, JobExecution, MCP_SERVERS_PATH, McpSet, McpSettings, MemorySet, POLICY_SECTION,
-    Provider, QUOTA_SECTION, RuntimeSettings, SYSTEM_PROMPT_KEY, Storage, StorageChoice,
-    SummarySettings, ToolSet, load_config, pin_database_path, system_prompt,
+    ExecSettings, JobExecution, MCP_SERVERS_PATH, McpSet, McpSettings, MemorySet, NET_SECTION,
+    NetSet, POLICY_SECTION, Provider, QUOTA_SECTION, RuntimeSettings, SYSTEM_PROMPT_KEY, Storage,
+    StorageChoice, SummarySettings, ToolSet, load_config, pin_database_path, system_prompt,
 };
 pub use wiring::{Assembled, assemble, builder, first_available_model};

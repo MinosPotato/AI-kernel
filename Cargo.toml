@@ -14,6 +14,7 @@ members = [
     "crates/resilience",
     "crates/fs",
     "crates/exec",
+    "crates/net",
     "crates/approval",
     "crates/audit",
     "crates/context",
@@ -47,6 +48,7 @@ aik-quota = { version = "0.1.0", path = "crates/quota" }
 aik-resilience = { version = "0.1.0", path = "crates/resilience" }
 aik-fs = { version = "0.1.0", path = "crates/fs" }
 aik-exec = { version = "0.1.0", path = "crates/exec" }
+aik-net = { version = "0.1.0", path = "crates/net" }
 aik-approval = { version = "0.1.0", path = "crates/approval" }
 aik-audit = { version = "0.1.0", path = "crates/audit" }
 aik-context = { version = "0.1.0", path = "crates/context" }
@@ -81,6 +83,7 @@ async-stream = "0.3"
 bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 wiremock = "0.6"
+url = "2"
 
 libc = "0.2"
 tempfile = "3"

@@ -190,6 +190,45 @@ a model asking to write a file never reaches the tool registry at all — the ag
 outside the fixed set the run was given, and the model just sees that as a normal tool-error
 result it can react to.
 
+## Fetching documents: `--net`
+
+```bash
+aik --net on "what does https://doc.rust-lang.org/std/pin/index.html say about projection?"
+```
+
+Off unless a run asks for it. `--net on` registers one tool, `web.fetch`: an `https` GET
+taking a URL and nothing else — no method, header, body or timeout argument — returning
+HTML, plain text, JSON or XML as text, with the body cut at `agent.net.max_bytes` and
+truncation reported rather than hidden. `--no-tools` and `--net` together are a usage error,
+like every other pair of switches that contradict each other.
+
+What it may reach is checked independently of policy, and a permissive policy cannot widen it:
+
+* `https` only, unless `agent.net.allow_http` says otherwise; no credentials in the URL; no
+  privileged port other than 80 and 443.
+* No loopback, private, or carrier-grade-NAT address unless `agent.net.allow_local_addresses`
+  says so — and never `169.254.0.0/16` or `fe80::/10`, whatever the configuration says, because
+  that is where a hosted machine answers with its own credentials.
+* The address that was checked is the address connected to: the HTTP client's only resolver is
+  one that cannot return a refused address, so a DNS record that changes in between is caught
+  at the point of use.
+* Redirects are followed by the tool rather than by the client, one authorized hop at a time,
+  and `https` never downgrades to `http`.
+
+Policy sees two resources per call, `host/<host>` and `url/<scheme>://<host>/<path>`, so a
+rule can name a host or a specific page. The URL a rule sees carries no query string: a
+resource is written to the durable audit trail, and a query is where tokens and signed links
+live.
+
+The shipped `aik.example.json` allows the capability and every host, and puts each individual
+URL to a human. A deployment that knows where it reads from lists those hosts and turns the
+last rule into a deny.
+
+Everything that comes back was written by whoever runs that server. It is described to the
+model as something to evaluate rather than obey, and nothing about having fetched it grants
+anything: whatever a page talks a model into asking for goes through policy, approval and the
+audit trail like any other request.
+
 ## Memory: what the agent may keep
 
 ```bash
