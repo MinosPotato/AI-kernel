@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -147,6 +148,10 @@ impl Tool for EchoTool {
             })),
             required_permissions: self.required_permissions.clone(),
             read_only: true,
+            // It returns its own argument and touches nothing: the one tool in the workspace
+            // that genuinely introduces nothing and reaches nowhere.
+            output_trust: Trust::Trusted,
+            reach: Reach::Contained,
         }
     }
 

@@ -34,6 +34,7 @@ aik-policy.workspace = true
 aik-quota.workspace = true
 aik-resilience.workspace = true
 aik-fs.workspace = true
+aik-approval.workspace = true
 aik-agent.workspace = true
 # Both frontends, because the property under test in `deployment.rs` is that they resolve the
 # *same* deployment from one configuration file. That claim cannot be made from inside either

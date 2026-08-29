@@ -247,6 +247,15 @@ fn banner(settings: &Settings) {
     if settings.is_one_shot() {
         println!("  approvals: refused (no responder attached in one-shot mode)");
     }
+    // Only when it is not the default. A person who has not configured this does not need to
+    // be told about a mechanism that will introduce itself the first time it asks them
+    // something; a person who turned it down should see that they did, every time.
+    if settings.runtime.trust.enforcement != aik_tools::TrustEnforcement::default() {
+        println!(
+            "  trust:  {} — what a conversation that has read untrusted content may do",
+            settings.runtime.trust.enforcement
+        );
+    }
 }
 
 #[cfg(test)]

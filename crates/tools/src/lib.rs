@@ -31,6 +31,16 @@
 //! [audit events](aik_api::audit). See the [`aik_api::tool`] module docs for why the split
 //! exists and what it does and does not guarantee.
 //!
+//! # And a fourth, about the conversation rather than the caller
+//!
+//! The three phases above all ask what a *principal* may do. A system that reads the outside
+//! world has a second question to answer — what the conversation has already been *told* —
+//! because a model cannot tell a fetched page's instructions from its operator's. So the
+//! registry keeps a [`TrustLedger`](aik_api::provenance::TrustLedger) of what each
+//! conversation has read, and a call that would let untrusted content act reaches a human, or
+//! nobody, before it acts. See [`aik_api::provenance`] for the shape of that and
+//! [`TrustEnforcement`] for the one dial on it.
+//!
 //! ```
 //! use std::sync::Arc;
 //! use aik_api::execution::ExecutionContext;
@@ -76,7 +86,11 @@
 mod component;
 mod echo;
 mod registry;
+mod trust;
 
 pub use component::{DEFAULT_COMPONENT_ID, ToolsComponent};
 pub use echo::{DEFAULT_NAME, DEFAULT_PERMISSION, EchoTool};
 pub use registry::{InProcessToolRegistry, system_principal_id};
+pub use trust::{
+    DEFAULT_CAPACITY, InMemoryTrustLedger, TrustEnforcement, UNTRUSTED_CONTENT_ACTION,
+};

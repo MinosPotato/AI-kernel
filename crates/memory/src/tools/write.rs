@@ -5,6 +5,7 @@ use std::sync::Arc;
 use aik_api::execution::ExecutionContext;
 use aik_api::memory::{MemoryId, MemoryRecord};
 use aik_api::permission::{ActionId, ResourceAuthorizer};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -209,6 +210,11 @@ impl Tool for MemoryPutTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: false,
+            // The output is an id and a timestamp this tool wrote, not the memory itself.
+            output_trust: Trust::Trusted,
+            // What it changes outlives the conversation, which is the whole point of it: a
+            // record written now is read back by a run tomorrow.
+            reach: Reach::Mutating,
         }
     }
 
@@ -230,10 +236,15 @@ impl Tool for MemoryPutTool {
         // The only resource this call touches is the kind, which `planned_resources`
         // declared and the registry authorized before this ran. There is nothing discovered
         // mid-call to ask the authorizer about.
-        let input = self.parse(arguments)?;
+        let mut input = self.parse(arguments)?;
         let kind = parse_kind(&input.kind)?;
         let store = self.binding.store()?;
         ensure_live(cx, self.binding.clock()?.as_ref())?;
+
+        // Stamped before the size is measured, so the record that is checked is the record
+        // that is stored. See `stamp_trust` for why a model's own metadata cannot survive
+        // under this key.
+        super::stamp_trust(&mut input.metadata, cx);
 
         let bytes = Self::payload_bytes(&input)?;
         if bytes > self.max_record_bytes {
@@ -366,6 +377,8 @@ impl Tool for MemoryDeleteTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: false,
+            output_trust: Trust::Trusted,
+            reach: Reach::Mutating,
         }
     }
 

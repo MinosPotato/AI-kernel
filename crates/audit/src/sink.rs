@@ -225,6 +225,7 @@ mod tests {
             principal: PrincipalId::new("agent"),
             principal_kind: PrincipalKind::Agent,
             on_behalf_of: None,
+            output_trust: None,
             duration_ms: 1,
             authorization_duration_ms: None,
             execution_duration_ms: None,

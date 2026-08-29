@@ -29,6 +29,18 @@ aik_core::uuid_id! {
     pub SessionId
 }
 
+/// The execution-context attribute naming the session a run belongs to.
+///
+/// Set by the agent loop from [`AgentRequest::session`], so it is the caller's and never the
+/// model's. It ties the model calls and tool invocations of one conversation together in a
+/// trace, lets a policy rule be scoped to a session, and is what
+/// [`provenance`](crate::provenance) uses to decide which conversation a tool call inherits
+/// its trust from.
+///
+/// It lives here rather than in the agent crate because two things that never depend on each
+/// other have to agree on it: the loop writes it, and the tool registry reads it.
+pub const SESSION_ATTRIBUTE: &str = "aik.agent.session";
+
 /// What an agent is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDescriptor {

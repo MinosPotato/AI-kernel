@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -504,6 +505,12 @@ impl Tool for ExecTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: false,
+            // Whatever the program printed. A program's stdout is not this deployment's
+            // words even when the deployment chose the program.
+            output_trust: Trust::Untrusted,
+            // It runs host code. Even an allowlisted program is a wider reach than any
+            // single-purpose tool here: what it can touch is whatever it can touch.
+            reach: Reach::External,
         }
     }
 

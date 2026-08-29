@@ -30,6 +30,7 @@ use aik_api::permission::{
     ActionId, ApprovalSink, Decision, PermissionRequest, PolicyEngine, Principal, PrincipalKind,
     ResourceAuthorizer,
 };
+use aik_api::provenance::{Reach, Trust};
 use aik_api::quota::{QuotaGuard, QuotaStatus, UsageCharge};
 use aik_api::tool::{ResourceClaim, Tool, ToolCall, ToolName, ToolOutcome, ToolSpec};
 use aik_context::InMemoryContextStore;
@@ -330,6 +331,8 @@ impl Tool for ProbeTool {
             output_schema: None,
             required_permissions: self.permissions.clone(),
             read_only: true,
+            output_trust: Trust::Trusted,
+            reach: Reach::Contained,
         }
     }
 

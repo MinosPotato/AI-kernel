@@ -194,6 +194,7 @@ every "Implemented by" column below is a separate crate.
 | `context`    | `ContextCompactor`: replacing evicted turns with a recap, rather than losing them | `aik-summary` |
 | `memory`     | `MemoryStore`: records, queries, optional embeddings                   | `aik-memory` (semantic query needs an `Embedder`) |
 | `permission` | `PolicyEngine`, `ApprovalSink`, principals and decisions               | `aik-policy` (`PolicyEngine`), `aik-approval` (`ApprovalSink`) |
+| `provenance` | `Trust`, `Reach`, `TrustLedger`: what a conversation has read, and what may act on it | `aik-tools` (`InMemoryTrustLedger`, and the gate that reads it), declared by every `Tool` |
 | `scheduler`  | `Scheduler`, `JobHandler`, triggers (at / after / interval / cron / event) | `aik-scheduler` |
 | `agent`      | `Agent`, sessions, streaming updates                                   | `aik-agent` (`AgentLoop`) |
 | `platform`   | `PlatformIntegration`: the single seam for Hyprland/Wayland/OS backends | not yet implemented |

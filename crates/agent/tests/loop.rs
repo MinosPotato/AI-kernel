@@ -1229,9 +1229,15 @@ async fn the_execution_context_a_tool_sees_carries_only_trusted_annotations() {
         attributes[SESSION_ATTRIBUTE],
         json!(harness.session.to_string())
     );
+    // The third is not the loop's: the tool registry annotates the context it hands a tool
+    // with what the conversation has read. Nothing in this run has read anything untrusted.
+    assert_eq!(
+        attributes[aik_api::provenance::TRUST_ATTRIBUTE],
+        json!("trusted")
+    );
     assert_eq!(
         attributes.len(),
-        2,
+        3,
         "the caller's `AgentRequest::context` must not travel with authorization: {attributes:?}",
     );
 }

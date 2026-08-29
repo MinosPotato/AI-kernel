@@ -232,6 +232,61 @@ pub(crate) fn render_record(record: &MemoryRecord) -> Value {
     Value::Object(rendered)
 }
 
+/// The metadata key recording what a stored record is, in [trust](aik_api::provenance)
+/// terms.
+///
+/// Written by [`stamp_trust`] on every write and never taken from a call's arguments, so a
+/// model cannot label its own memory trustworthy. It is deliberately visible in a rendered
+/// record and filterable like any other metadata: hiding it would buy nothing, since the
+/// enforcement reads the stored value and not the rendered one.
+pub(crate) const TRUST_METADATA_KEY: &str = aik_api::provenance::TRUST_ATTRIBUTE;
+
+/// Records, on a memory about to be stored, what the conversation storing it had read.
+///
+/// This is what keeps memory from becoming a way to launder provenance. Without it, a run
+/// that reads an injected page and writes what it says into a memory produces a record that
+/// tomorrow's run recalls as though this deployment had authored it — the taint having been
+/// dropped in between by the one subsystem whose job is to outlive the conversation.
+///
+/// Overwrites whatever `metadata` holds under [`TRUST_METADATA_KEY`], because the only source
+/// of that value is the context the registry annotated, and a call's arguments are a model's
+/// to write. A context with no annotation at all is treated as untrusted: the registry sets
+/// it on every invocation it makes, so its absence means this tool was reached some other
+/// way, and the fail-closed reading of "nobody said" is not "it is fine".
+pub(crate) fn stamp_trust(
+    metadata: &mut Map<String, Value>,
+    cx: &aik_api::execution::ExecutionContext,
+) {
+    let trust = match cx
+        .attributes
+        .get(aik_api::provenance::TRUST_ATTRIBUTE)
+        .and_then(Value::as_str)
+    {
+        Some(value) if value == aik_api::provenance::Trust::Trusted.as_str() => {
+            aik_api::provenance::Trust::Trusted
+        }
+        _ => aik_api::provenance::Trust::Untrusted,
+    };
+    metadata.insert(TRUST_METADATA_KEY.to_owned(), json!(trust.as_str()));
+}
+
+/// What recalling this record puts into a conversation.
+///
+/// Anything but an explicit `trusted` stamp is untrusted, which covers the record written
+/// before this existed as well as the one written by a tainted run.
+pub(crate) fn record_trust(record: &MemoryRecord) -> aik_api::provenance::Trust {
+    match record
+        .metadata
+        .get(TRUST_METADATA_KEY)
+        .and_then(Value::as_str)
+    {
+        Some(value) if value == aik_api::provenance::Trust::Trusted.as_str() => {
+            aik_api::provenance::Trust::Trusted
+        }
+        _ => aik_api::provenance::Trust::Untrusted,
+    }
+}
+
 /// Refuses to start work whose context has already been cancelled or run out of time.
 ///
 /// A store call is short, but it is not free, and a tool that ignored an expired context

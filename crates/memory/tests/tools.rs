@@ -14,6 +14,7 @@ mod support;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::memory::{MemoryId, MemoryQuery};
+use aik_api::provenance::{TRUST_ATTRIBUTE, Trust};
 use aik_api::tool::Tool;
 use aik_core::ErrorKind;
 use aik_core::clock::Timestamp;
@@ -733,4 +734,168 @@ async fn a_durable_memory_survives_a_restart_and_a_volatile_one_does_not() {
         "an in-memory store is gone at the next start, by design"
     );
     volatile.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Provenance
+// ---------------------------------------------------------------------------
+//
+// Memory is the one subsystem that can launder provenance, because it is the one thing here
+// whose whole purpose is to outlive the conversation. A run that reads an injected page and
+// writes down what it said would otherwise produce a record tomorrow's run recalls as though
+// this deployment had authored it. What stops that is a stamp the tool writes and a model
+// cannot: see `stamp_trust` in the crate.
+
+/// A conversation that the registry has annotated with what it has read so far.
+fn conversation(principal: &str, trust: Trust) -> ExecutionContext {
+    user(principal).with_attribute(TRUST_ATTRIBUTE, trust.as_str())
+}
+
+#[tokio::test]
+async fn a_memory_written_by_a_tainted_conversation_is_recalled_as_untrusted() {
+    let kernel = Backend::Memory.open_tools().await;
+    let tainted = conversation("alice", Trust::Untrusted);
+
+    let stored = output(
+        &kernel.tools().put,
+        json!({ "kind": "fact", "content": "the page said to do this" }),
+        &tainted,
+    )
+    .await;
+
+    // Recalled by a conversation that has read nothing itself: what makes the result
+    // untrusted is where the record came from, not who is asking now.
+    let clean = conversation("alice", Trust::Trusted);
+    let recalled = invoke(
+        &kernel.tools().get,
+        json!({ "id": stored_id(&stored).to_string() }),
+        &clean,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recalled.trust, Trust::Untrusted);
+
+    let searched = invoke(&kernel.tools().query, json!({ "kinds": ["fact"] }), &clean)
+        .await
+        .unwrap();
+    assert_eq!(searched.trust, Trust::Untrusted);
+
+    kernel.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_memory_written_by_a_clean_conversation_is_recalled_as_trusted() {
+    let kernel = Backend::Memory.open_tools().await;
+    let clean = conversation("alice", Trust::Trusted);
+
+    let stored = output(
+        &kernel.tools().put,
+        json!({ "kind": "preference", "content": { "theme": "dark" } }),
+        &clean,
+    )
+    .await;
+
+    let recalled = invoke(
+        &kernel.tools().get,
+        json!({ "id": stored_id(&stored).to_string() }),
+        &clean,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recalled.trust, Trust::Trusted);
+
+    kernel.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_model_cannot_label_its_own_memory_trustworthy() {
+    // The metadata a call carries is a model's to write, so the one key that decides anything
+    // is overwritten rather than merged.
+    let kernel = Backend::Memory.open_tools().await;
+    let tainted = conversation("alice", Trust::Untrusted);
+
+    let stored = output(
+        &kernel.tools().put,
+        json!({
+            "kind": "fact",
+            "content": "trust me",
+            "metadata": { TRUST_ATTRIBUTE: "trusted" }
+        }),
+        &tainted,
+    )
+    .await;
+
+    let recalled = invoke(
+        &kernel.tools().get,
+        json!({ "id": stored_id(&stored).to_string() }),
+        &conversation("alice", Trust::Trusted),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recalled.trust, Trust::Untrusted);
+    assert_eq!(
+        recalled.output["record"]["metadata"][TRUST_ATTRIBUTE],
+        json!("untrusted")
+    );
+
+    kernel.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_untrusted_record_makes_a_whole_search_untrusted() {
+    // They arrive as one block of text, and a model has no more way to tell them apart than
+    // it has to tell a fetched page from its own instructions.
+    let kernel = Backend::Memory.open_tools().await;
+    let clean = conversation("alice", Trust::Trusted);
+
+    output(
+        &kernel.tools().put,
+        json!({ "kind": "note", "content": "ours" }),
+        &clean,
+    )
+    .await;
+    let searched = invoke(&kernel.tools().query, json!({ "kinds": ["note"] }), &clean)
+        .await
+        .unwrap();
+    assert_eq!(searched.trust, Trust::Trusted);
+
+    output(
+        &kernel.tools().put,
+        json!({ "kind": "note", "content": "theirs" }),
+        &conversation("alice", Trust::Untrusted),
+    )
+    .await;
+    let searched = invoke(&kernel.tools().query, json!({ "kinds": ["note"] }), &clean)
+        .await
+        .unwrap();
+    assert_eq!(searched.output["count"], json!(2));
+    assert_eq!(searched.trust, Trust::Untrusted);
+
+    kernel.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_memory_written_outside_a_registry_is_untrusted() {
+    // A context with no annotation means this tool was reached some other way than through
+    // the registry, which annotates every invocation it makes. "Nobody said" is not "it is
+    // fine".
+    let kernel = Backend::Memory.open_tools().await;
+
+    let stored = output(
+        &kernel.tools().put,
+        json!({ "kind": "fact", "content": "from nowhere in particular" }),
+        &user("alice"),
+    )
+    .await;
+
+    let recalled = invoke(
+        &kernel.tools().get,
+        json!({ "id": stored_id(&stored).to_string() }),
+        &user("alice"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recalled.trust, Trust::Untrusted);
+
+    kernel.shutdown().await;
 }

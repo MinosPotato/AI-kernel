@@ -207,6 +207,7 @@ fn phase_name(phase: aik_api::audit::AuthorizationPhase) -> &'static str {
         AuthorizationPhase::Tool => "tool",
         AuthorizationPhase::Resource => "resource",
         AuthorizationPhase::DiscoveredResource => "discovered_resource",
+        AuthorizationPhase::Trust => "trust",
     }
 }
 
@@ -295,6 +296,7 @@ mod tests {
             resource: Some(aik_api::permission::ResourceId::new(
                 "/home/alice/secret-project/notes.md",
             )),
+            scope_trust: None,
             phase: AuthorizationPhase::Resource,
             duration_ms: 7,
             approval_wait_ms: None,
@@ -325,6 +327,7 @@ mod tests {
             principal: PrincipalId::new("agent"),
             principal_kind: PrincipalKind::Agent,
             on_behalf_of: None,
+            output_trust: None,
             duration_ms: 5,
             authorization_duration_ms: Some(1),
             execution_duration_ms: Some(4),

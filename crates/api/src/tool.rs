@@ -148,6 +148,7 @@ use serde_json::Value;
 
 use crate::execution::ExecutionContext;
 use crate::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use crate::provenance::{Reach, Trust};
 
 aik_core::string_id! {
     /// Names a tool, e.g. `fs.read` or `hyprland.focus_window`.
@@ -201,6 +202,27 @@ pub struct ToolSpec {
     /// generally should not be.
     #[serde(default)]
     pub read_only: bool,
+    /// What this tool's output is, in [trust](crate::provenance) terms.
+    ///
+    /// [`Trust::Untrusted`] means the output can carry text a third party wrote — a fetched
+    /// page, a file somebody else can write to, a program's stdout, an external server's
+    /// reply. It is a statement about the *channel*, not about any one result: a tool whose
+    /// output is usually this deployment's own but sometimes is not declares the worse case
+    /// here and narrows it per call with [`ToolOutcome::with_trust`].
+    ///
+    /// The default is [`Trust::Untrusted`], and the default is what a specification
+    /// *deserialised* from somewhere gets. That is the fail-closed direction: a tool
+    /// described by an external server has no way to declare its output trustworthy, and a
+    /// field added to this struct later must not silently promote anything.
+    #[serde(default = "Trust::untrusted")]
+    pub output_trust: Trust,
+    /// How far this tool's effects travel — the question that decides whether a conversation
+    /// that has read untrusted content may use it at all.
+    ///
+    /// Defaults to [`Reach::External`], the widest, for the same reason
+    /// [`ToolSpec::output_trust`] defaults to untrusted.
+    #[serde(default = "Reach::external")]
+    pub reach: Reach,
 }
 
 /// A model's request to run a tool.
@@ -226,23 +248,54 @@ pub struct ToolOutcome {
     /// tool could not be run at all.
     #[serde(default)]
     pub is_error: bool,
+    /// What *this* result is, in [trust](crate::provenance) terms.
+    ///
+    /// The registry takes the lower of this and [`ToolSpec::output_trust`], so a tool can
+    /// only ever narrow what its specification declared for one particular call — a memory
+    /// store that returns a record written while the conversation was already tainted, a
+    /// filesystem tool that read from a root the deployment did not vouch for. Raising trust
+    /// is not expressible, which is the property that makes the declaration in the
+    /// specification the ceiling rather than a hint.
+    ///
+    /// Deserialising defaults to [`Trust::Untrusted`]: a result that crossed a wire has been
+    /// out of this process's hands, and the constructors below are how in-process code says
+    /// otherwise.
+    #[serde(default = "Trust::untrusted")]
+    pub trust: Trust,
 }
 
 impl ToolOutcome {
-    /// A successful outcome.
+    /// A successful outcome, as trusted as its tool's specification says.
     pub fn ok(output: impl Into<Value>) -> Self {
         Self {
             output: output.into(),
             is_error: false,
+            trust: Trust::Trusted,
         }
     }
 
     /// A failure the model should see.
+    ///
+    /// Trusted by default like [`ToolOutcome::ok`], because a refusal is written by the tool
+    /// itself. A tool that puts a third party's error text in the output should say so with
+    /// [`ToolOutcome::with_trust`].
     pub fn error(output: impl Into<Value>) -> Self {
         Self {
             output: output.into(),
             is_error: true,
+            trust: Trust::Trusted,
         }
+    }
+
+    /// Narrows this result's trust.
+    ///
+    /// Only ever narrows: the registry combines this with the tool's declared
+    /// [`ToolSpec::output_trust`] by [`Trust::min_with`], so passing [`Trust::Trusted`] to a
+    /// tool whose specification says otherwise changes nothing.
+    #[must_use]
+    pub fn with_trust(mut self, trust: Trust) -> Self {
+        self.trust = trust;
+        self
     }
 }
 

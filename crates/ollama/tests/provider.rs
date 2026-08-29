@@ -14,6 +14,7 @@ use aik_api::model::{
     ModelProvider, Role, ToolDefinition,
 };
 use aik_api::permission::ActionId;
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ToolCall, ToolName, ToolSpec};
 use aik_core::Error;
 use aik_core::clock::{ManualClock, SharedClock, SystemClock, Timestamp};
@@ -317,6 +318,8 @@ async fn nothing_about_a_tools_permissions_reaches_the_server() {
         output_schema: None,
         required_permissions: vec![ActionId::new("filesystem.write")],
         read_only: false,
+        output_trust: Trust::Untrusted,
+        reach: Reach::External,
     };
     let mut request = CompletionRequest::new("llama3.2", vec![Message::text(Role::User, "hi")]);
     request.tools.push(ToolDefinition::from(&spec));

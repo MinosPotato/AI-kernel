@@ -68,6 +68,16 @@ pub enum AuthorizationPhase {
     /// The same question, asked by the tool mid-execution about a resource it only
     /// discovered while running.
     DiscoveredResource,
+    /// "May a conversation that has read untrusted content act through this tool?" — asked
+    /// once per invocation, after the two phases above have already allowed it, and only for
+    /// a tool whose [`Reach`](crate::provenance::Reach) is not
+    /// [`Contained`](crate::provenance::Reach::Contained).
+    ///
+    /// A distinct phase because it is a distinct question. The others ask what a principal
+    /// may do; this one asks what the conversation has been told, and an operator reading the
+    /// trail needs to be able to tell a call that was refused on identity from one that was
+    /// refused on provenance.
+    Trust,
 }
 
 /// How an authorization question was answered.
@@ -133,6 +143,14 @@ pub struct AuthorizationDecided {
     /// itself rather than any particular target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<ResourceId>,
+    /// What the conversation had read, when the question was asked.
+    ///
+    /// `None` where trust was not evaluated at all — a registry with no ledger, or a record
+    /// written before provenance existed. Absent is deliberately not
+    /// [`Trust::Trusted`](crate::provenance::Trust::Trusted): "nothing untrusted had been
+    /// read" and "nobody looked" are different claims, and only one of them is evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_trust: Option<crate::provenance::Trust>,
     /// Which stage asked.
     pub phase: AuthorizationPhase,
     /// How long this one decision took to reach, in milliseconds.
@@ -226,6 +244,15 @@ pub struct ToolInvoked {
     /// Who they were acting for, if anyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<PrincipalId>,
+    /// What the result was, in [trust](crate::provenance) terms.
+    ///
+    /// The lower of the tool's declared
+    /// [`output_trust`](crate::tool::ToolSpec::output_trust) and whatever the call itself
+    /// reported, which is what the conversation's ledger was then told. `None` when the tool
+    /// produced no result at all — it was not found, or it was refused — and for a record
+    /// written before provenance existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_trust: Option<crate::provenance::Trust>,
     /// How long the whole call took, in milliseconds: authorization plus execution.
     ///
     /// Present even for [`InvocationOutcome::NotFound`] and
@@ -681,6 +708,7 @@ mod tests {
             on_behalf_of: None,
             action: ActionId::new("demo.act"),
             resource: Some(ResourceId::new("/tmp/x")),
+            scope_trust: Some(crate::provenance::Trust::Trusted),
             phase: AuthorizationPhase::Resource,
             duration_ms: 5,
             approval_wait_ms: None,
@@ -750,6 +778,7 @@ mod tests {
             principal: PrincipalId::new("agent-1"),
             principal_kind: PrincipalKind::Agent,
             on_behalf_of: Some(PrincipalId::new("user-1")),
+            output_trust: Some(crate::provenance::Trust::Untrusted),
             duration_ms: 12,
             authorization_duration_ms: Some(3),
             execution_duration_ms: Some(9),
@@ -778,6 +807,7 @@ mod tests {
             principal: PrincipalId::new("agent-1"),
             principal_kind: PrincipalKind::Agent,
             on_behalf_of: None,
+            output_trust: None,
             duration_ms: 1,
             authorization_duration_ms: None,
             execution_duration_ms: None,
@@ -810,6 +840,7 @@ mod tests {
             principal: PrincipalId::new("agent-1"),
             principal_kind: PrincipalKind::Agent,
             on_behalf_of: Some(PrincipalId::new("user-1")),
+            output_trust: Some(crate::provenance::Trust::Untrusted),
             duration_ms: 12,
             authorization_duration_ms: Some(3),
             execution_duration_ms: Some(9),

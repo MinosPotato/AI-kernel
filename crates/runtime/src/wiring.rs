@@ -126,7 +126,12 @@ pub fn builder(
 
     let mut tools = ToolsComponent::new()
         .with_policy(Arc::new(policy))
-        .with_approvals(broker.clone() as Arc<dyn ApprovalSink>);
+        .with_approvals(broker.clone() as Arc<dyn ApprovalSink>)
+        // The third question the registry asks, beside identity and resource: what has this
+        // conversation already read? Passed rather than defaulted so that the deployment's
+        // answer is visible here with the other two, and so a deployment that runs unattended
+        // can say `deny` instead of waiting for somebody to approve.
+        .with_trust_enforcement(settings.trust.enforcement);
 
     // A tool that is not registered cannot be reached however permissive the policy is, so
     // this is the outer limit and policy is the inner one. Both apply; neither substitutes

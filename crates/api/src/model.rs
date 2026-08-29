@@ -343,6 +343,7 @@ pub trait Embedder: Send + Sync + 'static {
 mod tests {
     use super::*;
     use crate::permission::ActionId;
+    use crate::provenance::{Reach, Trust};
     use crate::tool::ToolSpec;
     use serde_json::json;
 
@@ -354,6 +355,8 @@ mod tests {
             output_schema: Some(json!({ "type": "string" })),
             required_permissions: vec![ActionId::new("filesystem.read")],
             read_only: true,
+            output_trust: Trust::Untrusted,
+            reach: Reach::Contained,
         }
     }
 

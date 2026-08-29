@@ -50,9 +50,13 @@ pub const AGENT_ATTRIBUTE: &str = "aik.agent";
 /// The execution-context attribute naming the session a run belongs to.
 ///
 /// Taken from [`AgentRequest::session`], so it is the caller's, not the model's. It is what
-/// ties the model calls and tool invocations of one conversation together in a trace, and
-/// what lets a policy rule be scoped to a session.
-pub const SESSION_ATTRIBUTE: &str = "aik.agent.session";
+/// ties the model calls and tool invocations of one conversation together in a trace, what
+/// lets a policy rule be scoped to a session, and what the tool registry reads to decide
+/// which conversation's [trust](aik_api::provenance) a tool call inherits.
+///
+/// Defined in `aik-api` rather than here, because the loop that writes it and the registry
+/// that reads it do not depend on each other and must still agree.
+pub use aik_api::agent::SESSION_ATTRIBUTE;
 
 /// A model/tool loop built from the kernel's existing primitives.
 ///

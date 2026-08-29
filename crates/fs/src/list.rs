@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, ErrorKind, Result};
 use async_trait::async_trait;
@@ -399,6 +400,10 @@ impl Tool for FsListTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: true,
+            // A directory listing is content too: a file *name* is chosen by whoever created
+            // the file, and is as good a place to put a sentence as the file itself.
+            output_trust: Trust::Untrusted,
+            reach: Reach::Contained,
         }
     }
 

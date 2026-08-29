@@ -26,6 +26,7 @@ use aik_api::permission::{Principal, PrincipalId, PrincipalKind};
 use aik_core::ComponentId;
 use aik_core::prelude::*;
 use aik_net::NetSettings;
+use aik_tools::TrustEnforcement;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -408,6 +409,23 @@ impl NetSet {
     }
 }
 
+/// What a deployment says about provenance, read from `agent.trust`.
+///
+/// The mechanism itself is not optional and has no switch here: every tool result's
+/// [`Trust`](aik_api::provenance::Trust) is recorded against the conversation that received
+/// it, and every decision carries it, in every deployment. What this settles is only what
+/// happens at the moment a conversation that has read untrusted content asks for a tool that
+/// can act — see [`TrustEnforcement`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrustSettings {
+    /// What a call carrying untrusted content into an acting tool has to clear.
+    ///
+    /// Defaults to [`TrustEnforcement::Approval`]: a human is asked, and an unattended
+    /// deployment — one with no approval sink at all — refuses.
+    pub enforcement: TrustEnforcement,
+}
+
 /// What a deployment says about compacting long sessions, read from `agent.summary`.
 ///
 /// Compaction is the one capability here that is *on* unless a deployment says otherwise,
@@ -621,6 +639,7 @@ struct AgentSection {
     mcp: McpSettings,
     net: NetSettings,
     summary: SummarySettings,
+    trust: TrustSettings,
 }
 
 impl AgentSection {
@@ -842,6 +861,7 @@ impl Deployment {
             net: self.net,
             net_settings: section.net,
             summary: section.summary,
+            trust: section.trust,
             storage,
             jobs: self.jobs,
             system_prompt: section.system_prompt.filter(|prompt| non_blank(prompt)),
@@ -925,6 +945,8 @@ pub struct RuntimeSettings {
     pub net_settings: NetSettings,
     /// Whether long sessions are compacted, and with what, read from `agent.summary`.
     pub summary: SummarySettings,
+    /// How strictly provenance is enforced, read from `agent.trust`.
+    pub trust: TrustSettings,
     /// Where the durable subsystems keep what they hold, if anywhere.
     pub storage: Storage,
     /// Whether scheduled jobs are executed in this process, and by what.
@@ -991,6 +1013,7 @@ impl RuntimeSettings {
             net: NetSet::default(),
             net_settings: NetSettings::default(),
             summary: SummarySettings::default(),
+            trust: TrustSettings::default(),
             storage: Storage::Ephemeral,
             jobs: JobExecution::default(),
             system_prompt: None,
