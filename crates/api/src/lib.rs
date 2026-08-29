@@ -19,6 +19,7 @@
 //! | [`scheduler`] | Time- and event-triggered jobs |
 //! | [`agent`] | Long-running work with streamed progress |
 //! | [`platform`] | The single seam to an OS or desktop |
+//! | [`provenance`] | Where content came from, and what may act on it |
 //!
 //! # How these are used
 //!
@@ -81,6 +82,7 @@ pub mod memory;
 pub mod model;
 pub mod permission;
 pub mod platform;
+pub mod provenance;
 pub mod quota;
 pub mod resilience;
 pub mod scheduler;

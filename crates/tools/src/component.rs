@@ -8,6 +8,7 @@ use aik_api::tool::{Tool, ToolCatalog, ToolRegistry};
 use aik_core::prelude::*;
 
 use crate::registry::InProcessToolRegistry;
+use crate::trust::TrustEnforcement;
 
 /// The component id used when none is given explicitly.
 pub const DEFAULT_COMPONENT_ID: &str = "tools.registry";
@@ -35,6 +36,7 @@ pub struct ToolsComponent {
     catalogs: Vec<Arc<dyn ToolCatalog>>,
     policy: Option<Arc<dyn PolicyEngine>>,
     approvals: Option<Arc<dyn ApprovalSink>>,
+    enforcement: TrustEnforcement,
 }
 
 impl std::fmt::Debug for ToolsComponent {
@@ -52,6 +54,7 @@ impl std::fmt::Debug for ToolsComponent {
             .field("catalogs", &self.catalogs.len())
             .field("policy_configured", &self.policy.is_some())
             .field("approvals_configured", &self.approvals.is_some())
+            .field("trust_enforcement", &self.enforcement)
             .finish()
     }
 }
@@ -76,6 +79,7 @@ impl ToolsComponent {
             catalogs: Vec::new(),
             policy: None,
             approvals: None,
+            enforcement: TrustEnforcement::default(),
         }
     }
 
@@ -136,6 +140,16 @@ impl ToolsComponent {
         self.approvals = Some(approvals);
         self
     }
+
+    /// Sets how strictly the registry enforces [provenance](aik_api::provenance).
+    ///
+    /// Defaults to [`TrustEnforcement::Approval`]. There is deliberately no setting here for
+    /// whether provenance is *tracked*: it always is.
+    #[must_use]
+    pub fn with_trust_enforcement(mut self, enforcement: TrustEnforcement) -> Self {
+        self.enforcement = enforcement;
+        self
+    }
 }
 
 #[async_trait]
@@ -150,7 +164,8 @@ impl Component for ToolsComponent {
         // audit sink is an ordinary subscriber and needs no wiring of its own.
         let mut registry = InProcessToolRegistry::new()
             .with_audit(ctx.events().clone(), self.id.clone())
-            .with_clock(ctx.clock().clone());
+            .with_clock(ctx.clock().clone())
+            .with_trust_enforcement(self.enforcement);
         if let Some(policy) = &self.policy {
             registry = registry.with_policy(policy.clone());
         }
@@ -193,6 +208,7 @@ mod tests {
     use super::*;
     use aik_api::execution::ExecutionContext;
     use aik_api::permission::{Decision, PermissionRequest};
+    use aik_api::provenance::{Reach, Trust};
 
     struct AlwaysAllow;
 
@@ -223,6 +239,8 @@ mod tests {
                     output_schema: None,
                     required_permissions: Vec::new(),
                     read_only: false,
+                    output_trust: Trust::Untrusted,
+                    reach: Reach::External,
                 })
                 .collect())
         }

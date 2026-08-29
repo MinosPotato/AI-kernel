@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -358,6 +359,12 @@ impl Tool for FsWriteTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: false,
+            // The output is this tool's own account of what it did — a byte count — and
+            // never the content of anything.
+            output_trust: Trust::Trusted,
+            // It changes this machine. A conversation that has read an untrusted page does
+            // not get to do that without somebody saying so.
+            reach: Reach::Mutating,
         }
     }
 

@@ -77,6 +77,7 @@ use std::time::Duration;
 use aik_api::agent::SessionId;
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::scheduler::{JobId, JobSpec, Scheduler, Trigger};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::clock::{Clock, SharedClock, Timestamp};
@@ -462,6 +463,11 @@ impl Tool for ScheduleCreateTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: false,
+            // The output is the job this tool just created, in its own words.
+            output_trust: Trust::Trusted,
+            // A job outlives the conversation that created it and fires unattended, which
+            // makes this the most consequential mutation an agent can make here.
+            reach: Reach::Mutating,
         }
     }
 
@@ -599,6 +605,10 @@ impl Tool for ScheduleListTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: true,
+            // A listing carries back the prompts of jobs somebody — possibly a previous,
+            // already-tainted run — wrote.
+            output_trust: Trust::Untrusted,
+            reach: Reach::Contained,
         }
     }
 
@@ -729,6 +739,8 @@ impl Tool for ScheduleCancelTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: false,
+            output_trust: Trust::Trusted,
+            reach: Reach::Mutating,
         }
     }
 

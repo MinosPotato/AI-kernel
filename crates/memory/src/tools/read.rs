@@ -5,6 +5,7 @@ use std::sync::Arc;
 use aik_api::execution::ExecutionContext;
 use aik_api::memory::{MemoryKind, MemoryQuery};
 use aik_api::permission::{ActionId, ResourceAuthorizer};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -150,6 +151,11 @@ impl Tool for MemoryGetTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: true,
+            // Declared at the worse case and narrowed per call: see `outcome_trust`, which
+            // reports a result as trusted only when every record in it was stored by a
+            // conversation that had itself read nothing untrusted.
+            output_trust: Trust::Untrusted,
+            reach: Reach::Contained,
         }
     }
 
@@ -172,10 +178,15 @@ impl Tool for MemoryGetTool {
         ensure_live(cx, self.binding.clock()?.as_ref())?;
 
         Ok(match store.get(&input.id, cx).await? {
+            // The result is only as trusted as the record it carries: a memory written by a
+            // conversation that had read an injected page is that page's words, however long
+            // ago it was stored and whoever is asking now.
             Some(record) => ToolOutcome::ok(json!({
                 "found": true,
                 "record": render_record(&record)
-            })),
+            }))
+            .with_trust(super::record_trust(&record)),
+            // Nothing was recalled, so nothing entered the conversation.
             None => ToolOutcome::ok(json!({ "found": false })),
         })
     }
@@ -436,6 +447,8 @@ impl Tool for MemoryQueryTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: true,
+            output_trust: Trust::Untrusted,
+            reach: Reach::Contained,
         }
     }
 
@@ -491,6 +504,14 @@ impl Tool for MemoryQueryTool {
             .map(|matched| render_record(&matched.record))
             .collect();
 
+        // One untrusted record in the result makes the result untrusted: the conversation is
+        // about to be sent all of them as one block of text, and the model has no more way to
+        // tell them apart than it has to tell a fetched page from its own instructions. An
+        // empty result carries nothing and so lowers nothing.
+        let trust = matches.iter().fold(Trust::Trusted, |trust, matched| {
+            trust.min_with(super::record_trust(&matched.record))
+        });
+
         let mut result = json!({
             "count": records.len(),
             "limit": limit,
@@ -510,7 +531,7 @@ impl Tool for MemoryQueryTool {
                 .insert("scores".to_owned(), json!(scores));
         }
 
-        Ok(ToolOutcome::ok(result))
+        Ok(ToolOutcome::ok(result).with_trust(trust))
     }
 }
 

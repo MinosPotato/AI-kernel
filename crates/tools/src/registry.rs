@@ -12,13 +12,19 @@ use aik_api::permission::{
     ActionId, ApprovalSink, Decision, PermissionRequest, PolicyEngine, Principal, PrincipalId,
     ResourceAuthorizer, ResourceId,
 };
+use aik_api::provenance::{
+    REACH_CONTEXT_KEY, Reach, SCOPE_ATTRIBUTE, TRUST_ATTRIBUTE, TRUST_CONTEXT_KEY, Trust,
+    TrustLedger, TrustScope,
+};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::clock::{SharedClock, SystemClock};
 use aik_core::event::{Envelope, Event, EventBus};
 use aik_core::id::ComponentId;
 use aik_core::{Error, Result};
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{Map, Value};
+
+use crate::trust::{InMemoryTrustLedger, TrustEnforcement, UNTRUSTED_CONTENT_ACTION};
 
 /// The principal attributed to a call whose [`ExecutionContext`] names none.
 ///
@@ -71,6 +77,8 @@ pub struct InProcessToolRegistry {
     audit: Option<EventBus>,
     source: ComponentId,
     clock: SharedClock,
+    ledger: Arc<dyn TrustLedger>,
+    enforcement: TrustEnforcement,
 }
 
 impl std::fmt::Debug for InProcessToolRegistry {
@@ -82,6 +90,7 @@ impl std::fmt::Debug for InProcessToolRegistry {
             .field("policy_configured", &self.policy.is_some())
             .field("approvals_configured", &self.approvals.is_some())
             .field("audit_configured", &self.audit.is_some())
+            .field("trust_enforcement", &self.enforcement)
             .finish()
     }
 }
@@ -106,6 +115,12 @@ impl InProcessToolRegistry {
             audit: None,
             source: ComponentId::new("tools.registry"),
             clock: Arc::new(SystemClock),
+            // Not an `Option`: a registry with no ledger would be one where provenance is
+            // silently not tracked, and the whole point of the mechanism is that no
+            // deployment has to remember to switch it on. Substituting a durable ledger is a
+            // replacement, never an enabling.
+            ledger: Arc::new(InMemoryTrustLedger::new()),
+            enforcement: TrustEnforcement::default(),
         }
     }
 
@@ -142,6 +157,23 @@ impl InProcessToolRegistry {
     #[must_use]
     pub fn with_clock(mut self, clock: SharedClock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Replaces the [`TrustLedger`] this registry records and consults provenance in.
+    ///
+    /// Defaults to an [`InMemoryTrustLedger`], which forgets everything when the process
+    /// exits; a durable one makes a resumed session resume the trust it actually has.
+    #[must_use]
+    pub fn with_trust_ledger(mut self, ledger: Arc<dyn TrustLedger>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
+    /// Sets how strictly provenance is enforced. Defaults to [`TrustEnforcement::Approval`].
+    #[must_use]
+    pub fn with_trust_enforcement(mut self, enforcement: TrustEnforcement) -> Self {
+        self.enforcement = enforcement;
         self
     }
 
@@ -196,6 +228,7 @@ impl InProcessToolRegistry {
                 on_behalf_of: question.principal.on_behalf_of.clone(),
                 action: question.action.clone(),
                 resource: question.resource.cloned(),
+                scope_trust: Some(question.trust),
                 phase: question.phase,
                 duration_ms: millis(duration),
                 approval_wait_ms: approval_wait.map(millis),
@@ -211,6 +244,7 @@ impl InProcessToolRegistry {
         tool: &ToolName,
         principal: &Principal,
         outcome: InvocationOutcome,
+        output_trust: Option<Trust>,
         duration: Duration,
         authorization_duration: Option<Duration>,
         execution_duration: Option<Duration>,
@@ -224,6 +258,7 @@ impl InProcessToolRegistry {
                 principal: principal.id.clone(),
                 principal_kind: principal.kind,
                 on_behalf_of: principal.on_behalf_of.clone(),
+                output_trust,
                 duration_ms: millis(duration),
                 authorization_duration_ms: authorization_duration.map(millis),
                 execution_duration_ms: execution_duration.map(millis),
@@ -254,12 +289,7 @@ impl InProcessToolRegistry {
             )));
         };
 
-        let request = PermissionRequest {
-            principal: question.principal.clone(),
-            action: question.action.clone(),
-            resource: question.resource.cloned(),
-            context: json!({ "tool": tool.as_str() }),
-        };
+        let request = question.request();
 
         // A policy engine that fails to answer has not allowed anything. The failure is
         // recorded before it is propagated, so a mechanism that broke is as visible in the
@@ -351,6 +381,7 @@ impl InProcessToolRegistry {
         spec: &ToolSpec,
         principal: &Principal,
         claims: Vec<ResourceClaim>,
+        trust: Trust,
     ) -> Result<()> {
         for action in &spec.required_permissions {
             self.decide(&Question {
@@ -360,6 +391,8 @@ impl InProcessToolRegistry {
                 action,
                 resource: None,
                 phase: AuthorizationPhase::Tool,
+                trust,
+                reach: spec.reach,
             })
             .await?;
         }
@@ -372,11 +405,113 @@ impl InProcessToolRegistry {
                 action: &claim.action,
                 resource: Some(&claim.resource),
                 phase: AuthorizationPhase::Resource,
+                trust,
+                reach: spec.reach,
             })
             .await?;
         }
 
-        Ok(())
+        self.enforce_trust(cx, spec, principal, trust).await
+    }
+
+    /// Decides whether a conversation that has read untrusted content may act through this
+    /// tool.
+    ///
+    /// Asked once per invocation, last, after identity-based authorization has already
+    /// allowed the call — so this can only ever narrow what policy permitted, never widen it,
+    /// and a call refused on identity is never additionally refused here. It is not a policy
+    /// question and no rule is evaluated for it: [`TrustEnforcement`] decides, because the
+    /// alternative is a mechanism every existing policy document would have to be rewritten
+    /// to keep working, which is a mechanism most deployments would end up turning off.
+    ///
+    /// Nothing happens at all in the two cases that are not the trifecta: a conversation that
+    /// has read nothing untrusted, and a tool that cannot carry anything out of one.
+    async fn enforce_trust(
+        &self,
+        cx: &ExecutionContext,
+        spec: &ToolSpec,
+        principal: &Principal,
+        trust: Trust,
+    ) -> Result<()> {
+        if !trust.is_untrusted() || spec.reach.is_contained() {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let action = ActionId::new(UNTRUSTED_CONTENT_ACTION);
+        let question = Question {
+            cx,
+            tool: &spec.name,
+            principal,
+            action: &action,
+            resource: None,
+            phase: AuthorizationPhase::Trust,
+            trust,
+            reach: spec.reach,
+        };
+        let tool = &spec.name;
+        let effect = describe_reach(spec.reach);
+        let reason =
+            format!("this conversation has read untrusted content, and `{tool}` can {effect}");
+
+        let (outcome, error, approval_wait) = match self.enforcement {
+            TrustEnforcement::Observe => (AuthorizationOutcome::Allowed, None, None),
+            TrustEnforcement::Deny => (
+                AuthorizationOutcome::Denied {
+                    reason: reason.clone(),
+                },
+                Some(reason.clone()),
+                None,
+            ),
+            TrustEnforcement::Approval => match &self.approvals {
+                None => (
+                    AuthorizationOutcome::ApprovalUnavailable,
+                    Some(format!("{reason}, and there is nobody to ask")),
+                    None,
+                ),
+                Some(sink) => {
+                    let prompt = format!(
+                        "This conversation has read content from outside this deployment — a \
+                         fetched page, a file, a program's output, or an external tool server. \
+                         Running `{tool}` now would let that content {effect}. Untrusted \
+                         content asking for exactly this is what a prompt injection looks \
+                         like. Allow it?"
+                    );
+                    let approval_started = Instant::now();
+                    match sink
+                        .request_approval(&question.request(), &prompt, cx)
+                        .await
+                    {
+                        Ok(true) => (
+                            AuthorizationOutcome::ApprovalGranted,
+                            None,
+                            Some(approval_started.elapsed()),
+                        ),
+                        Ok(false) => (
+                            AuthorizationOutcome::ApprovalRefused,
+                            Some(format!("{reason}, and it was not approved")),
+                            Some(approval_started.elapsed()),
+                        ),
+                        Err(error) => {
+                            self.record_decision(
+                                &question,
+                                AuthorizationOutcome::ApprovalUnavailable,
+                                started.elapsed(),
+                                Some(approval_started.elapsed()),
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+            },
+        };
+
+        self.record_decision(&question, outcome, started.elapsed(), approval_wait);
+
+        match error {
+            Some(message) => Err(Error::PermissionDenied(format!("tool `{tool}`: {message}"))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -391,6 +526,10 @@ struct Question<'a> {
     action: &'a ActionId,
     resource: Option<&'a ResourceId>,
     phase: AuthorizationPhase,
+    /// What the conversation this call belongs to has read so far.
+    trust: Trust,
+    /// How far the tool being asked about can reach.
+    reach: Reach,
 }
 
 impl Question<'_> {
@@ -400,6 +539,55 @@ impl Question<'_> {
             Some(resource) => format!("`{}` on `{resource}`", self.action),
             None => format!("`{}`", self.action),
         }
+    }
+
+    /// The request put to the policy engine, and to a human if it defers to one.
+    ///
+    /// Trust and reach travel in the context rather than as fields of
+    /// [`PermissionRequest`], for the same reason the tool name does: they are facts a rule
+    /// may want to constrain on, not part of the question's identity. A policy rule reads
+    /// them through its `context` matcher — see [`aik_api::provenance`].
+    fn request(&self) -> PermissionRequest {
+        let mut context = Map::new();
+        context.insert("tool".to_owned(), Value::from(self.tool.as_str()));
+        context.insert(
+            TRUST_CONTEXT_KEY.to_owned(),
+            Value::from(self.trust.as_str()),
+        );
+        context.insert(
+            REACH_CONTEXT_KEY.to_owned(),
+            Value::from(self.reach.as_str()),
+        );
+        PermissionRequest {
+            principal: self.principal.clone(),
+            action: self.action.clone(),
+            resource: self.resource.cloned(),
+            context: Value::Object(context),
+        }
+    }
+}
+
+/// The scope whose trust a call inherits.
+///
+/// The session where there is one, because the transcript is what carries untrusted text
+/// from one turn to the next, and the operation's correlation otherwise. The two are
+/// prefixed so that no session id can ever name the same scope as some correlation.
+///
+/// The attribute is written by the agent loop from the caller's session id and is not
+/// reachable by a model; see [`aik_api::agent::SESSION_ATTRIBUTE`].
+fn scope_of(cx: &ExecutionContext) -> TrustScope {
+    match cx.attributes.get(SCOPE_ATTRIBUTE).and_then(Value::as_str) {
+        Some(session) if !session.is_empty() => TrustScope::new(format!("session:{session}")),
+        _ => TrustScope::new(format!("operation:{}", cx.correlation)),
+    }
+}
+
+/// What a tool of this reach can do, in a sentence a person is being asked to judge.
+fn describe_reach(reach: Reach) -> &'static str {
+    match reach {
+        Reach::Contained => "read state this deployment already holds",
+        Reach::Mutating => "change state on this machine",
+        Reach::External => "send data outside this deployment",
     }
 }
 
@@ -413,6 +601,13 @@ struct ScopedAuthorizer<'a> {
     tool: ToolName,
     principal: Principal,
     cx: &'a ExecutionContext,
+    /// The scope's trust as it stood when the call was authorized.
+    ///
+    /// Fixed for the duration of the invocation, like everything else here. A tool cannot
+    /// change what its conversation has read, and a call that was allowed to start does not
+    /// become a different question halfway through.
+    trust: Trust,
+    reach: Reach,
 }
 
 impl std::fmt::Debug for ScopedAuthorizer<'_> {
@@ -435,6 +630,8 @@ impl ResourceAuthorizer for ScopedAuthorizer<'_> {
                 action,
                 resource: Some(resource),
                 phase: AuthorizationPhase::DiscoveredResource,
+                trust: self.trust,
+                reach: self.reach,
             })
             .await
     }
@@ -463,6 +660,7 @@ impl ToolRegistry for InProcessToolRegistry {
                 name,
                 &principal,
                 InvocationOutcome::NotFound,
+                None,
                 started.elapsed(),
                 None,
                 None,
@@ -472,6 +670,30 @@ impl ToolRegistry for InProcessToolRegistry {
 
         let spec = tool.spec();
         let authorization_started = Instant::now();
+
+        // What this conversation has already been told, read once and used for every question
+        // this call asks. A ledger that cannot answer is treated the way an unavailable policy
+        // engine is: the call stops. "We could not find out whether this conversation is
+        // tainted" is not "it is not".
+        let scope = scope_of(cx);
+        let trust = match self.ledger.trust_of(&scope).await {
+            Ok(trust) => trust,
+            Err(error) => {
+                self.record_invocation(
+                    cx,
+                    name,
+                    &principal,
+                    InvocationOutcome::Denied,
+                    None,
+                    started.elapsed(),
+                    Some(authorization_started.elapsed()),
+                    None,
+                );
+                return Err(Error::PermissionDenied(format!(
+                    "tool `{name}`: the trust of this conversation could not be established: {error}"
+                )));
+            }
+        };
 
         // Building a resource claim is not an authorization question — no `decide` was ever
         // asked, so a failure here (e.g. a path that does not resolve) is not a policy
@@ -486,6 +708,7 @@ impl ToolRegistry for InProcessToolRegistry {
                     InvocationOutcome::Failed {
                         kind: format!("{:?}", error.kind()).to_lowercase(),
                     },
+                    None,
                     started.elapsed(),
                     Some(authorization_started.elapsed()),
                     None,
@@ -494,12 +717,13 @@ impl ToolRegistry for InProcessToolRegistry {
             }
         };
 
-        if let Err(error) = self.authorize(cx, &spec, &principal, claims).await {
+        if let Err(error) = self.authorize(cx, &spec, &principal, claims, trust).await {
             self.record_invocation(
                 cx,
                 name,
                 &principal,
                 InvocationOutcome::Denied,
+                None,
                 started.elapsed(),
                 Some(authorization_started.elapsed()),
                 None,
@@ -508,16 +732,32 @@ impl ToolRegistry for InProcessToolRegistry {
         }
         let authorization_duration = authorization_started.elapsed();
 
+        // The tool runs under a context carrying the scope's trust, so a tool that persists
+        // what it was given — a memory store, say — can record where it came from without
+        // resolving a ledger of its own. It is annotation, not authority: nothing read back
+        // from here decides anything.
+        let cx = &cx.child().with_attribute(TRUST_ATTRIBUTE, trust.as_str());
+
         let authorizer = ScopedAuthorizer {
             registry: self,
             tool: name.clone(),
             principal: principal.clone(),
             cx,
+            trust,
+            reach: spec.reach,
         };
 
         let execution_started = Instant::now();
         let result = tool.invoke(arguments, &authorizer, cx).await;
         let execution_duration = execution_started.elapsed();
+
+        // What the tool declared it can return, narrowed by what this particular call says it
+        // did return. Only a result that actually reaches the caller counts: a refused or
+        // failed call put nothing into the conversation.
+        let output_trust = result
+            .as_ref()
+            .ok()
+            .map(|outcome| spec.output_trust.min_with(outcome.trust));
 
         let outcome = match &result {
             Ok(outcome) if outcome.is_error => InvocationOutcome::ReportedError,
@@ -526,17 +766,44 @@ impl ToolRegistry for InProcessToolRegistry {
             // as denied rather than as a generic failure.
             Err(error) => classify_authorization_error(error),
         };
+
+        // Recorded before the result is handed back, and a failure to record discards it. A
+        // ledger that missed a taint is a conversation that has read an untrusted page and
+        // has nothing to show for it, which is worse than a tool call that failed: the caller
+        // can retry a failure.
+        let ledger_failure = match output_trust {
+            Some(trust) => self.ledger.observe(&scope, trust).await.err(),
+            None => None,
+        };
+
+        let (outcome, output_trust) = match &ledger_failure {
+            None => (outcome, output_trust),
+            Some(error) => (
+                InvocationOutcome::Failed {
+                    kind: format!("{:?}", error.kind()).to_lowercase(),
+                },
+                None,
+            ),
+        };
+
         self.record_invocation(
             cx,
             name,
             &principal,
             outcome,
+            output_trust,
             started.elapsed(),
             Some(authorization_duration),
             Some(execution_duration),
         );
 
-        result
+        match ledger_failure {
+            None => result,
+            Some(error) => Err(Error::other(format!(
+                "tool `{name}` ran, but its result was discarded: the provenance of what it \
+                 returned could not be recorded: {error}"
+            ))),
+        }
     }
 }
 
@@ -576,7 +843,7 @@ pub fn system_principal_id() -> PrincipalId {
 mod tests {
     use super::*;
     use aik_api::tool::ResourceClaim;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     struct Noop {
         name: &'static str,
@@ -593,6 +860,8 @@ mod tests {
                 output_schema: None,
                 required_permissions: self.permissions.clone(),
                 read_only: true,
+                output_trust: Trust::Trusted,
+                reach: Reach::Contained,
             }
         }
 
@@ -620,6 +889,8 @@ mod tests {
                 output_schema: None,
                 required_permissions: vec![],
                 read_only: true,
+                output_trust: Trust::Trusted,
+                reach: Reach::Contained,
             }
         }
 

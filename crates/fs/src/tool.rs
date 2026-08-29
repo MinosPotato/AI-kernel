@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -261,6 +262,13 @@ impl Tool for FsReadTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: true,
+            // A file inside the root is not this deployment's own words. Anything that can
+            // write into the root — a download, a checkout, another program, a person who is
+            // not the operator — decides what this returns.
+            output_trust: Trust::Untrusted,
+            // It reads, and hands what it read back to the caller. That is one leg of the
+            // trifecta and not the one the registry holds.
+            reach: Reach::Contained,
         }
     }
 

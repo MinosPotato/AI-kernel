@@ -16,6 +16,7 @@ use aik_api::permission::{
     ActionId, ApprovalSink, Decision, PermissionRequest, PolicyEngine, Principal, PrincipalId,
     PrincipalKind, ResourceId,
 };
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolRegistry, ToolSpec};
 use aik_core::event::EventStream;
 use aik_core::prelude::*;
@@ -514,6 +515,8 @@ impl Tool for BadClaim {
             output_schema: None,
             required_permissions: vec![],
             read_only: true,
+            output_trust: Trust::Trusted,
+            reach: Reach::Contained,
         }
     }
 

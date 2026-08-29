@@ -519,6 +519,7 @@ a host process over one database are the same assistant, so all five are read on
 | `agent.root`         | The directory the filesystem tools are confined to.                             |
 | `agent.model`        | The model every turn is sent to.                                                |
 | `agent.system_prompt`| What the agent is told before its first turn.                                   |
+| `agent.trust.enforcement` | What a conversation that has read untrusted content must clear to use a tool that can act: `approval` (the default), `deny` or `observe`. |
 
 Each of these used to exist twice — `cli.agent` **and** `daemon.agent`, and so on — and
 nothing checked that the two agreed. A file saying `daemon.agent = "aikd-agent"` and
@@ -814,6 +815,42 @@ it on. Verified directly with a file containing literal `ESC[2K` and bare `\r` b
 never printed the raw control bytes anywhere, tool output included — everything untrusted
 (assistant text, tool arguments, file contents returned by a tool) passes through a sanitiser
 that turns control characters into a visible `\u{XXXX}` escape before it reaches the terminal.
+
+### A second reason to be asked: what the conversation has read
+
+Not every question at that prompt comes from a policy rule. A conversation that has read
+content from outside this deployment — a page `web.fetch` returned, a file `filesystem.read`
+opened, a program's output, an MCP server's reply — is asked again before it uses a tool that
+can change this machine or send anything off it, whatever the policy says:
+
+```
+  ⚠ This conversation has read content from outside this deployment — a fetched page, a
+    file, a program's output, or an external tool server. Running `filesystem.write` now
+    would let that content change state on this machine. Untrusted content asking for
+    exactly this is what a prompt injection looks like. Allow it?
+    action:   aik.untrusted-content
+    asked by: assistant (for user)
+  allow? [y/N]
+```
+
+The `action` is the giveaway: `aik.untrusted-content` is not a permission any policy grants
+and not a tool anything can call. It is the name the decision carries in the audit trail, and
+it appears once per invocation rather than once per resource.
+
+Three things follow from where this sits:
+
+- **One-shot mode refuses it**, for the same reason it refuses every other approval: nobody is
+  attached. A script that reads a file and then writes one needs `agent.trust.enforcement` set
+  to `observe`, and should be read as a deployment saying it accepts the risk.
+- **Reading more is never gated.** Only tools that can act are — a second `filesystem.read`
+  after the first is not a question, because reading cannot carry anything out of a
+  conversation.
+- **A second fetch is a question.** `web.fetch` can carry data out in a URL, so once a
+  conversation has read one page, fetching another is exactly the shape an exfiltration takes.
+  Research across several pages is therefore research you are asked about, once per fetch.
+- **It cannot widen anything.** The question is only ever asked about a call policy has
+  *already* allowed, so answering `y` grants exactly what the policy already did and nothing
+  more.
 
 Approval cannot widen what confinement or policy already refused. Verified directly: a
 `require_approval` write policy plus `y` at the prompt still refuses a `../` traversal target

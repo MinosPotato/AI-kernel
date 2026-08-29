@@ -39,6 +39,7 @@ fn decision(principal: &str, on_behalf_of: Option<&str>, tool: &str) -> AuditEnt
         on_behalf_of: on_behalf_of.map(PrincipalId::new),
         action: ActionId::new("filesystem.read"),
         resource: None,
+        scope_trust: None,
         phase: AuthorizationPhase::Tool,
         duration_ms: 0,
         approval_wait_ms: None,

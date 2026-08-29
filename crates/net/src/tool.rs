@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -462,6 +463,12 @@ impl Tool for WebFetchTool {
             })),
             required_permissions: vec![self.action.clone()],
             read_only: true,
+            // The whole point of the tool: text somebody else wrote, on a machine this
+            // deployment does not run.
+            output_trust: Trust::Untrusted,
+            // A URL is a channel. What comes back is only half of what a fetch does; the
+            // other half is that the address, and everything in it, left this machine.
+            reach: Reach::External,
         }
     }
 

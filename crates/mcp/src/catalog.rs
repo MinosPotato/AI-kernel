@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use aik_api::execution::ExecutionContext;
 use aik_api::permission::{ActionId, ResourceAuthorizer, ResourceId};
+use aik_api::provenance::{Reach, Trust};
 use aik_api::tool::{ResourceClaim, Tool, ToolCatalog, ToolName, ToolOutcome, ToolSpec};
 use aik_core::{Error, Result};
 use async_trait::async_trait;
@@ -178,6 +179,11 @@ fn spec_for(name: &ToolName, entry: &Entry) -> ToolSpec {
         required_permissions: vec![ActionId::new(server.permission.clone())],
         // Never taken from the server's own annotations: see the module documentation.
         read_only: false,
+        // Authored by a server this repository did not write, exactly like the description
+        // and the schema above. Never taken from the server's own annotations.
+        output_trust: Trust::Untrusted,
+        // A server can do anything the program does, and this kernel cannot see which.
+        reach: Reach::External,
     }
 }
 
@@ -258,9 +264,13 @@ impl Tool for RemoteTool {
             .call_tool(&self.definition.remote_name, arguments, cx)
             .await?;
 
+        // Belt and braces over the specification's own `output_trust`: this is a reply from
+        // a server whose code nobody here reviewed, whichever way the specification was
+        // built.
         Ok(ToolOutcome {
             output: result.output,
             is_error: result.is_error,
+            trust: Trust::Untrusted,
         })
     }
 }

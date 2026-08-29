@@ -415,6 +415,7 @@ mod tests {
                 on_behalf_of: Some(PrincipalId::new("alice")),
                 action: ActionId::new("fs.read"),
                 resource: Some(ResourceId::new("/srv/notes.txt")),
+                scope_trust: None,
                 phase: AuthorizationPhase::Resource,
                 duration_ms: 1,
                 approval_wait_ms: None,

@@ -367,6 +367,7 @@ mod tests {
             on_behalf_of: None,
             action: ActionId::new("demo.act"),
             resource: None,
+            scope_trust: None,
             phase: aik_api::audit::AuthorizationPhase::Tool,
             duration_ms,
             approval_wait_ms,
