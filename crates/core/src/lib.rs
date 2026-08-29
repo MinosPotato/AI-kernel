@@ -99,7 +99,7 @@ pub use clock::{Clock, SharedClock, SystemClock, Timestamp};
 pub use component::{Component, ComponentDescriptor, ComponentState, Health, HealthStatus};
 pub use config::Config;
 pub use context::{ComponentContext, KernelContext};
-pub use error::{Error, ErrorKind, Result};
+pub use error::{BoxError, Error, ErrorKind, Result};
 pub use event::{Envelope, Event, EventBus, EventMetadata};
 pub use id::{ComponentId, CorrelationId, EventId, EventName, PluginId, TaskId};
 pub use kernel::{Kernel, KernelBuilder, KernelState};

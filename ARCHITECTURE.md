@@ -34,6 +34,7 @@ AI-kernel/
 │  ├─ aik/      → aik          : thin facade re-exporting both
 │  ├─ ollama/   → aik-ollama   : a ModelProvider, talking to a local Ollama server
 │  ├─ anthropic/→ aik-anthropic: a ModelProvider, talking to the Anthropic Messages API
+│  ├─ resilience/→ aik-resilience: a ModelProvider wrapping another, to retry and circuit-break it
 │  ├─ tools/    → aik-tools    : the reference ToolRegistry (authorization-gated)
 │  ├─ mcp/      → aik-mcp      : a ToolCatalog over external Model Context Protocol servers
 │  ├─ policy/   → aik-policy   : a deterministic, configuration-driven PolicyEngine
@@ -184,6 +185,7 @@ every "Implemented by" column below is a separate crate.
 |--------------|------------------------------------------------------------------------|----------------|
 | `execution`  | `ExecutionContext`: correlation, principal, deadline, cancellation     | — (a plain value type, not a trait) |
 | `model`      | `ModelProvider`, `Embedder`, provider-neutral message/content types    | `aik-ollama` (both), `aik-anthropic` (`ModelProvider`) |
+| `resilience` | `TransientFailure`: a provider saying a failure was the service's, not the request's | marked by `aik-ollama` and `aik-anthropic`, acted on by `aik-resilience` |
 | `tool`       | `Tool`, `ToolCatalog`, JSON-Schema specs, invocation and outcome       | `aik-tools` (`ToolRegistry`), `aik-fs` and `aik-exec` (`Tool`), `aik-mcp` (`ToolCatalog`) |
 | `context`    | `ContextStore`, `ContextBudget`, `TokenCounter`: transcript vs. model payload | `aik-context` |
 | `context`    | `ContextCompactor`: replacing evicted turns with a recap, rather than losing them | `aik-summary` |

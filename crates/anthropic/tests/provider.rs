@@ -28,7 +28,6 @@ const KEY: &str = "sk-ant-test-key";
 fn settings(server: &MockServer) -> AnthropicSettings {
     AnthropicSettings {
         endpoint: server.uri(),
-        max_retries: 0,
         ..AnthropicSettings::default()
     }
 }
@@ -320,7 +319,6 @@ async fn the_configured_timeout_bounds_a_slow_service() {
         &AnthropicSettings {
             endpoint: server.uri(),
             request_timeout_ms: 50,
-            max_retries: 0,
             ..AnthropicSettings::default()
         },
         ApiKey::new(KEY, "TEST").unwrap(),

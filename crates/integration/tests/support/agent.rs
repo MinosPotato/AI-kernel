@@ -44,6 +44,13 @@ pub enum Reply {
     Answer(String),
     /// A turn that asks for tools.
     Calls(Vec<ToolCall>),
+    /// A turn the provider fails, marked as the service's fault rather than the request's.
+    ///
+    /// Consumed like any other entry, so a script says exactly how many upstream calls a run
+    /// is expected to make — which is the whole assertion in the resilience suite.
+    Transient,
+    /// A turn the provider fails in a way nothing marked, so nothing may repeat it.
+    Terminal,
 }
 
 impl Reply {
@@ -61,8 +68,8 @@ impl Reply {
         }])
     }
 
-    fn into_response(self) -> CompletionResponse {
-        match self {
+    fn into_response(self) -> Result<CompletionResponse> {
+        Ok(match self {
             Self::Answer(text) => CompletionResponse {
                 message: Message::text(Role::Assistant, text),
                 finish_reason: FinishReason::Stop,
@@ -77,7 +84,18 @@ impl Reply {
                 finish_reason: FinishReason::ToolCalls,
                 usage: None,
             },
-        }
+            Self::Transient => {
+                return Err(
+                    aik_api::resilience::TransientFailure::new("the stub is overloaded")
+                        .wrapped("calling the scripted model"),
+                );
+            }
+            Self::Terminal => {
+                return Err(Error::InvalidArgument(
+                    "the stub refuses this request".into(),
+                ));
+            }
+        })
     }
 }
 
@@ -132,7 +150,7 @@ impl ModelProvider for ScriptedModel {
         self.requests.lock().expect("no panics").push(request);
         let reply = self.replies.lock().expect("no panics").pop_front();
         match reply {
-            Some(reply) => Ok(reply.into_response()),
+            Some(reply) => reply.into_response(),
             None => Err(Error::other("the script ran out of turns")),
         }
     }

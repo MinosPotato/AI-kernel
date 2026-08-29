@@ -244,6 +244,7 @@ dependencies = [
  "aik-memory",
  "aik-policy",
  "aik-quota",
+ "aik-resilience",
  "aik-runtime",
  "aik-scheduler",
  "aik-store",
@@ -357,6 +358,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aik-resilience"
+version = "0.1.0"
+dependencies = [
+ "aik-api",
+ "aik-core",
+ "async-trait",
+ "futures",
+ "futures-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "aik-runtime"
 version = "0.1.0"
 dependencies = [
@@ -374,6 +391,7 @@ dependencies = [
  "aik-ollama",
  "aik-policy",
  "aik-quota",
+ "aik-resilience",
  "aik-scheduler",
  "aik-store",
  "aik-summary",

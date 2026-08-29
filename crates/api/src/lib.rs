@@ -82,6 +82,7 @@ pub mod model;
 pub mod permission;
 pub mod platform;
 pub mod quota;
+pub mod resilience;
 pub mod scheduler;
 pub mod tool;
 

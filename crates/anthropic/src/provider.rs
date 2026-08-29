@@ -14,7 +14,7 @@ use futures_core::stream::BoxStream;
 
 use crate::credentials::ApiKey;
 use crate::deadline::{Deadline, race};
-use crate::http::{ensure_success, map_reqwest_error, send_with_retry};
+use crate::http::{ensure_success, map_reqwest_error};
 use crate::protocol::{
     MessageResponse, ModelsResponse, build_request, convert_models, convert_response,
 };
@@ -31,7 +31,6 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     base_url: String,
     max_output_tokens: u32,
-    max_retries: u32,
     default_timeout: Duration,
     clock: SharedClock,
 }
@@ -42,7 +41,6 @@ impl std::fmt::Debug for AnthropicProvider {
         f.debug_struct("AnthropicProvider")
             .field("base_url", &self.base_url)
             .field("max_output_tokens", &self.max_output_tokens)
-            .field("max_retries", &self.max_retries)
             .field("default_timeout", &self.default_timeout)
             .finish_non_exhaustive()
     }
@@ -73,7 +71,6 @@ impl AnthropicProvider {
             client,
             base_url: settings.base_url(),
             max_output_tokens: settings.max_output_tokens,
-            max_retries: settings.max_retries,
             default_timeout: Duration::from_millis(settings.request_timeout_ms),
             clock,
         })
@@ -125,17 +122,17 @@ impl ModelProvider for AnthropicProvider {
         let deadline = self.deadline(cx);
         let wire = build_request(&request, self.max_output_tokens, false)?;
         let url = self.url("v1/messages");
-        let cancellation = cx.cancellation.clone();
 
         let attempt = async {
-            let response = send_with_retry(
-                || self.client.post(&url).json(&wire),
-                "sending a completion request to the Anthropic API",
-                self.max_retries,
-                &cancellation,
-                deadline,
-            )
-            .await?;
+            let response = self
+                .client
+                .post(&url)
+                .json(&wire)
+                .send()
+                .await
+                .map_err(|error| {
+                    map_reqwest_error("sending a completion request to the Anthropic API", error)
+                })?;
             let response = ensure_success(response).await?;
             let body: MessageResponse = response.json().await.map_err(|error| {
                 map_reqwest_error("decoding the Anthropic completion response", error)
@@ -154,15 +151,15 @@ impl ModelProvider for AnthropicProvider {
         let deadline = self.deadline(cx);
         let wire = build_request(&request, self.max_output_tokens, true)?;
         let url = self.url("v1/messages");
-        let cancellation = cx.cancellation.clone();
 
-        let opening = send_with_retry(
-            || self.client.post(&url).json(&wire),
-            "opening an Anthropic stream",
-            self.max_retries,
-            &cancellation,
-            deadline,
-        );
+        let opening = async {
+            self.client
+                .post(&url)
+                .json(&wire)
+                .send()
+                .await
+                .map_err(|error| map_reqwest_error("opening an Anthropic stream", error))
+        };
 
         let response = race(opening, &cx.cancellation, deadline).await?;
         let response = ensure_success(response).await?;
